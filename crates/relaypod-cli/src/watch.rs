@@ -54,6 +54,7 @@ impl AgentType {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchConfig {
     pub url: Option<String>,
+    pub instructions_file: Option<String>,
     pub handles: BTreeMap<String, HandleConfig>,
 }
 
@@ -65,6 +66,7 @@ pub struct HandleConfig {
     pub exec: String,
     pub args: Option<String>,
     pub prompt: Option<String>,
+    pub instructions_file: Option<String>,
     pub cwd: Option<String>,
     pub auto_ack: bool,
     pub drain_on_start: bool,
@@ -81,6 +83,7 @@ impl Default for HandleConfig {
             exec: String::new(),
             args: None,
             prompt: None,
+            instructions_file: None,
             cwd: None,
             auto_ack: false,
             drain_on_start: true,
@@ -111,6 +114,7 @@ struct ResolvedTarget {
     exec: String,
     args: Option<String>,
     prompt: Option<String>,
+    instructions_file: Option<PathBuf>,
     cwd: Option<String>,
     auto_ack: bool,
     drain_on_start: bool,
@@ -241,6 +245,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 exec: exec_cmd.clone(),
                 args: None,
                 prompt: None,
+                instructions_file: None,
                 cwd: opts.cwd_override.as_deref().map(expand_tilde),
                 auto_ack: opts.auto_ack_override.unwrap_or(false),
                 drain_on_start: !opts.no_drain,
@@ -309,6 +314,19 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
             ));
         }
 
+        let instructions_file = h
+            .instructions_file
+            .or_else(|| cfg.instructions_file.clone())
+            .map(|p| PathBuf::from(expand_tilde(&p)));
+        if let Some(ref p) = instructions_file {
+            if !p.exists() {
+                return Err(anyhow!(
+                    "handle '@{name}' instructions_file not found: {}",
+                    p.display()
+                ));
+            }
+        }
+
         targets.push(ResolvedTarget {
             label: format!("@{name}"),
             agent_type,
@@ -317,6 +335,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
             exec,
             args: h.args,
             prompt: h.prompt,
+            instructions_file,
             cwd: opts
                 .cwd_override
                 .clone()
@@ -487,10 +506,9 @@ fn build_agent_prompt(
     thread_id: &str,
     is_resume: bool,
 ) -> String {
-    if let Some(ref custom) = target.prompt {
-        return render_exec_template(custom, handle, item, thread_id);
-    }
-    if is_resume {
+    let base = if let Some(ref custom) = target.prompt {
+        render_exec_template(custom, handle, item, thread_id)
+    } else if is_resume {
         format!(
             "Follow-up reply in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
             item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
@@ -500,7 +518,27 @@ fn build_agent_prompt(
             "New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
             item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
         )
+    };
+
+    if !is_resume {
+        if let Some(ref path) = target.instructions_file {
+            match std::fs::read_to_string(path) {
+                Ok(instructions) if !instructions.trim().is_empty() => {
+                    return format!(
+                        "{}\n\n---\n\n{}",
+                        instructions.trim(),
+                        base
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(path = %path.display(), error = %err, "failed to read instructions_file");
+                }
+            }
+        }
     }
+
+    base
 }
 
 fn split_shell_words(s: &str) -> Vec<String> {
@@ -831,6 +869,9 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                 "url" => {
                     cfg.url = Some(expand_env_vars(&unquote_yaml(val)));
                 }
+                "instructions_file" => {
+                    cfg.instructions_file = Some(expand_env_vars(&unquote_yaml(val)));
+                }
                 "handles" => {
                     if !val.is_empty() {
                         return Err(anyhow!(
@@ -874,6 +915,9 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                     "exec" => entry.exec = expand_env_vars(&unquote_yaml(val)),
                     "args" => entry.args = Some(expand_env_vars(&unquote_yaml(val))),
                     "prompt" => entry.prompt = Some(expand_env_vars(&unquote_yaml(val))),
+                    "instructions_file" => {
+                        entry.instructions_file = Some(expand_env_vars(&unquote_yaml(val)))
+                    }
                     "cwd" => entry.cwd = Some(expand_env_vars(&unquote_yaml(val))),
                     "auto_ack" => {
                         entry.auto_ack = parse_bool(val)

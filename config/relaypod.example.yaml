@@ -3,6 +3,8 @@
 # Run with: `relaypod watch` (all handles) or `relaypod watch --handle marcin-codex`
 
 url: http://127.0.0.1:8787
+# Optional default instructions file prepended on the first turn of each new thread
+# instructions_file: ~/.relaypod/agent-instructions.md
 
 handles:
   # Managed agent mode (`agent_type: codex` or `agent_type: claude`):
@@ -14,7 +16,9 @@ handles:
     token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
     # Optional extra CLI flags passed to `codex exec` / `codex exec resume`
     args: -m gpt-6.2-sol -c model_reasoning_effort=medium --full-auto
-    cwd: ~/projects/relaypod
+    # Optional per-handle instructions file (overrides top-level `instructions_file`)
+    instructions_file: ~/.relaypod/agent-instructions.md
+    cwd: ~/projects
     # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
     auto_ack: false
     # Drain existing unacked items on startup/reconnect (default: true)
