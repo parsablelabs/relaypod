@@ -1,0 +1,20 @@
+[package]
+name = "relaypod-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "relaypod"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+relaypod-client = { path = "../relaypod-client" }
+relaypod-core = { path = "../relaypod-core" }
+relaypod-server = { path = "../relaypod-server" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

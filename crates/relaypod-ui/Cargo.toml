@@ -1,0 +1,14 @@
+[package]
+name = "relaypod-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "relaypod-ui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+relaypod-client = { path = "../relaypod-client" }
+relaypod-core = { path = "../relaypod-core" }

@@ -1,0 +1,294 @@
+use crate::runtime::{ClientCommand, ClientEvent};
+use relaypod_core::{
+    Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent,
+};
+
+/// Follow-up commands or UI signals produced by reducing a `ClientEvent`.
+#[derive(Debug, Default)]
+pub struct StateEffects {
+    pub commands: Vec<ClientCommand>,
+    pub channel_just_created: bool,
+    pub identity_just_created: Option<CreatedIdentity>,
+}
+
+/// Pure, display-framework-agnostic client workspace state.
+/// Any UI (egui, iced, gpui, ratatui, etc.) renders from this struct and feeds `ClientEvent`s into `apply()`.
+#[derive(Debug, Default)]
+pub struct WorkspaceState {
+    pub connected: bool,
+    pub ws_live: bool,
+    pub status_error: Option<String>,
+
+    pub me: Option<Identity>,
+    pub channels: Vec<Channel>,
+    pub identities: Vec<Identity>,
+    pub unread: Vec<UnreadItem>,
+
+    pub selected_channel_id: Option<String>,
+    pub messages: Vec<Message>,
+    pub active_thread: Option<ThreadView>,
+}
+
+impl WorkspaceState {
+    pub fn active_channel(&self) -> Option<&Channel> {
+        let id = self.selected_channel_id.as_deref()?;
+        self.channels.iter().find(|c| c.id == id)
+    }
+
+    pub fn select_channel(&mut self, channel_id: String) -> ClientCommand {
+        self.selected_channel_id = Some(channel_id.clone());
+        self.active_thread = None;
+        ClientCommand::LoadChannelMessages { channel_id }
+    }
+
+    pub fn apply(&mut self, ev: ClientEvent) -> StateEffects {
+        let mut effects = StateEffects::default();
+
+        match ev {
+            ClientEvent::Connected {
+                me,
+                channels,
+                identities,
+                unread,
+            } => {
+                self.connected = true;
+                self.status_error = None;
+                self.me = Some(me);
+                self.channels = channels;
+                self.identities = identities;
+                self.unread = unread;
+
+                if self.selected_channel_id.is_none() {
+                    if let Some(first) = self.channels.first() {
+                        let cmd = self.select_channel(first.id.clone());
+                        effects.commands.push(cmd);
+                    }
+                }
+            }
+            ClientEvent::Disconnected => {
+                self.connected = false;
+                self.ws_live = false;
+                self.me = None;
+                self.channels.clear();
+                self.identities.clear();
+                self.unread.clear();
+                self.selected_channel_id = None;
+                self.messages.clear();
+                self.active_thread = None;
+            }
+            ClientEvent::ChannelMessages {
+                channel_id,
+                messages,
+            } => {
+                if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
+                    self.messages = messages;
+                }
+            }
+            ClientEvent::ThreadLoaded(thread) => {
+                self.active_thread = Some(thread);
+            }
+            ClientEvent::ChannelCreated(ch) => {
+                if !self.channels.iter().any(|c| c.id == ch.id) {
+                    self.channels.push(ch.clone());
+                }
+                let cmd = self.select_channel(ch.id);
+                effects.commands.push(cmd);
+                effects.channel_just_created = true;
+            }
+            ClientEvent::IdentityCreated(created) => {
+                if !self
+                    .identities
+                    .iter()
+                    .any(|i| i.id == created.identity.id)
+                {
+                    self.identities.push(created.identity.clone());
+                }
+                effects.identity_just_created = Some(created);
+            }
+            ClientEvent::UnreadLoaded(items) => {
+                self.unread = items;
+            }
+            ClientEvent::WsStatus(live) => {
+                self.ws_live = live;
+            }
+            ClientEvent::Error(msg) => {
+                self.status_error = Some(msg);
+            }
+            ClientEvent::Ws(ws_ev) => self.apply_ws(ws_ev),
+        }
+
+        effects
+    }
+
+    fn apply_ws(&mut self, ev: WsEvent) {
+        match ev {
+            WsEvent::MessageCreated(msg) => {
+                if let Some(parent_id) = &msg.parent_id {
+                    if let Some(parent) = self.messages.iter_mut().find(|m| &m.id == parent_id) {
+                        parent.reply_count += 1;
+                    }
+                    if let Some(thread) = &mut self.active_thread {
+                        if &thread.parent.id == parent_id
+                            && !thread.replies.iter().any(|r| r.id == msg.id)
+                        {
+                            thread.parent.reply_count += 1;
+                            thread.replies.push(msg);
+                        }
+                    }
+                } else if self.selected_channel_id.as_deref() == Some(msg.channel_id.as_str())
+                    && !self.messages.iter().any(|m| m.id == msg.id)
+                {
+                    self.messages.push(msg);
+                }
+            }
+            WsEvent::UnreadCreated(item) => {
+                if let Some(id) = self.identities.iter_mut().find(|i| i.id == item.identity_id) {
+                    id.unread_count += 1;
+                }
+                if self.me.as_ref().map(|m| m.id.as_str()) == Some(item.identity_id.as_str())
+                    && !self.unread.iter().any(|u| u.id == item.id)
+                {
+                    self.unread.push(item);
+                }
+            }
+            WsEvent::UnreadAcked {
+                unread_id,
+                identity_id,
+            } => {
+                if let Some(id) = self.identities.iter_mut().find(|i| i.id == identity_id) {
+                    id.unread_count = (id.unread_count - 1).max(0);
+                }
+                self.unread.retain(|u| u.id != unread_id);
+            }
+            WsEvent::ChannelCreated(ch) => {
+                if !self.channels.iter().any(|c| c.id == ch.id) {
+                    self.channels.push(ch);
+                }
+            }
+            WsEvent::IdentityCreated(id) => {
+                if !self.identities.iter().any(|i| i.id == id.id) {
+                    self.identities.push(id);
+                }
+            }
+            WsEvent::PresenceChanged {
+                identity_id,
+                online,
+            } => {
+                if let Some(id) = self.identities.iter_mut().find(|i| i.id == identity_id) {
+                    id.online = online;
+                }
+                if let Some(me) = &mut self.me {
+                    if me.id == identity_id {
+                        me.online = online;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relaypod_core::{IdentityKind, UnreadReason};
+
+    fn sample_identity(id: &str, handle: &str, kind: IdentityKind) -> Identity {
+        Identity {
+            id: id.into(),
+            handle: handle.into(),
+            display_name: handle.into(),
+            kind,
+            owner_id: None,
+            created_at: 0,
+            unread_count: 0,
+            online: false,
+        }
+    }
+
+    #[test]
+    fn test_workspace_state_ws_reduction() {
+        let mut state = WorkspaceState::default();
+        let me = sample_identity("u1", "martek", IdentityKind::Human);
+        let agent = sample_identity("a1", "codex", IdentityKind::Agent);
+        let ch = Channel {
+            id: "c1".into(),
+            name: "general".into(),
+            description: String::new(),
+            created_at: 0,
+        };
+
+        let effects = state.apply(ClientEvent::Connected {
+            me: me.clone(),
+            channels: vec![ch],
+            identities: vec![me.clone(), agent.clone()],
+            unread: vec![],
+        });
+        assert!(state.connected);
+        assert_eq!(state.selected_channel_id.as_deref(), Some("c1"));
+        assert_eq!(effects.commands.len(), 1);
+
+        // Top-level message arrives via WS
+        let root = Message {
+            id: "m1".into(),
+            channel_id: "c1".into(),
+            parent_id: None,
+            author_id: "u1".into(),
+            author_handle: "martek".into(),
+            author_kind: IdentityKind::Human,
+            body: "@codex check build".into(),
+            created_at: 1,
+            reply_count: 0,
+        };
+        state.apply(ClientEvent::Ws(WsEvent::MessageCreated(root.clone())));
+        assert_eq!(state.messages.len(), 1);
+
+        // Unread arrives for agent + reply bumps reply_count
+        state.apply(ClientEvent::Ws(WsEvent::UnreadCreated(UnreadItem {
+            id: "un1".into(),
+            identity_id: "a1".into(),
+            message_id: "m1".into(),
+            channel_id: "c1".into(),
+            channel_name: "general".into(),
+            parent_id: None,
+            author_handle: "martek".into(),
+            body: "@codex check build".into(),
+            reason: UnreadReason::Mention,
+            acked_at: None,
+            created_at: 1,
+        })));
+        assert_eq!(state.identities[1].unread_count, 1);
+
+        state.apply(ClientEvent::Ws(WsEvent::MessageCreated(Message {
+            id: "m2".into(),
+            channel_id: "c1".into(),
+            parent_id: Some("m1".into()),
+            author_id: "a1".into(),
+            author_handle: "codex".into(),
+            author_kind: IdentityKind::Agent,
+            body: "Build is green!".into(),
+            created_at: 2,
+            reply_count: 0,
+        })));
+        assert_eq!(state.messages[0].reply_count, 1);
+
+        // Ack decrements agent unread_count
+        state.apply(ClientEvent::Ws(WsEvent::UnreadAcked {
+            unread_id: "un1".into(),
+            identity_id: "a1".into(),
+        }));
+        assert_eq!(state.identities[1].unread_count, 0);
+
+        // Presence changes toggle online status
+        state.apply(ClientEvent::Ws(WsEvent::PresenceChanged {
+            identity_id: "a1".into(),
+            online: true,
+        }));
+        assert!(state.identities[1].online);
+
+        state.apply(ClientEvent::Ws(WsEvent::PresenceChanged {
+            identity_id: "a1".into(),
+            online: false,
+        }));
+        assert!(!state.identities[1].online);
+    }
+}
