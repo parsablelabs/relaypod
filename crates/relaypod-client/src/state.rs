@@ -141,6 +141,39 @@ impl WorkspaceState {
                     self.messages.push(msg);
                 }
             }
+            WsEvent::MessageDeleted {
+                message_id,
+                channel_id: _,
+                parent_id,
+            } => {
+                if let Some(parent_id) = parent_id {
+                    if let Some(parent) = self.messages.iter_mut().find(|m| m.id == parent_id) {
+                        parent.reply_count = (parent.reply_count - 1).max(0);
+                    }
+                    if let Some(thread) = &mut self.active_thread {
+                        if thread.parent.id == parent_id {
+                            let before = thread.replies.len();
+                            thread.replies.retain(|r| r.id != message_id);
+                            if thread.replies.len() < before {
+                                thread.parent.reply_count =
+                                    (thread.parent.reply_count - 1).max(0);
+                            }
+                        }
+                    }
+                } else {
+                    self.messages.retain(|m| m.id != message_id);
+                    if self
+                        .active_thread
+                        .as_ref()
+                        .is_some_and(|t| t.parent.id == message_id)
+                    {
+                        self.active_thread = None;
+                    }
+                }
+                self.unread.retain(|u| {
+                    u.message_id != message_id && u.parent_id.as_deref() != Some(message_id.as_str())
+                });
+            }
             WsEvent::UnreadCreated(item) => {
                 if let Some(id) = self.identities.iter_mut().find(|i| i.id == item.identity_id) {
                     id.unread_count += 1;

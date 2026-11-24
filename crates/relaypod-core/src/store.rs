@@ -2,8 +2,8 @@ use crate::auth::{
     extract_mentions, generate_token, hash_token, normalize_channel_name, normalize_handle,
 };
 use crate::models::{
-    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, IdentityKind,
-    Message, PostMessageResult, ThreadView, UnreadItem, UnreadReason,
+    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedMessage,
+    Identity, IdentityKind, Message, PostMessageResult, ThreadView, UnreadItem, UnreadReason,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -572,6 +572,56 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Deletes a message (and any child thread replies + associated unread items).
+    pub fn delete_message(&self, message_id: &str) -> CoreResult<DeletedMessage> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let meta: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT channel_id, parent_id FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let (channel_id, parent_id) =
+            meta.ok_or_else(|| CoreError::NotFound(format!("message '{message_id}' not found")))?;
+
+        if parent_id.is_some() {
+            return Err(CoreError::InvalidInput(
+                "cannot delete an individual thread reply; delete the top-level message instead"
+                    .into(),
+            ));
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, identity_id FROM unread_items
+             WHERE acked_at IS NULL
+               AND (message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1))",
+        )?;
+        let affected_unread: Vec<(String, String)> = stmt
+            .query_map(params![message_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        conn.execute(
+            "DELETE FROM unread_items
+             WHERE message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1)",
+            params![message_id],
+        )?;
+        conn.execute(
+            "DELETE FROM messages WHERE parent_id = ?1",
+            params![message_id],
+        )?;
+        conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+
+        Ok(DeletedMessage {
+            message_id: message_id.to_string(),
+            channel_id,
+            parent_id,
+            affected_unread,
+        })
+    }
 }
 
 fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
@@ -694,5 +744,15 @@ mod tests {
         let thread = store.get_thread(&post.message.id).unwrap();
         assert_eq!(thread.parent.reply_count, 1);
         assert_eq!(thread.replies.len(), 1);
+
+        // Deleting an individual thread reply is rejected
+        assert!(store.delete_message(&reply.message.id).is_err());
+
+        // Deleting parent message cascades to replies and unacked unread items
+        let deleted = store.delete_message(&post.message.id).unwrap();
+        assert_eq!(deleted.message_id, post.message.id);
+        assert_eq!(deleted.affected_unread.len(), 1);
+        assert!(store.list_channel_messages("general", 20).unwrap().is_empty());
+        assert!(store.list_unread(&admin.identity.id).unwrap().is_empty());
     }
 }

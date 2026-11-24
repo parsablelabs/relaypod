@@ -26,6 +26,9 @@ pub enum ClientCommand {
         body: String,
         parent_id: Option<String>,
     },
+    DeleteMessage {
+        message_id: String,
+    },
     CreateChannel {
         name: String,
         description: String,
@@ -174,6 +177,13 @@ where
                     } => {
                         if let Some(c) = &client {
                             if let Err(e) = c.post_message(&channel_id, body, parent_id).await {
+                                emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteMessage { message_id } => {
+                        if let Some(c) = &client {
+                            if let Err(e) = c.delete_message(&message_id).await {
                                 emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
                             }
                         }

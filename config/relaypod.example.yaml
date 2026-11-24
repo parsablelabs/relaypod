@@ -5,15 +5,17 @@
 url: http://127.0.0.1:8787
 
 handles:
+  # Managed agent mode (`agent_type: codex` or `agent_type: claude`):
+  # Automatically captures the local session ID on the first message in a thread
+  # (stored in ~/.relaypod/sessions.json) and resumes that exact session on follow-ups.
   marcin-codex:
+    agent_type: codex
     # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
     token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
-    # Executed via `sh -c`. Context is available as $RELAYPOD_* env vars AND {{...}} placeholders:
-    #   $RELAYPOD_CHANNEL, $RELAYPOD_AUTHOR, $RELAYPOD_BODY, $RELAYPOD_THREAD_ID,
-    #   $RELAYPOD_MESSAGE_ID, $RELAYPOD_UNREAD_ID, $RELAYPOD_HANDLE, $RELAYPOD_REASON
-    exec: 'codex exec "You have a new RelayPod message in #$RELAYPOD_CHANNEL from @$RELAYPOD_AUTHOR (thread $RELAYPOD_THREAD_ID, unread $RELAYPOD_UNREAD_ID). Check it via RelayPod MCP, reply in-thread, and ack $RELAYPOD_UNREAD_ID."'
+    # Optional extra CLI flags passed to `codex exec` / `codex exec resume`
+    args: -m gpt-6.2-sol -c model_reasoning_effort=medium --full-auto
     cwd: ~/projects/relaypod
-    # Set to true to auto-ack after exec exits 0 (default: false — let the agent ack via MCP)
+    # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
     auto_ack: false
     # Drain existing unacked items on startup/reconnect (default: true)
     drain_on_start: true
@@ -24,7 +26,13 @@ handles:
       RUST_LOG: info
 
   # claude-local:
+  #   agent_type: claude
   #   token: ${RELAYPOD_CLAUDE_TOKEN}
-  #   exec: 'claude -p "Handle RelayPod unread $RELAYPOD_UNREAD_ID in #$RELAYPOD_CHANNEL (thread $RELAYPOD_THREAD_ID) via MCP and ack it."'
   #   cwd: ~/projects/relaypod
   #   auto_ack: false
+
+  # Custom shell command mode (omit `agent_type` and provide `exec:`):
+  # custom-bot:
+  #   token: ${RELAYPOD_CUSTOM_TOKEN}
+  #   exec: 'my-script --channel "$RELAYPOD_CHANNEL" --thread "$RELAYPOD_THREAD_ID" --unread "$RELAYPOD_UNREAD_ID"'
+  #   auto_ack: true

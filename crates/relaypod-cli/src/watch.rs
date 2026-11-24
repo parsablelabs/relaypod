@@ -3,8 +3,10 @@ use relaypod_client::{run_live_ws_loop, RelayPodClient, DEFAULT_PING_INTERVAL};
 use relaypod_core::{UnreadItem, WsEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -33,6 +35,22 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentType {
+    Codex,
+    Claude,
+}
+
+impl AgentType {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "claude" | "claude-code" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchConfig {
     pub url: Option<String>,
@@ -41,9 +59,12 @@ pub struct WatchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandleConfig {
+    pub agent_type: Option<AgentType>,
     pub url: Option<String>,
     pub token: Option<String>,
     pub exec: String,
+    pub args: Option<String>,
+    pub prompt: Option<String>,
     pub cwd: Option<String>,
     pub auto_ack: bool,
     pub drain_on_start: bool,
@@ -54,9 +75,12 @@ pub struct HandleConfig {
 impl Default for HandleConfig {
     fn default() -> Self {
         Self {
+            agent_type: None,
             url: None,
             token: None,
             exec: String::new(),
+            args: None,
+            prompt: None,
             cwd: None,
             auto_ack: false,
             drain_on_start: true,
@@ -81,14 +105,75 @@ pub struct WatchOptions {
 #[derive(Debug, Clone)]
 struct ResolvedTarget {
     label: String,
+    agent_type: Option<AgentType>,
     url: String,
     token: String,
     exec: String,
+    args: Option<String>,
+    prompt: Option<String>,
     cwd: Option<String>,
     auto_ack: bool,
     drain_on_start: bool,
     cooldown_secs: u64,
     env: BTreeMap<String, String>,
+}
+
+/// Persistent mapping of `(handle, relaypod_thread_id) -> local_agent_session_id`
+/// stored at `~/.relaypod/sessions.json`.
+#[derive(Clone)]
+struct SessionStore {
+    path: PathBuf,
+    map: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+impl SessionStore {
+    fn default_path() -> PathBuf {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(".relaypod").join("sessions.json")
+        } else {
+            PathBuf::from(".relaypod-sessions.json")
+        }
+    }
+
+    fn load_from(path: PathBuf) -> Self {
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(&s).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            map: Arc::new(Mutex::new(map)),
+        }
+    }
+
+    fn load_default() -> Self {
+        Self::load_from(Self::default_path())
+    }
+
+    fn key(handle: &str, thread_id: &str) -> String {
+        format!("{handle}:{thread_id}")
+    }
+
+    fn get(&self, handle: &str, thread_id: &str) -> Option<String> {
+        let guard = self.map.lock().expect("session store lock poisoned");
+        guard.get(&Self::key(handle, thread_id)).cloned()
+    }
+
+    fn set(&self, handle: &str, thread_id: &str, session_id: String) {
+        let serialized = {
+            let mut guard = self.map.lock().expect("session store lock poisoned");
+            guard.insert(Self::key(handle, thread_id), session_id);
+            serde_json::to_string_pretty(&*guard).ok()
+        };
+        if let Some(json) = serialized {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(err) = std::fs::write(&self.path, json) {
+                warn!(path = %self.path.display(), error = %err, "failed to persist sessions.json");
+            }
+        }
+    }
 }
 
 pub async fn run_watch(opts: WatchOptions) -> Result<()> {
@@ -102,10 +187,12 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
         targets.len()
     );
 
+    let sessions = SessionStore::load_default();
     let mut join_handles = Vec::with_capacity(targets.len());
     for target in targets {
+        let sessions_clone = sessions.clone();
         join_handles.push(tokio::spawn(async move {
-            if let Err(err) = watch_single_target(target.clone()).await {
+            if let Err(err) = watch_single_target(target.clone(), sessions_clone).await {
                 error!(target = %target.label, error = %err, "watcher exited with error");
             }
         }));
@@ -148,9 +235,12 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 .ok_or_else(|| anyhow!("RELAYPOD_TOKEN (or --token) is required with --exec"))?;
             return Ok(vec![ResolvedTarget {
                 label: "cli".to_string(),
+                agent_type: None,
                 url: opts.default_url.clone(),
                 token,
                 exec: exec_cmd.clone(),
+                args: None,
+                prompt: None,
                 cwd: opts.cwd_override.as_deref().map(expand_tilde),
                 auto_ack: opts.auto_ack_override.unwrap_or(false),
                 drain_on_start: !opts.no_drain,
@@ -206,20 +296,33 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 )
             })?;
 
-        let exec = opts
-            .exec_override
-            .clone()
-            .unwrap_or(h.exec);
-        if exec.trim().is_empty() {
-            return Err(anyhow!("handle '@{name}' has an empty `exec` command"));
+        let exec = opts.exec_override.clone().unwrap_or(h.exec);
+        let agent_type = if opts.exec_override.is_some() {
+            None
+        } else {
+            h.agent_type
+        };
+
+        if agent_type.is_none() && exec.trim().is_empty() {
+            return Err(anyhow!(
+                "handle '@{name}' must set either `agent_type` (codex/claude) or `exec`"
+            ));
         }
 
         targets.push(ResolvedTarget {
             label: format!("@{name}"),
+            agent_type,
             url,
             token,
             exec,
-            cwd: opts.cwd_override.clone().or(h.cwd).as_deref().map(expand_tilde),
+            args: h.args,
+            prompt: h.prompt,
+            cwd: opts
+                .cwd_override
+                .clone()
+                .or(h.cwd)
+                .as_deref()
+                .map(expand_tilde),
             auto_ack: opts.auto_ack_override.unwrap_or(h.auto_ack),
             drain_on_start: if opts.no_drain {
                 false
@@ -234,7 +337,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     Ok(targets)
 }
 
-async fn watch_single_target(target: ResolvedTarget) -> Result<()> {
+async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> Result<()> {
     let client = RelayPodClient::new(target.url.clone(), target.token.clone());
     let me = client
         .me()
@@ -244,6 +347,7 @@ async fn watch_single_target(target: ResolvedTarget) -> Result<()> {
     info!(
         handle = %me.handle,
         kind = %me.kind,
+        agent_type = ?target.agent_type,
         url = %target.url,
         auto_ack = target.auto_ack,
         "Authenticated watcher"
@@ -255,9 +359,17 @@ async fn watch_single_target(target: ResolvedTarget) -> Result<()> {
     let worker_client = client.clone();
     let worker_target = target.clone();
     let worker_handle = me.handle.clone();
+    let worker_sessions = sessions.clone();
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
-            run_exec_for_item(&worker_client, &worker_target, &worker_handle, &item).await;
+            run_exec_for_item(
+                &worker_client,
+                &worker_target,
+                &worker_handle,
+                &item,
+                &worker_sessions,
+            )
+            .await;
             if worker_target.cooldown_secs > 0 {
                 tokio::time::sleep(Duration::from_secs(worker_target.cooldown_secs)).await;
             }
@@ -335,27 +447,14 @@ async fn watch_single_target(target: ResolvedTarget) -> Result<()> {
     Ok(())
 }
 
-async fn run_exec_for_item(
-    client: &RelayPodClient,
+fn apply_common_env(
+    cmd: &mut Command,
     target: &ResolvedTarget,
     handle: &str,
     item: &UnreadItem,
+    thread_id: &str,
+    existing_session: Option<&str>,
 ) {
-    let thread_id = item
-        .parent_id
-        .clone()
-        .unwrap_or_else(|| item.message_id.clone());
-    let rendered_cmd = render_exec_template(&target.exec, handle, item, &thread_id);
-
-    info!(
-        handle = %handle,
-        unread_id = %item.id,
-        channel = %item.channel_name,
-        "Executing watcher command"
-    );
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&rendered_cmd);
     if let Some(ref cwd) = target.cwd {
         cmd.current_dir(cwd);
     }
@@ -365,47 +464,289 @@ async fn run_exec_for_item(
         .env("RELAYPOD_HANDLE", handle)
         .env("RELAYPOD_UNREAD_ID", &item.id)
         .env("RELAYPOD_MESSAGE_ID", &item.message_id)
-        .env("RELAYPOD_THREAD_ID", &thread_id)
+        .env("RELAYPOD_THREAD_ID", thread_id)
         .env("RELAYPOD_CHANNEL_ID", &item.channel_id)
         .env("RELAYPOD_CHANNEL", &item.channel_name)
         .env("RELAYPOD_AUTHOR", &item.author_handle)
         .env("RELAYPOD_REASON", item.reason.to_string())
         .env("RELAYPOD_BODY", &item.body);
 
+    if let Some(sid) = existing_session {
+        cmd.env("RELAYPOD_SESSION_ID", sid);
+    }
+
     for (k, v) in &target.env {
         cmd.env(k, v);
     }
+}
 
-    match cmd.status().await {
-        Ok(status) if status.success() => {
-            info!(handle = %handle, unread_id = %item.id, "Watcher command succeeded");
-            if target.auto_ack {
-                match client.ack_unread(&item.id).await {
-                    Ok(()) => info!(handle = %handle, unread_id = %item.id, "Auto-acked unread item"),
-                    Err(err) => warn!(
+fn build_agent_prompt(
+    target: &ResolvedTarget,
+    handle: &str,
+    item: &UnreadItem,
+    thread_id: &str,
+    is_resume: bool,
+) -> String {
+    if let Some(ref custom) = target.prompt {
+        return render_exec_template(custom, handle, item, thread_id);
+    }
+    if is_resume {
+        format!(
+            "Follow-up reply in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
+            item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
+        )
+    } else {
+        format!(
+            "New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
+            item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
+        )
+    }
+}
+
+fn split_shell_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if in_double => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            other => cur.push(other),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn extract_session_id_from_json_line(agent_type: AgentType, line: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    match agent_type {
+        AgentType::Codex => {
+            if let Some(id) = val.get("thread_id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+            if let Some(id) = val.get("session_id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+            None
+        }
+        AgentType::Claude => val
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    }
+}
+
+async fn run_exec_for_item(
+    client: &RelayPodClient,
+    target: &ResolvedTarget,
+    handle: &str,
+    item: &UnreadItem,
+    sessions: &SessionStore,
+) {
+    let thread_id = item
+        .parent_id
+        .clone()
+        .unwrap_or_else(|| item.message_id.clone());
+    let existing_session = sessions.get(handle, &thread_id);
+
+    let succeeded = match target.agent_type {
+        Some(agent_type) => {
+            run_managed_agent(
+                agent_type,
+                target,
+                handle,
+                item,
+                &thread_id,
+                existing_session.as_deref(),
+                sessions,
+            )
+            .await
+        }
+        None => {
+            let rendered_cmd = render_exec_template(&target.exec, handle, item, &thread_id);
+            info!(
+                handle = %handle,
+                unread_id = %item.id,
+                channel = %item.channel_name,
+                "Executing watcher command"
+            );
+
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(&rendered_cmd);
+            apply_common_env(
+                &mut cmd,
+                target,
+                handle,
+                item,
+                &thread_id,
+                existing_session.as_deref(),
+            );
+
+            match cmd.status().await {
+                Ok(status) if status.success() => true,
+                Ok(status) => {
+                    warn!(
+                        handle = %handle,
+                        unread_id = %item.id,
+                        code = ?status.code(),
+                        "Watcher command exited non-zero"
+                    );
+                    false
+                }
+                Err(err) => {
+                    error!(
                         handle = %handle,
                         unread_id = %item.id,
                         error = %err,
-                        "Auto-ack failed (item may already be acked by the agent)"
-                    ),
+                        "Failed to spawn watcher command"
+                    );
+                    false
                 }
             }
         }
+    };
+
+    if succeeded {
+        info!(handle = %handle, unread_id = %item.id, "Watcher command succeeded");
+        if target.auto_ack {
+            match client.ack_unread(&item.id).await {
+                Ok(()) => {
+                    info!(handle = %handle, unread_id = %item.id, "Auto-acked unread item")
+                }
+                Err(err) => warn!(
+                    handle = %handle,
+                    unread_id = %item.id,
+                    error = %err,
+                    "Auto-ack failed (item may already be acked by the agent)"
+                ),
+            }
+        }
+    }
+}
+
+async fn run_managed_agent(
+    agent_type: AgentType,
+    target: &ResolvedTarget,
+    handle: &str,
+    item: &UnreadItem,
+    thread_id: &str,
+    existing_session: Option<&str>,
+    sessions: &SessionStore,
+) -> bool {
+    let is_resume = existing_session.is_some();
+    let prompt = build_agent_prompt(target, handle, item, thread_id, is_resume);
+    let extra_args = target
+        .args
+        .as_deref()
+        .map(split_shell_words)
+        .unwrap_or_default();
+
+    let mut cmd = match agent_type {
+        AgentType::Codex => {
+            let mut c = Command::new("codex");
+            c.arg("exec");
+            if let Some(sid) = existing_session {
+                c.arg("resume").arg(sid);
+            }
+            c.arg("--json");
+            c.args(&extra_args);
+            c.arg(&prompt);
+            c
+        }
+        AgentType::Claude => {
+            let mut c = Command::new("claude");
+            c.arg("-p").arg("--output-format").arg("json");
+            if let Some(sid) = existing_session {
+                c.arg("--resume").arg(sid);
+            }
+            c.args(&extra_args);
+            c.arg(&prompt);
+            c
+        }
+    };
+
+    apply_common_env(&mut cmd, target, handle, item, thread_id, existing_session);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+    info!(
+        handle = %handle,
+        agent_type = ?agent_type,
+        thread_id = %thread_id,
+        unread_id = %item.id,
+        resuming = is_resume,
+        session_id = ?existing_session,
+        "Launching managed agent"
+    );
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                handle = %handle,
+                agent_type = ?agent_type,
+                error = %err,
+                "Failed to spawn managed agent"
+            );
+            return false;
+        }
+    };
+
+    let mut captured_session: Option<String> = None;
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if captured_session.is_none() {
+                if let Some(sid) = extract_session_id_from_json_line(agent_type, &line) {
+                    info!(
+                        handle = %handle,
+                        thread_id = %thread_id,
+                        session_id = %sid,
+                        "Captured agent session ID for thread"
+                    );
+                    sessions.set(handle, thread_id, sid.clone());
+                    captured_session = Some(sid);
+                }
+            }
+            println!("{line}");
+        }
+    }
+
+    match child.wait().await {
+        Ok(status) if status.success() => true,
         Ok(status) => {
             warn!(
                 handle = %handle,
+                agent_type = ?agent_type,
                 unread_id = %item.id,
                 code = ?status.code(),
-                "Watcher command exited non-zero"
+                "Managed agent exited non-zero"
             );
+            false
         }
         Err(err) => {
             error!(
                 handle = %handle,
-                unread_id = %item.id,
+                agent_type = ?agent_type,
                 error = %err,
-                "Failed to spawn watcher command"
+                "Failed waiting on managed agent"
             );
+            false
         }
     }
 }
@@ -515,6 +856,14 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                     .expect("handle entry exists");
 
                 match key.as_str() {
+                    "agent_type" => {
+                        let parsed = AgentType::parse(&unquote_yaml(val)).ok_or_else(|| {
+                            anyhow!(
+                                "line {line_no}: unknown agent_type `{val}` (expected `codex` or `claude`)"
+                            )
+                        })?;
+                        entry.agent_type = Some(parsed);
+                    }
                     "url" => entry.url = Some(expand_env_vars(&unquote_yaml(val))),
                     "token" => {
                         let expanded = expand_env_vars(&unquote_yaml(val));
@@ -523,6 +872,8 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                         }
                     }
                     "exec" => entry.exec = expand_env_vars(&unquote_yaml(val)),
+                    "args" => entry.args = Some(expand_env_vars(&unquote_yaml(val))),
+                    "prompt" => entry.prompt = Some(expand_env_vars(&unquote_yaml(val))),
                     "cwd" => entry.cwd = Some(expand_env_vars(&unquote_yaml(val))),
                     "auto_ack" => {
                         entry.auto_ack = parse_bool(val)
@@ -734,5 +1085,45 @@ handles:
         let yaml = "handles:\n  bot:\n    token: ${RELAYPOD_TEST_YAML_TOK}\n    exec: echo hi\n";
         let cfg = parse_yaml_config(yaml).unwrap();
         assert_eq!(cfg.handles["bot"].token.as_deref(), Some("rp_from_env"));
+    }
+
+    #[test]
+    fn parses_agent_type_and_extracts_session_ids() {
+        let yaml = r#"
+url: http://127.0.0.1:8787
+handles:
+  marcin-codex:
+    agent_type: codex
+    token: rp_123
+    args: --full-auto --skip-git-repo-check
+    cwd: ~/projects/relaypod
+  claude-local:
+    agent_type: claude
+    token: rp_456
+"#;
+        let cfg = parse_yaml_config(yaml).unwrap();
+        assert_eq!(cfg.handles["marcin-codex"].agent_type, Some(AgentType::Codex));
+        assert_eq!(
+            cfg.handles["marcin-codex"].args.as_deref(),
+            Some("--full-auto --skip-git-repo-check")
+        );
+        assert_eq!(cfg.handles["claude-local"].agent_type, Some(AgentType::Claude));
+
+        let codex_line = r#"{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}"#;
+        assert_eq!(
+            extract_session_id_from_json_line(AgentType::Codex, codex_line).as_deref(),
+            Some("0199a213-81c0-7800-8aa1-bbab2a035a53")
+        );
+
+        let claude_line = r#"{"type":"result","session_id":"sess_abc123","result":"done"}"#;
+        assert_eq!(
+            extract_session_id_from_json_line(AgentType::Claude, claude_line).as_deref(),
+            Some("sess_abc123")
+        );
+
+        assert_eq!(
+            split_shell_words(r#"--full-auto -m "gpt-5" --skip-git-repo-check"#),
+            vec!["--full-auto", "-m", "gpt-5", "--skip-git-repo-check"]
+        );
     }
 }

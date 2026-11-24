@@ -54,6 +54,8 @@ struct RelayPodApp {
     new_agent_display: String,
     new_agent_kind: IdentityKind,
     last_created_identity: Option<CreatedIdentity>,
+
+    pending_delete_message: Option<Message>,
 }
 
 impl RelayPodApp {
@@ -92,6 +94,7 @@ impl RelayPodApp {
             new_agent_display: String::new(),
             new_agent_kind: IdentityKind::Agent,
             last_created_identity: None,
+            pending_delete_message: None,
         }
     }
 
@@ -239,6 +242,82 @@ impl RelayPodApp {
                         }
                     }
                 });
+        }
+
+        if let Some(msg) = self.pending_delete_message.clone() {
+            let mut close_modal = false;
+            let mut confirmed = false;
+
+            let modal = egui::Modal::new(egui::Id::new("confirm_delete_modal")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Delete message?");
+                ui.add_space(6.0);
+
+                let preview = if msg.body.chars().count() > 120 {
+                    let truncated: String = msg.body.chars().take(120).collect();
+                    format!("{truncated}...")
+                } else {
+                    msg.body.clone()
+                };
+
+                egui::Frame::group(ui.style())
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.strong(format!("@{}", msg.author_handle));
+                        ui.label(
+                            egui::RichText::new(preview)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+
+                ui.add_space(8.0);
+                if msg.reply_count > 0 {
+                    ui.colored_label(
+                        Color32::from_rgb(248, 113, 113),
+                        format!(
+                            "This will also permanently delete {} {} in this thread.",
+                            msg.reply_count,
+                            if msg.reply_count == 1 {
+                                "reply"
+                            } else {
+                                "replies"
+                            }
+                        ),
+                    );
+                } else {
+                    ui.label("This action cannot be undone.");
+                }
+
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let delete_btn = egui::Button::new(
+                        egui::RichText::new("Delete").color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(220, 38, 38))
+                    .corner_radius(CornerRadius::same(8));
+                    if ui.add(delete_btn).clicked() {
+                        confirmed = true;
+                        close_modal = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+
+            if modal.should_close() {
+                close_modal = true;
+            }
+            if confirmed {
+                self.runtime.send(ClientCommand::DeleteMessage {
+                    message_id: msg.id,
+                });
+            }
+            if close_modal {
+                self.pending_delete_message = None;
+            }
         }
     }
 }
@@ -452,7 +531,8 @@ impl eframe::App for RelayPodApp {
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             ui.add_space(4.0);
-                            let parent_is_me = my_id.as_deref() == Some(thread.parent.author_id.as_str());
+                            let parent_is_me =
+                                my_id.as_deref() == Some(thread.parent.author_id.as_str());
                             render_thread_bubble(ui, &thread.parent, parent_is_me);
 
                             ui.add_space(6.0);
@@ -536,12 +616,18 @@ impl eframe::App for RelayPodApp {
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         for msg in msgs {
-                            let open_thread = render_message_card(ui, &msg, true);
-                            if open_thread {
-                                self.show_unread_drawer = false;
-                                self.runtime.send(ClientCommand::LoadThread {
-                                    message_id: msg.id.clone(),
-                                });
+                            let action = render_message_card(ui, &msg, true);
+                            match action {
+                                MessageCardAction::OpenThread => {
+                                    self.show_unread_drawer = false;
+                                    self.runtime.send(ClientCommand::LoadThread {
+                                        message_id: msg.id.clone(),
+                                    });
+                                }
+                                MessageCardAction::Delete => {
+                                    self.pending_delete_message = Some(msg.clone());
+                                }
+                                MessageCardAction::None => {}
                             }
                             ui.add_space(6.0);
                         }
@@ -961,8 +1047,14 @@ fn draw_kind_badge(ui: &mut egui::Ui, kind: IdentityKind) {
     }
 }
 
-fn render_message_card(ui: &mut egui::Ui, msg: &Message, show_thread_btn: bool) -> bool {
-    let mut clicked_thread = false;
+enum MessageCardAction {
+    None,
+    OpenThread,
+    Delete,
+}
+
+fn render_message_card(ui: &mut egui::Ui, msg: &Message, show_thread_btn: bool) -> MessageCardAction {
+    let mut action = MessageCardAction::None;
     egui::Frame::group(ui.style())
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(12, 10))
@@ -971,23 +1063,36 @@ fn render_message_card(ui: &mut egui::Ui, msg: &Message, show_thread_btn: bool) 
             ui.horizontal(|ui| {
                 draw_kind_badge(ui, msg.author_kind);
                 ui.strong(format!("@{}", msg.author_handle));
-                if show_thread_btn {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let del_btn = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("×")
+                                    .size(13.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Delete message & thread");
+                    if del_btn.clicked() {
+                        action = MessageCardAction::Delete;
+                    }
+                    if show_thread_btn {
                         let label = if msg.reply_count > 0 {
                             format!("{} replies", msg.reply_count)
                         } else {
                             "Reply".to_string()
                         };
                         if ui.small_button(label).clicked() {
-                            clicked_thread = true;
+                            action = MessageCardAction::OpenThread;
                         }
-                    });
-                }
+                    }
+                });
             });
             ui.add_space(4.0);
             markdown::render_markdown(ui, &msg.body);
         });
-    clicked_thread
+    action
 }
 
 /// Renders a thread message as a chat bubble:

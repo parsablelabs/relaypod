@@ -185,4 +185,19 @@ impl RelayPodClient {
         }
         Ok(())
     }
+
+    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/api/messages/{message_id}", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("server returned {status}: {text}"));
+        }
+        Ok(())
+    }
 }

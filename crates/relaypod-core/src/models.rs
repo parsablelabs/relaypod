@@ -149,10 +149,24 @@ pub struct PostMessageResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletedMessage {
+    pub message_id: String,
+    pub channel_id: String,
+    pub parent_id: Option<String>,
+    pub affected_unread: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WsEvent {
     #[serde(rename = "message.created")]
     MessageCreated(Message),
+    #[serde(rename = "message.deleted")]
+    MessageDeleted {
+        message_id: String,
+        channel_id: String,
+        parent_id: Option<String>,
+    },
     #[serde(rename = "unread.created")]
     UnreadCreated(UnreadItem),
     #[serde(rename = "unread.acked")]

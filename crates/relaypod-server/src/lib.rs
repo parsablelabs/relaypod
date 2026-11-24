@@ -5,7 +5,7 @@ use axum::{
     },
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -258,6 +258,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/channels/{id}/messages",
             get(list_channel_messages).post(post_message),
         )
+        .route("/api/messages/{id}", delete(delete_message))
         .route("/api/messages/{id}/thread", get(get_thread))
         .route("/api/unread", get(list_unread))
         .route("/api/unread/{id}/ack", post(ack_unread))
@@ -374,6 +375,26 @@ async fn post_message(
     }
 
     Ok((StatusCode::CREATED, Json(res.message)))
+}
+
+async fn delete_message(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(_): AuthIdentity,
+    Path(message_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let deleted = state.store.delete_message(&message_id)?;
+    for (unread_id, identity_id) in deleted.affected_unread {
+        state.emit(WsEvent::UnreadAcked {
+            unread_id,
+            identity_id,
+        });
+    }
+    state.emit(WsEvent::MessageDeleted {
+        message_id: deleted.message_id,
+        channel_id: deleted.channel_id,
+        parent_id: deleted.parent_id,
+    });
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_thread(

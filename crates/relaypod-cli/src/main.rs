@@ -96,6 +96,11 @@ enum Commands {
         /// Parent (or reply) message ID
         message_id: String,
     },
+    /// Delete a message (and its thread replies if it is a parent message)
+    Delete {
+        /// Message ID to delete
+        message_id: String,
+    },
     /// Inspect or acknowledge items in your unread queue
     Unread {
         /// Acknowledge the given unread item ID
@@ -288,6 +293,11 @@ async fn main() -> Result<()> {
             for r in thread.replies {
                 println!("  └ [{}] @{}: {}", r.id, r.author_handle, r.body);
             }
+        }
+        Commands::Delete { message_id } => {
+            let client = require_client(&cli)?;
+            client.delete_message(message_id).await?;
+            println!("Deleted message {message_id}");
         }
         Commands::Unread { ack } => {
             let client = require_client(&cli)?;
