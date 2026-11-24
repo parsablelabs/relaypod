@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -56,6 +57,7 @@ pub struct Channel {
     pub name: String,
     pub description: String,
     pub created_at: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +138,21 @@ pub struct CreateChannelRequest {
     pub description: String,
 }
 
+/// Fields to update on a channel. Omitted fields retain their current values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateChannelRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub archived: Option<bool>,
+}
+
+/// Identifies the deleted channel and the pending unread items removed with it.
+#[derive(Debug)]
+pub struct DeletedChannel {
+    pub channel_id: String,
+    pub unread_removed: HashMap<String, i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostMessageRequest {
     pub body: String,
@@ -176,6 +193,13 @@ pub enum WsEvent {
     },
     #[serde(rename = "channel.created")]
     ChannelCreated(Channel),
+    #[serde(rename = "channel.updated")]
+    ChannelUpdated(Channel),
+    #[serde(rename = "channel.deleted")]
+    ChannelDeleted {
+        channel_id: String,
+        unread_removed: HashMap<String, i64>,
+    },
     #[serde(rename = "identity.created")]
     IdentityCreated(Identity),
     #[serde(rename = "presence.changed")]

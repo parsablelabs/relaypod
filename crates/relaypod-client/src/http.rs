@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use relaypod_core::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, Message,
-    PostMessageRequest, ThreadView, UnreadItem,
+    PostMessageRequest, ThreadView, UnreadItem, UpdateChannelRequest,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -101,9 +101,19 @@ impl RelayPodClient {
     }
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {
+        self.fetch_channels("/api/channels").await
+    }
+
+    /// Lists channels including those with read-only history.
+    pub async fn list_channels_including_archived(&self) -> Result<Vec<Channel>> {
+        self.fetch_channels("/api/channels?include_archived=true")
+            .await
+    }
+
+    async fn fetch_channels(&self, path: &str) -> Result<Vec<Channel>> {
         let resp = self
             .http
-            .get(format!("{}/api/channels", self.base_url))
+            .get(format!("{}{path}", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -119,6 +129,36 @@ impl RelayPodClient {
             .send()
             .await?;
         Self::parse_json(resp).await
+    }
+
+    /// Applies a channel update using its ID or name.
+    pub async fn update_channel(
+        &self,
+        channel: &str,
+        req: &UpdateChannelRequest,
+    ) -> Result<Channel> {
+        let url = self.channel_url(channel)?;
+        let resp = self
+            .http
+            .patch(url)
+            .bearer_auth(&self.token)
+            .json(req)
+            .send()
+            .await?;
+        Self::parse_json(resp).await
+    }
+
+    /// Permanently deletes a channel using its ID or name.
+    pub async fn delete_channel(&self, channel: &str) -> Result<()> {
+        self.delete(self.channel_url(channel)?).await
+    }
+
+    fn channel_url(&self, channel: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/channels", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid RelayPod server URL"))?
+            .push(channel);
+        Ok(url)
     }
 
     pub async fn list_channel_messages(&self, channel: &str, limit: usize) -> Result<Vec<Message>> {
@@ -187,9 +227,14 @@ impl RelayPodClient {
     }
 
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        self.delete(format!("{}/api/messages/{message_id}", self.base_url))
+            .await
+    }
+
+    async fn delete(&self, url: impl reqwest::IntoUrl) -> Result<()> {
         let resp = self
             .http
-            .delete(format!("{}/api/messages/{message_id}", self.base_url))
+            .delete(url)
             .bearer_auth(&self.token)
             .send()
             .await?;

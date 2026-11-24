@@ -5,13 +5,13 @@ use axum::{
     },
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use relaypod_core::{
-    CoreError, CreateChannelRequest, CreateIdentityRequest, Identity, PostMessageRequest, Store,
-    WsClientMessage, WsEvent,
+    CoreError, CreateChannelRequest, CreateIdentityRequest, Identity, IdentityKind,
+    PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage, WsEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<WsEvent>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
+    // Keep board events in the same order as their committed writes.
+    board_writes: Mutex<()>,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             store,
             events,
             presence: Mutex::new(HashMap::new()),
+            board_writes: Mutex::new(()),
         })
     }
 
@@ -216,6 +219,16 @@ impl FromRequestParts<Arc<AppState>> for AuthIdentity {
     }
 }
 
+fn require_human(identity: &Identity) -> Result<(), ApiError> {
+    if identity.kind != IdentityKind::Human {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "human identity required",
+        ));
+    }
+    Ok(())
+}
+
 fn extract_bearer_or_query_token(parts: &Parts) -> Option<String> {
     if let Some(val) = parts
         .headers
@@ -254,6 +267,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/me", get(get_me))
         .route("/api/identities", get(list_identities).post(create_identity))
         .route("/api/channels", get(list_channels).post(create_channel))
+        .route(
+            "/api/channels/{id}",
+            patch(update_channel).delete(delete_channel),
+        )
         .route(
             "/api/channels/{id}/messages",
             get(list_channel_messages).post(post_message),
@@ -313,7 +330,9 @@ async fn create_identity(
     AuthIdentity(caller): AuthIdentity,
     Json(mut req): Json<CreateIdentityRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::CreatedIdentity>), ApiError> {
-    if req.owner_id.is_none() && req.kind == relaypod_core::IdentityKind::Agent {
+    if req.kind == IdentityKind::Human {
+        require_human(&caller)?;
+    } else if req.owner_id.is_none() {
         req.owner_id = Some(caller.id);
     }
     let created = state.store.create_identity(req)?;
@@ -321,11 +340,21 @@ async fn create_identity(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+#[derive(Debug, Deserialize)]
+struct ChannelListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
 async fn list_channels(
     State(state): State<Arc<AppState>>,
     AuthIdentity(_): AuthIdentity,
+    Query(query): Query<ChannelListQuery>,
 ) -> Result<Json<Vec<relaypod_core::Channel>>, ApiError> {
-    let channels = state.store.list_channels()?;
+    let mut channels = state.store.list_channels()?;
+    if !query.include_archived {
+        channels.retain(|channel| channel.archived_at.is_none());
+    }
     Ok(Json(channels))
 }
 
@@ -334,9 +363,47 @@ async fn create_channel(
     AuthIdentity(_): AuthIdentity,
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::Channel>), ApiError> {
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
     let channel = state.store.create_channel(req)?;
     state.emit(WsEvent::ChannelCreated(channel.clone()));
     Ok((StatusCode::CREATED, Json(channel)))
+}
+
+async fn update_channel(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(caller): AuthIdentity,
+    Path(channel_id): Path<String>,
+    Json(request): Json<UpdateChannelRequest>,
+) -> Result<Json<relaypod_core::Channel>, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
+    let channel = state.store.update_channel(&channel_id, request)?;
+    state.emit(WsEvent::ChannelUpdated(channel.clone()));
+    Ok(Json(channel))
+}
+
+async fn delete_channel(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(caller): AuthIdentity,
+    Path(channel_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
+    let deleted = state.store.delete_channel(&channel_id)?;
+    state.emit(WsEvent::ChannelDeleted {
+        channel_id: deleted.channel_id,
+        unread_removed: deleted.unread_removed,
+    });
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,6 +432,10 @@ async fn post_message(
     Path(channel_id): Path<String>,
     Json(req): Json<PostMessageRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::Message>), ApiError> {
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
     let res = state
         .store
         .post_message(&channel_id, &author, &req.body, req.parent_id)?;
@@ -379,9 +450,14 @@ async fn post_message(
 
 async fn delete_message(
     State(state): State<Arc<AppState>>,
-    AuthIdentity(_): AuthIdentity,
+    AuthIdentity(caller): AuthIdentity,
     Path(message_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
     let deleted = state.store.delete_message(&message_id)?;
     for (unread_id, identity_id) in deleted.affected_unread {
         state.emit(WsEvent::UnreadAcked {
@@ -419,6 +495,10 @@ async fn ack_unread(
     AuthIdentity(identity): AuthIdentity,
     Path(unread_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
     state.store.ack_unread(&identity.id, &unread_id)?;
     state.emit(WsEvent::UnreadAcked {
         unread_id,

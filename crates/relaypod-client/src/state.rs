@@ -38,6 +38,7 @@ impl WorkspaceState {
     pub fn select_channel(&mut self, channel_id: String) -> ClientCommand {
         self.selected_channel_id = Some(channel_id.clone());
         self.active_thread = None;
+        self.messages.clear();
         ClientCommand::LoadChannelMessages { channel_id }
     }
 
@@ -59,7 +60,7 @@ impl WorkspaceState {
                 self.unread = unread;
 
                 if self.selected_channel_id.is_none() {
-                    if let Some(first) = self.channels.first() {
+                    if let Some(first) = self.channels.iter().find(|ch| ch.archived_at.is_none()) {
                         let cmd = self.select_channel(first.id.clone());
                         effects.commands.push(cmd);
                     }
@@ -85,7 +86,13 @@ impl WorkspaceState {
                 }
             }
             ClientEvent::ThreadLoaded(thread) => {
-                self.active_thread = Some(thread);
+                if self
+                    .channels
+                    .iter()
+                    .any(|ch| ch.id == thread.parent.channel_id)
+                {
+                    self.active_thread = Some(thread);
+                }
             }
             ClientEvent::ChannelCreated(ch) => {
                 if !self.channels.iter().any(|c| c.id == ch.id) {
@@ -106,7 +113,14 @@ impl WorkspaceState {
                 effects.identity_just_created = Some(created);
             }
             ClientEvent::UnreadLoaded(items) => {
-                self.unread = items;
+                self.unread = items
+                    .into_iter()
+                    .filter_map(|mut item| {
+                        let channel = self.channels.iter().find(|ch| ch.id == item.channel_id)?;
+                        item.channel_name.clone_from(&channel.name);
+                        Some(item)
+                    })
+                    .collect();
             }
             ClientEvent::WsStatus(live) => {
                 self.ws_live = live;
@@ -114,13 +128,13 @@ impl WorkspaceState {
             ClientEvent::Error(msg) => {
                 self.status_error = Some(msg);
             }
-            ClientEvent::Ws(ws_ev) => self.apply_ws(ws_ev),
+            ClientEvent::Ws(ws_ev) => self.apply_ws(ws_ev, &mut effects),
         }
 
         effects
     }
 
-    fn apply_ws(&mut self, ev: WsEvent) {
+    fn apply_ws(&mut self, ev: WsEvent, effects: &mut StateEffects) {
         match ev {
             WsEvent::MessageCreated(msg) => {
                 if let Some(parent_id) = &msg.parent_id {
@@ -198,6 +212,48 @@ impl WorkspaceState {
                     self.channels.push(ch);
                 }
             }
+            WsEvent::ChannelUpdated(ch) => {
+                for item in self
+                    .unread
+                    .iter_mut()
+                    .filter(|item| item.channel_id == ch.id)
+                {
+                    item.channel_name.clone_from(&ch.name);
+                }
+                if let Some(current) = self.channels.iter_mut().find(|current| current.id == ch.id)
+                {
+                    *current = ch;
+                } else {
+                    self.channels.push(ch);
+                }
+                self.channels.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            WsEvent::ChannelDeleted {
+                channel_id,
+                unread_removed,
+            } => {
+                self.channels.retain(|ch| ch.id != channel_id);
+                self.unread.retain(|item| item.channel_id != channel_id);
+                for identity in self.identities.iter_mut() {
+                    if let Some(count) = unread_removed.get(&identity.id) {
+                        identity.unread_count = (identity.unread_count - count).max(0);
+                    }
+                }
+                if self
+                    .active_thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.parent.channel_id == channel_id)
+                {
+                    self.active_thread = None;
+                }
+                if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
+                    self.selected_channel_id = None;
+                    self.messages.clear();
+                    if let Some(first) = self.channels.iter().find(|ch| ch.archived_at.is_none()) {
+                        effects.commands.push(self.select_channel(first.id.clone()));
+                    }
+                }
+            }
             WsEvent::IdentityCreated(id) => {
                 if !self.identities.iter().any(|i| i.id == id.id) {
                     self.identities.push(id);
@@ -247,6 +303,7 @@ mod tests {
             id: "c1".into(),
             name: "general".into(),
             description: String::new(),
+            archived_at: None,
             created_at: 0,
         };
 
@@ -323,5 +380,52 @@ mod tests {
             online: false,
         }));
         assert!(!state.identities[1].online);
+
+        let mut archived_channel = state.channels[0].clone();
+        archived_channel.name = "builds".into();
+        archived_channel.archived_at = Some(3);
+        let agent_unread = UnreadItem {
+            id: "un2".into(),
+            identity_id: me.id.clone(),
+            message_id: root.id.clone(),
+            channel_id: root.channel_id.clone(),
+            channel_name: "general".into(),
+            parent_id: None,
+            author_handle: "codex".into(),
+            body: "Build is green!".into(),
+            reason: UnreadReason::Mention,
+            acked_at: None,
+            created_at: 2,
+        };
+        state.apply(ClientEvent::Ws(WsEvent::UnreadCreated(agent_unread)));
+        state.apply(ClientEvent::ThreadLoaded(ThreadView {
+            parent: root,
+            replies: vec![],
+        }));
+        state.apply(ClientEvent::Ws(WsEvent::ChannelUpdated(archived_channel)));
+        assert_eq!(state.unread[0].channel_name, "builds");
+        assert!(state.active_channel().unwrap().archived_at.is_some());
+        assert!(state.active_thread.is_some());
+        assert_eq!(state.messages.len(), 1);
+
+        state.apply(ClientEvent::Ws(WsEvent::ChannelCreated(Channel {
+            id: "c2".into(),
+            name: "general".into(),
+            description: String::new(),
+            created_at: 4,
+            archived_at: None,
+        })));
+        let effects = state.apply(ClientEvent::Ws(WsEvent::ChannelDeleted {
+            channel_id: "c1".into(),
+            unread_removed: [(me.id, 1)].into(),
+        }));
+        assert!(state.unread.is_empty());
+        assert_eq!(state.identities[0].unread_count, 0);
+        assert!(state.messages.is_empty());
+        assert!(state.active_thread.is_none());
+        assert_eq!(state.selected_channel_id.as_deref(), Some("c2"));
+        assert!(
+            matches!(&effects.commands[..], [ClientCommand::LoadChannelMessages { channel_id }] if channel_id == "c2")
+        );
     }
 }

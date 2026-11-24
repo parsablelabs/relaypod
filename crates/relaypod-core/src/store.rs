@@ -2,11 +2,12 @@ use crate::auth::{
     extract_mentions, generate_token, hash_token, normalize_channel_name, normalize_handle,
 };
 use crate::models::{
-    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedMessage,
-    Identity, IdentityKind, Message, PostMessageResult, ThreadView, UnreadItem, UnreadReason,
+    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedChannel,
+    DeletedMessage, Identity, IdentityKind, Message, PostMessageResult, ThreadView, UnreadItem,
+    UnreadReason, UpdateChannelRequest,
 };
-use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,7 +83,8 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                archived_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -115,22 +117,21 @@ impl Store {
         Ok(())
     }
 
-    /// Ensures a default `#general` channel exists and, if no identities exist yet,
-    /// creates an initial admin human identity and returns its plaintext token.
+    /// Creates the default channel and initial human identity when starting a new board.
+    /// Returns the new identity and its plaintext token.
     pub fn bootstrap(&self, admin_handle: &str) -> CoreResult<Option<CreatedIdentity>> {
-        if self.get_channel_by_name("general")?.is_none() {
-            self.create_channel(CreateChannelRequest {
-                name: "general".to_string(),
-                description: "Shared workspace for humans and agents".to_string(),
-            })?;
-        }
-
         let count: i64 = {
             let conn = self.conn.lock().expect("store lock poisoned");
             conn.query_row("SELECT COUNT(*) FROM identities", [], |row| row.get(0))?
         };
 
         if count == 0 {
+            if self.get_channel_by_name("general")?.is_none() {
+                self.create_channel(CreateChannelRequest {
+                    name: "general".to_string(),
+                    description: "Shared workspace for humans and agents".to_string(),
+                })?;
+            }
             let created = self.create_identity(CreateIdentityRequest {
                 handle: admin_handle.to_string(),
                 display_name: Some(admin_handle.to_string()),
@@ -237,17 +238,7 @@ impl Store {
     }
 
     pub fn create_channel(&self, req: CreateChannelRequest) -> CoreResult<Channel> {
-        let name = normalize_channel_name(&req.name);
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(CoreError::InvalidInput(
-                "channel name must be non-empty and contain only letters, digits, '-' or '_'"
-                    .into(),
-            ));
-        }
+        let name = validate_channel_name(&req.name)?;
 
         let id = new_id();
         let created_at = now_ms();
@@ -263,6 +254,7 @@ impl Store {
                 name,
                 description: req.description,
                 created_at,
+                archived_at: None,
             }),
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -278,7 +270,7 @@ impl Store {
     pub fn list_channels(&self) -> CoreResult<Vec<Channel>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at FROM channels ORDER BY name ASC",
+            "SELECT id, name, description, created_at, archived_at FROM channels ORDER BY name ASC",
         )?;
         let rows = stmt.query_map([], row_to_channel)?;
         let mut out = Vec::new();
@@ -289,21 +281,92 @@ impl Store {
     }
 
     pub fn get_channel(&self, id_or_name: &str) -> CoreResult<Option<Channel>> {
-        let normalized = normalize_channel_name(id_or_name);
         let conn = self.conn.lock().expect("store lock poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at FROM channels WHERE id = ?1 OR name = ?2",
+        find_channel(&conn, id_or_name)
+    }
+
+    /// Updates the supplied fields together and preserves the original archive time on retries.
+    pub fn update_channel(
+        &self,
+        id_or_name: &str,
+        request: UpdateChannelRequest,
+    ) -> CoreResult<Channel> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut channel = require_channel(&tx, id_or_name)?;
+
+        if let Some(name) = request.name {
+            channel.name = validate_channel_name(&name)?;
+        }
+        if let Some(description) = request.description {
+            channel.description = description;
+        }
+        match request.archived {
+            Some(true) => {
+                channel.archived_at.get_or_insert_with(now_ms);
+            }
+            Some(false) => channel.archived_at = None,
+            None => {}
+        }
+
+        let result = tx.execute(
+            "UPDATE channels SET name = ?2, description = ?3, archived_at = ?4 WHERE id = ?1",
+            params![
+                channel.id,
+                channel.name,
+                channel.description,
+                channel.archived_at
+            ],
+        );
+        match result {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                return Err(CoreError::Conflict(format!(
+                    "channel '#{}' already exists",
+                    channel.name
+                )));
+            }
+            result => {
+                result?;
+            }
+        }
+        tx.commit()?;
+        Ok(channel)
+    }
+
+    /// Permanently removes a channel and its messages and unread items in one transaction.
+    pub fn delete_channel(&self, id_or_name: &str) -> CoreResult<DeletedChannel> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let channel = require_channel(&tx, id_or_name)?;
+        let unread_removed = {
+            let mut stmt = tx.prepare(
+                "SELECT u.identity_id, COUNT(*) FROM unread_items u
+                 JOIN messages m ON m.id = u.message_id
+                 WHERE m.channel_id = ?1 AND u.acked_at IS NULL GROUP BY u.identity_id",
+            )?;
+            let rows = stmt.query_map([&channel.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<HashMap<_, _>, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM unread_items WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?1)",
+            [&channel.id],
         )?;
-        Ok(stmt
-            .query_row(params![id_or_name, normalized], row_to_channel)
-            .optional()?)
+        tx.execute("DELETE FROM messages WHERE channel_id = ?1", [&channel.id])?;
+        tx.execute("DELETE FROM channels WHERE id = ?1", [&channel.id])?;
+        tx.commit()?;
+        Ok(DeletedChannel {
+            channel_id: channel.id,
+            unread_removed,
+        })
     }
 
     pub fn get_channel_by_name(&self, name: &str) -> CoreResult<Option<Channel>> {
         let normalized = normalize_channel_name(name);
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at FROM channels WHERE name = ?1",
+            "SELECT id, name, description, created_at, archived_at FROM channels WHERE name = ?1",
         )?;
         Ok(stmt
             .query_row(params![normalized], row_to_channel)
@@ -322,15 +385,14 @@ impl Store {
             return Err(CoreError::InvalidInput("message body cannot be empty".into()));
         }
 
-        let channel = self
-            .get_channel(channel_id_or_name)?
-            .ok_or_else(|| CoreError::NotFound(format!("channel '{channel_id_or_name}'")))?;
-
-        let conn = self.conn.lock().expect("store lock poisoned");
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let channel = require_channel(&tx, channel_id_or_name)?;
+        ensure_channel_writable(&channel)?;
 
         // Validate parent message if replying in a thread
         let resolved_parent_id = if let Some(pid) = parent_id {
-            let parent_row: Option<(String, Option<String>)> = conn
+            let parent_row: Option<(String, Option<String>)> = tx
                 .query_row(
                     "SELECT channel_id, parent_id FROM messages WHERE id = ?1",
                     params![pid],
@@ -353,7 +415,7 @@ impl Store {
         let msg_id = new_id();
         let created_at = now_ms();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO messages (id, channel_id, parent_id, author_id, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -371,7 +433,7 @@ impl Store {
 
         // 1. Enqueue unread items for @mentions
         for handle in extract_mentions(trimmed) {
-            let target_id: Option<String> = conn
+            let target_id: Option<String> = tx
                 .query_row(
                     "SELECT id FROM identities WHERE handle = ?1",
                     params![handle],
@@ -382,7 +444,7 @@ impl Store {
             if let Some(target_id) = target_id {
                 if target_id != author.id && notified_identities.insert(target_id.clone()) {
                     let unread_id = new_id();
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO unread_items (id, identity_id, message_id, reason, acked_at, created_at)
                          VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
                         params![
@@ -410,17 +472,21 @@ impl Store {
             }
         }
 
-        // 2. If this is a thread reply, notify prior participants in the thread
+        // 2. If this is a thread reply, notify prior human participants in the thread
+        // (agents must be explicitly @mentioned to avoid waking every agent in multi-agent threads)
         if let Some(ref root_id) = resolved_parent_id {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT author_id FROM messages WHERE id = ?1 OR parent_id = ?1",
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT m.author_id
+                 FROM messages m
+                 JOIN identities i ON i.id = m.author_id
+                 WHERE (m.id = ?1 OR m.parent_id = ?1) AND i.kind = 'human'",
             )?;
             let participants = stmt.query_map(params![root_id], |r| r.get::<_, String>(0))?;
             for participant in participants {
                 let target_id = participant?;
                 if target_id != author.id && notified_identities.insert(target_id.clone()) {
                     let unread_id = new_id();
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO unread_items (id, identity_id, message_id, reason, acked_at, created_at)
                          VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
                         params![
@@ -459,6 +525,8 @@ impl Store {
             created_at,
             reply_count: 0,
         };
+
+        tx.commit()?;
 
         Ok(PostMessageResult {
             message,
@@ -575,8 +643,9 @@ impl Store {
 
     /// Deletes a message (and any child thread replies + associated unread items).
     pub fn delete_message(&self, message_id: &str) -> CoreResult<DeletedMessage> {
-        let conn = self.conn.lock().expect("store lock poisoned");
-        let meta: Option<(String, Option<String>)> = conn
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let meta: Option<(String, Option<String>)> = tx
             .query_row(
                 "SELECT channel_id, parent_id FROM messages WHERE id = ?1",
                 params![message_id],
@@ -587,6 +656,8 @@ impl Store {
         let (channel_id, parent_id) =
             meta.ok_or_else(|| CoreError::NotFound(format!("message '{message_id}' not found")))?;
 
+        ensure_channel_writable(&require_channel(&tx, &channel_id)?)?;
+
         if parent_id.is_some() {
             return Err(CoreError::InvalidInput(
                 "cannot delete an individual thread reply; delete the top-level message instead"
@@ -594,7 +665,7 @@ impl Store {
             ));
         }
 
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT id, identity_id FROM unread_items
              WHERE acked_at IS NULL
                AND (message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1))",
@@ -604,16 +675,18 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM unread_items
              WHERE message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1)",
             params![message_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM messages WHERE parent_id = ?1",
             params![message_id],
         )?;
-        conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+
+        tx.commit()?;
 
         Ok(DeletedMessage {
             message_id: message_id.to_string(),
@@ -622,6 +695,48 @@ impl Store {
             affected_unread,
         })
     }
+}
+
+fn validate_channel_name(raw: &str) -> CoreResult<String> {
+    let name = normalize_channel_name(raw);
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(CoreError::InvalidInput(
+            "channel name must be non-empty and contain only letters, digits, '-' or '_'".into(),
+        ));
+    }
+
+    Ok(name)
+}
+
+fn find_channel(conn: &Connection, id_or_name: &str) -> CoreResult<Option<Channel>> {
+    let normalized = normalize_channel_name(id_or_name);
+    Ok(conn
+        .query_row(
+            "SELECT id, name, description, created_at, archived_at FROM channels
+             WHERE id = ?1 OR name = ?2 ORDER BY (id = ?1) DESC LIMIT 1",
+            params![id_or_name, normalized],
+            row_to_channel,
+        )
+        .optional()?)
+}
+
+fn require_channel(conn: &Connection, id_or_name: &str) -> CoreResult<Channel> {
+    find_channel(conn, id_or_name)?
+        .ok_or_else(|| CoreError::NotFound(format!("channel '{id_or_name}'")))
+}
+
+fn ensure_channel_writable(channel: &Channel) -> CoreResult<()> {
+    if channel.archived_at.is_some() {
+        return Err(CoreError::Conflict(format!(
+            "channel '#{}' is archived",
+            channel.name
+        )));
+    }
+    Ok(())
 }
 
 fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
@@ -645,6 +760,7 @@ fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
         name: row.get(1)?,
         description: row.get(2)?,
         created_at: row.get(3)?,
+        archived_at: row.get(4)?,
     })
 }
 
@@ -740,10 +856,35 @@ mod tests {
         store.ack_unread(&agent.identity.id, &unread[0].id).unwrap();
         assert!(store.list_unread(&agent.identity.id).unwrap().is_empty());
 
-        // Thread view includes parent + reply
+        // Human follow-up WITHOUT @mention should NOT enqueue the agent again
+        let human_followup = store
+            .post_message(
+                "general",
+                &admin.identity,
+                "Thanks, discussing this with another human first.",
+                Some(post.message.id.clone()),
+            )
+            .unwrap();
+        assert!(human_followup.created_unread.is_empty());
+        assert!(store.list_unread(&agent.identity.id).unwrap().is_empty());
+
+        // Human follow-up WITH explicit @claude-local SHOULD enqueue the agent
+        let human_ping = store
+            .post_message(
+                "general",
+                &admin.identity,
+                "@claude-local please open a PR for this",
+                Some(post.message.id.clone()),
+            )
+            .unwrap();
+        assert_eq!(human_ping.created_unread.len(), 1);
+        assert_eq!(human_ping.created_unread[0].identity_id, agent.identity.id);
+        assert_eq!(human_ping.created_unread[0].reason, UnreadReason::Mention);
+
+        // Thread view includes parent + replies
         let thread = store.get_thread(&post.message.id).unwrap();
-        assert_eq!(thread.parent.reply_count, 1);
-        assert_eq!(thread.replies.len(), 1);
+        assert_eq!(thread.parent.reply_count, 3);
+        assert_eq!(thread.replies.len(), 3);
 
         // Deleting an individual thread reply is rejected
         assert!(store.delete_message(&reply.message.id).is_err());
@@ -751,7 +892,7 @@ mod tests {
         // Deleting parent message cascades to replies and unacked unread items
         let deleted = store.delete_message(&post.message.id).unwrap();
         assert_eq!(deleted.message_id, post.message.id);
-        assert_eq!(deleted.affected_unread.len(), 1);
+        assert_eq!(deleted.affected_unread.len(), 2);
         assert!(store.list_channel_messages("general", 20).unwrap().is_empty());
         assert!(store.list_unread(&admin.identity.id).unwrap().is_empty());
     }

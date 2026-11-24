@@ -2,7 +2,7 @@ use crate::http::RelayPodClient;
 use crate::ws::{run_live_ws_loop, DEFAULT_PING_INTERVAL};
 use relaypod_core::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, IdentityKind,
-    Message, ThreadView, UnreadItem, WsEvent,
+    Message, ThreadView, UnreadItem, UpdateChannelRequest, WsEvent,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -32,6 +32,13 @@ pub enum ClientCommand {
     CreateChannel {
         name: String,
         description: String,
+    },
+    UpdateChannel {
+        channel_id: String,
+        request: UpdateChannelRequest,
+    },
+    DeleteChannel {
+        channel_id: String,
     },
     CreateIdentity {
         handle: String,
@@ -201,6 +208,23 @@ where
                             }
                         }
                     }
+                    ClientCommand::UpdateChannel {
+                        channel_id,
+                        request,
+                    } => {
+                        if let Some(c) = &client {
+                            if let Err(e) = c.update_channel(&channel_id, &request).await {
+                                emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteChannel { channel_id } => {
+                        if let Some(c) = &client {
+                            if let Err(e) = c.delete_channel(&channel_id).await {
+                                emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
                     ClientCommand::CreateIdentity {
                         handle,
                         display_name,
@@ -261,7 +285,7 @@ async fn fetch_initial(
     client: &RelayPodClient,
 ) -> anyhow::Result<(Identity, Vec<Channel>, Vec<Identity>, Vec<UnreadItem>)> {
     let me = client.me().await?;
-    let channels = client.list_channels().await?;
+    let channels = client.list_channels_including_archived().await?;
     let identities = client.list_identities().await?;
     let unread = client.list_unread().await?;
     Ok((me, channels, identities, unread))

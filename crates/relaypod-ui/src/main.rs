@@ -6,7 +6,9 @@ use egui::{Color32, CornerRadius, Margin, Stroke};
 use relaypod_client::{
     mcp_config_snippet, spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState,
 };
-use relaypod_core::{CreatedIdentity, Identity, IdentityKind, Message};
+use relaypod_core::{
+    Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
+};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -56,6 +58,8 @@ struct RelayPodApp {
     last_created_identity: Option<CreatedIdentity>,
 
     pending_delete_message: Option<Message>,
+    pending_delete_channel: Option<Channel>,
+    channel_edit: Option<Channel>,
 }
 
 impl RelayPodApp {
@@ -95,6 +99,8 @@ impl RelayPodApp {
             new_agent_kind: IdentityKind::Agent,
             last_created_identity: None,
             pending_delete_message: None,
+            pending_delete_channel: None,
+            channel_edit: None,
         }
     }
 
@@ -120,6 +126,44 @@ impl RelayPodApp {
     fn select_channel(&mut self, channel_id: String) {
         let cmd = self.state.select_channel(channel_id);
         self.runtime.send(cmd);
+    }
+
+    fn can_manage_channels(&self) -> bool {
+        self.state
+            .me
+            .as_ref()
+            .is_some_and(|me| me.kind == IdentityKind::Human)
+    }
+
+    fn render_channel_row(&mut self, ui: &mut egui::Ui, channel: &Channel) {
+        let selected = self.state.selected_channel_id.as_deref() == Some(channel.id.as_str());
+        let row = ui.selectable_label(selected, format!("# {}", channel.name));
+        if row.clicked() {
+            self.select_channel(channel.id.clone());
+        }
+
+        if self.can_manage_channels() {
+            row.context_menu(|ui| {
+                let archive = channel.archived_at.is_none();
+                if ui
+                    .button(if archive { "Archive" } else { "Unarchive" })
+                    .clicked()
+                {
+                    self.runtime.send(ClientCommand::UpdateChannel {
+                        channel_id: channel.id.clone(),
+                        request: UpdateChannelRequest {
+                            archived: Some(archive),
+                            ..Default::default()
+                        },
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Delete").clicked() {
+                    self.pending_delete_channel = Some(channel.clone());
+                    ui.close_menu();
+                }
+            });
+        }
     }
 
     fn render_connect_screen(&mut self, ctx: &egui::Context) {
@@ -242,6 +286,65 @@ impl RelayPodApp {
                         }
                     }
                 });
+        }
+
+        if let Some(channel) = &mut self.channel_edit {
+            let mut save = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("edit_channel")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Edit channel");
+                ui.label("Name");
+                ui.text_edit_singleline(&mut channel.name);
+                ui.label("Description");
+                ui.text_edit_singleline(&mut channel.description);
+                ui.horizontal(|ui| {
+                    save = ui
+                        .add_enabled(!channel.name.trim().is_empty(), egui::Button::new("Save"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if save {
+                self.runtime.send(ClientCommand::UpdateChannel {
+                    channel_id: channel.id.clone(),
+                    request: UpdateChannelRequest {
+                        name: Some(channel.name.clone()),
+                        description: Some(channel.description.clone()),
+                        ..Default::default()
+                    },
+                });
+            }
+            if save || cancel || modal.should_close() {
+                self.channel_edit = None;
+            }
+        }
+
+        if let Some(channel) = &self.pending_delete_channel {
+            let mut confirm = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("confirm_delete_channel")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading(format!("Delete #{}?", channel.name));
+                ui.label("This permanently deletes the channel, its messages, and all threads.");
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let delete =
+                        egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(220, 38, 38))
+                            .corner_radius(CornerRadius::same(8));
+                    confirm = ui.add(delete).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if confirm {
+                self.runtime.send(ClientCommand::DeleteChannel {
+                    channel_id: channel.id.clone(),
+                });
+            }
+            if confirm || cancel || modal.should_close() {
+                self.pending_delete_channel = None;
+            }
         }
 
         if let Some(msg) = self.pending_delete_message.clone() {
@@ -381,13 +484,14 @@ impl eframe::App for RelayPodApp {
                 });
 
                 let channels = self.state.channels.clone();
-                for ch in channels {
-                    let selected = self.state.selected_channel_id.as_deref() == Some(ch.id.as_str());
-                    if ui
-                        .selectable_label(selected, format!("# {}", ch.name))
-                        .clicked()
-                    {
-                        self.select_channel(ch.id);
+                for channel in channels.iter().filter(|ch| ch.archived_at.is_none()) {
+                    self.render_channel_row(ui, channel);
+                }
+                if channels.iter().any(|ch| ch.archived_at.is_some()) {
+                    ui.add_space(8.0);
+                    ui.strong("ARCHIVED");
+                    for channel in channels.iter().filter(|ch| ch.archived_at.is_some()) {
+                        self.render_channel_row(ui, channel);
                     }
                 }
 
@@ -509,6 +613,12 @@ impl eframe::App for RelayPodApp {
                             bottom: 4,
                         }))
                         .show_inside(ui, |ui| {
+                            if !self.state.channels.iter().any(|ch| {
+                                ch.id == thread.parent.channel_id && ch.archived_at.is_none()
+                            }) {
+                                ui.label("This channel is archived.");
+                                return;
+                            }
                             if render_composer(
                                 ui,
                                 "thread_composer_input",
@@ -568,6 +678,8 @@ impl eframe::App for RelayPodApp {
         // Center panel: Channel feed + composer
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ch) = self.state.active_channel().cloned() {
+                let can_manage = self.can_manage_channels();
+                let archived = ch.archived_at.is_some();
                 ui.horizontal(|ui| {
                     ui.heading(format!("# {}", ch.name));
                     if !ch.description.is_empty() {
@@ -575,6 +687,9 @@ impl eframe::App for RelayPodApp {
                             egui::RichText::new(&ch.description)
                                 .color(ui.visuals().weak_text_color()),
                         );
+                    }
+                    if can_manage && ui.small_button("Edit channel").clicked() {
+                        self.channel_edit = Some(ch.clone());
                     }
                 });
                 ui.separator();
@@ -588,6 +703,10 @@ impl eframe::App for RelayPodApp {
                         bottom: 4,
                     }))
                     .show_inside(ui, |ui| {
+                        if archived {
+                            ui.label("This channel is archived.");
+                            return;
+                        }
                         let hint = format!(
                             "Message #{} (@ to mention, Shift+Enter for newline)",
                             ch.name
@@ -616,7 +735,7 @@ impl eframe::App for RelayPodApp {
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         for msg in msgs {
-                            let action = render_message_card(ui, &msg, true);
+                            let action = render_message_card(ui, &msg, can_manage && !archived);
                             match action {
                                 MessageCardAction::OpenThread => {
                                     self.show_unread_drawer = false;
@@ -1053,7 +1172,7 @@ enum MessageCardAction {
     Delete,
 }
 
-fn render_message_card(ui: &mut egui::Ui, msg: &Message, show_thread_btn: bool) -> MessageCardAction {
+fn render_message_card(ui: &mut egui::Ui, msg: &Message, can_delete: bool) -> MessageCardAction {
     let mut action = MessageCardAction::None;
     egui::Frame::group(ui.style())
         .corner_radius(CornerRadius::same(10))
@@ -1064,28 +1183,28 @@ fn render_message_card(ui: &mut egui::Ui, msg: &Message, show_thread_btn: bool) 
                 draw_kind_badge(ui, msg.author_kind);
                 ui.strong(format!("@{}", msg.author_handle));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let del_btn = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("×")
-                                    .size(13.0)
-                                    .color(ui.visuals().weak_text_color()),
+                    if can_delete {
+                        let del_btn = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("×")
+                                        .size(13.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .frame(false),
                             )
-                            .frame(false),
-                        )
-                        .on_hover_text("Delete message & thread");
-                    if del_btn.clicked() {
-                        action = MessageCardAction::Delete;
-                    }
-                    if show_thread_btn {
-                        let label = if msg.reply_count > 0 {
-                            format!("{} replies", msg.reply_count)
-                        } else {
-                            "Reply".to_string()
-                        };
-                        if ui.small_button(label).clicked() {
-                            action = MessageCardAction::OpenThread;
+                            .on_hover_text("Delete message & thread");
+                        if del_btn.clicked() {
+                            action = MessageCardAction::Delete;
                         }
+                    }
+                    let label = if msg.reply_count > 0 {
+                        format!("{} replies", msg.reply_count)
+                    } else {
+                        "Thread".to_string()
+                    };
+                    if ui.small_button(label).clicked() {
+                        action = MessageCardAction::OpenThread;
                     }
                 });
             });

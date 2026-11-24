@@ -4,7 +4,9 @@ mod watch;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use relaypod_client::{mcp_config_snippet, RelayPodClient};
-use relaypod_core::{CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store};
+use relaypod_core::{
+    CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store, UpdateChannelRequest,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -123,11 +125,33 @@ enum IdentityAction {
 
 #[derive(Subcommand)]
 enum ChannelAction {
-    List,
+    List {
+        #[arg(long)]
+        include_archived: bool,
+    },
     Create {
         name: String,
         #[arg(long, default_value = "")]
         description: String,
+    },
+    Update {
+        channel: String,
+        #[arg(long, required_unless_present = "description")]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    Archive {
+        channel: String,
+    },
+    Unarchive {
+        channel: String,
+    },
+    Delete {
+        channel: String,
+        /// Confirm permanent deletion of the channel and all its messages.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -245,9 +269,19 @@ async fn main() -> Result<()> {
         Commands::Channel { action } => {
             let client = require_client(&cli)?;
             match action {
-                ChannelAction::List => {
-                    for ch in client.list_channels().await? {
-                        println!("#{} ({}) — {}", ch.name, ch.id, ch.description);
+                ChannelAction::List { include_archived } => {
+                    let channels = if *include_archived {
+                        client.list_channels_including_archived().await?
+                    } else {
+                        client.list_channels().await?
+                    };
+                    for ch in channels {
+                        let status = if ch.archived_at.is_some() {
+                            " [archived]"
+                        } else {
+                            ""
+                        };
+                        println!("#{} ({}){status} — {}", ch.name, ch.id, ch.description);
                     }
                 }
                 ChannelAction::Create { name, description } => {
@@ -258,6 +292,42 @@ async fn main() -> Result<()> {
                         })
                         .await?;
                     println!("Created #{} ({})", ch.name, ch.id);
+                }
+                ChannelAction::Update {
+                    channel,
+                    name,
+                    description,
+                } => {
+                    let ch = client
+                        .update_channel(
+                            channel,
+                            &UpdateChannelRequest {
+                                name: name.clone(),
+                                description: description.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    println!("Updated #{} ({})", ch.name, ch.id);
+                }
+                ChannelAction::Archive { channel } | ChannelAction::Unarchive { channel } => {
+                    let archived = matches!(action, ChannelAction::Archive { .. });
+                    let ch = client
+                        .update_channel(
+                            channel,
+                            &UpdateChannelRequest {
+                                archived: Some(archived),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let verb = if archived { "Archived" } else { "Unarchived" };
+                    println!("{verb} #{} ({})", ch.name, ch.id);
+                }
+                ChannelAction::Delete { channel, yes } => {
+                    anyhow::ensure!(*yes, "pass --yes to confirm permanent channel deletion");
+                    client.delete_channel(channel).await?;
+                    println!("Deleted channel {channel}");
                 }
             }
         }
