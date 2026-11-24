@@ -114,6 +114,18 @@ impl Store {
                 ON unread_items(identity_id, acked_at, created_at);
             "#,
         )?;
+
+        // Idempotent migration for existing databases created before `channels.archived_at`
+        let has_archived_at = {
+            let mut stmt = conn.prepare("PRAGMA table_info(channels)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let found = cols.filter_map(|c| c.ok()).any(|name| name == "archived_at");
+            found
+        };
+        if !has_archived_at {
+            conn.execute("ALTER TABLE channels ADD COLUMN archived_at INTEGER NULL", [])?;
+        }
+
         Ok(())
     }
 
