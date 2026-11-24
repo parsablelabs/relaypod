@@ -5,20 +5,29 @@
 url: http://127.0.0.1:8787
 # Optional default instructions file prepended on the first turn of each new thread
 # instructions_file: ~/.relaypod/agent-instructions.md
+# Optional default max concurrent open sessions per handle (LRU eviction for Herdr; 0/omit = unlimited)
+# max_sessions: 5
 
 handles:
-  # Managed agent mode (`agent_type: codex` or `agent_type: claude`):
-  # Automatically captures the local session ID on the first message in a thread
-  # (stored in ~/.relaypod/sessions.json) and resumes that exact session on follow-ups.
+  # Interactive Herdr runner (`runner: herdr`):
+  # Launches each RelayPod thread as a live interactive agent pane in Herdr
+  # named `relaypod-<handle>-<thread>` (tab label `relaypod-<channel>-<thread>`),
+  # so you can inspect output, view working/blocked/idle status, and intervene.
   marcin-codex:
+    runner: herdr
     agent_type: codex
     # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
     token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
-    # Optional extra CLI flags passed to `codex exec` / `codex exec resume`
-    args: -m gpt-6.2-sol -c model_reasoning_effort=medium --full-auto
+    # Optional extra CLI flags forwarded to the agent (`herdr agent start ... -- <args>`)
+    args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox -c web_search=live
     # Optional per-handle instructions file (overrides top-level `instructions_file`)
     instructions_file: ~/.relaypod/agent-instructions.md
     cwd: ~/projects
+    # Optional: target a specific Herdr session or workspace label/ID (workspace defaults to "relaypod")
+    # herdr_session: main
+    # herdr_workspace: relaypod
+    # Optional: max live Herdr panes for this handle; oldest idle/done pane is closed (LRU)
+    max_sessions: 5
     # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
     auto_ack: false
     # Drain existing unacked items on startup/reconnect (default: true)
@@ -29,13 +38,17 @@ handles:
     env:
       RUST_LOG: info
 
+  # Headless exec runner (`runner: exec`, the default):
+  # Runs `codex exec --json` / `claude -p --output-format json` and resumes
+  # per-thread sessions via `~/.relaypod/sessions.json`.
   # claude-local:
+  #   runner: exec
   #   agent_type: claude
   #   token: ${RELAYPOD_CLAUDE_TOKEN}
   #   cwd: ~/projects/relaypod
   #   auto_ack: false
 
-  # Custom shell command mode (omit `agent_type` and provide `exec:`):
+  # Custom shell command mode (`runner: exec`, omit `agent_type` and provide `exec:`):
   # custom-bot:
   #   token: ${RELAYPOD_CUSTOM_TOKEN}
   #   exec: 'my-script --channel "$RELAYPOD_CHANNEL" --thread "$RELAYPOD_THREAD_ID" --unread "$RELAYPOD_UNREAD_ID"'
