@@ -70,6 +70,7 @@ struct RelayPodApp {
     thread_mention: MentionState,
     prefilled_thread_id: Option<String>,
     thread_panel_open_seq: u64,
+    last_min_window_width: f32,
 
     show_new_channel_modal: bool,
     new_channel_name: String,
@@ -123,6 +124,7 @@ impl RelayPodApp {
             thread_mention: MentionState::default(),
             prefilled_thread_id: None,
             thread_panel_open_seq: 0,
+            last_min_window_width: 0.0,
             show_new_channel_modal: false,
             new_channel_name: String::new(),
             new_channel_desc: String::new(),
@@ -542,6 +544,26 @@ impl eframe::App for RelayPodApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        let min_window_w = if !self.state.connected {
+            420.0
+        } else {
+            const MIN_SIDEBAR_WIDTH: f32 = 180.0;
+            const MIN_PANE_WIDTH: f32 = 300.0;
+            let right_pane_w = if self.state.active_thread.is_some() || self.show_unread_drawer {
+                MIN_PANE_WIDTH
+            } else {
+                0.0
+            };
+            MIN_SIDEBAR_WIDTH + MIN_PANE_WIDTH + right_pane_w
+        };
+        if (min_window_w - self.last_min_window_width).abs() > 0.5 {
+            self.last_min_window_width = min_window_w;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                min_window_w,
+                360.0,
+            )));
+        }
+
         if !self.state.connected {
             self.render_connect_screen(ctx);
             return;
@@ -593,6 +615,7 @@ impl eframe::App for RelayPodApp {
         // Left sidebar: Channels + Identities
         egui::SidePanel::left("sidebar")
             .default_width(220.0)
+            .min_width(180.0)
             .show(ctx, |ui| {
                 render_channel_search_box(ui, &mut self.channel_search);
                 ui.add_space(6.0);
@@ -789,19 +812,24 @@ impl eframe::App for RelayPodApp {
                 .map(|h| format!("@{h} "))
                 .unwrap_or_default();
             }
+            const MIN_PANE_WIDTH: f32 = 300.0;
             let available_w = ctx.available_rect().width();
-            let default_thread_w = (available_w * 0.5).max(300.0);
-            let max_thread_w = (available_w * 0.75).max(default_thread_w);
+            let min_thread_w = MIN_PANE_WIDTH.min((available_w * 0.5).max(160.0));
+            let max_thread_w = (available_w - MIN_PANE_WIDTH)
+                .min(available_w * 0.75)
+                .max(min_thread_w);
+            let default_thread_w = (available_w * 0.5).clamp(min_thread_w, max_thread_w);
             egui::SidePanel::right(egui::Id::new((
                 "thread_drawer_panel",
                 self.thread_panel_open_seq,
             )))
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(Margin::symmetric(12, 8)))
             .default_width(default_thread_w)
-            .min_width(300.0)
+            .min_width(min_thread_w)
             .max_width(max_thread_w)
             .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.strong("Thread");
+                        ui.heading("Thread");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Close").clicked() {
                                 self.state.active_thread = None;
@@ -920,9 +948,12 @@ impl eframe::App for RelayPodApp {
                 ui.horizontal(|ui| {
                     ui.heading(format!("# {}", ch.name));
                     if !ch.description.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&ch.description)
-                                .color(ui.visuals().weak_text_color()),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&ch.description)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
                         );
                     }
                 });
@@ -1448,44 +1479,49 @@ fn render_composer(
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                 let send_btn_width = 72.0;
-                let edit_width = (ui.available_width() - send_btn_width - 10.0).max(100.0);
+                let can_send = !text.trim().is_empty();
+                let btn_fill = if can_send {
+                    Color32::from_rgb(59, 130, 246)
+                } else if dark {
+                    Color32::from_rgb(48, 52, 62)
+                } else {
+                    Color32::from_rgb(215, 220, 228)
+                };
+                let btn_text = if can_send {
+                    Color32::WHITE
+                } else {
+                    ui.visuals().weak_text_color()
+                };
 
-                ui.add(
-                    egui::TextEdit::multiline(text)
-                        .id(input_id)
-                        .frame(false)
-                        .hint_text(hint_text)
-                        .desired_rows(2)
-                        .desired_width(edit_width)
-                        .min_size(egui::vec2(edit_width, 44.0)),
+                let btn = egui::Button::new(egui::RichText::new("Send").color(btn_text))
+                    .fill(btn_fill)
+                    .corner_radius(CornerRadius::same(10))
+                    .min_size(egui::vec2(send_btn_width, 32.0));
+
+                if ui.add_enabled(can_send, btn).clicked() {
+                    send_triggered = true;
+                }
+
+                ui.add_space(4.0);
+                let edit_width = ui.available_width().max(40.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(edit_width, 44.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_max_width(edit_width);
+                        ui.add(
+                            egui::TextEdit::multiline(text)
+                                .id(input_id)
+                                .frame(false)
+                                .hint_text(hint_text)
+                                .desired_rows(2)
+                                .desired_width(edit_width)
+                                .min_size(egui::vec2(edit_width, 44.0)),
+                        );
+                    },
                 );
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
-                    let can_send = !text.trim().is_empty();
-                    let btn_fill = if can_send {
-                        Color32::from_rgb(59, 130, 246)
-                    } else if dark {
-                        Color32::from_rgb(48, 52, 62)
-                    } else {
-                        Color32::from_rgb(215, 220, 228)
-                    };
-                    let btn_text = if can_send {
-                        Color32::WHITE
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-
-                    let btn = egui::Button::new(egui::RichText::new("Send").color(btn_text))
-                        .fill(btn_fill)
-                        .corner_radius(CornerRadius::same(10))
-                        .min_size(egui::vec2(send_btn_width, 32.0));
-
-                    if ui.add_enabled(can_send, btn).clicked() {
-                        send_triggered = true;
-                    }
-                });
             });
         });
 
@@ -2073,6 +2109,113 @@ mod tests {
             assert!(
                 (width - baseline_width).abs() < 0.1,
                 "sidebar expanded on frame {frame} with long query: baseline {baseline_width}, got {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_never_overflows_into_thread_pane_on_narrow_window() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+
+        let mut channel_text = String::new();
+        let mut channel_mention = MentionState::default();
+        let mut thread_text = String::new();
+        let mut thread_mention = MentionState::default();
+
+        for screen_w in [820.0_f32, 640.0_f32] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(screen_w, 600.0),
+                )),
+                ..Default::default()
+            };
+
+            let mut thread_left = 0.0_f32;
+            let mut composer_right = 0.0_f32;
+
+            for _ in 0..3 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    egui::SidePanel::left("sidebar")
+                        .default_width(220.0)
+                        .show(ctx, |ui| {
+                            ui.label("Sidebar");
+                        });
+
+                    const MIN_PANE_WIDTH: f32 = 300.0;
+                    let available_w = ctx.available_rect().width();
+                    let min_thread_w = MIN_PANE_WIDTH.min((available_w * 0.5).max(160.0));
+                    let max_thread_w = (available_w - MIN_PANE_WIDTH)
+                        .min(available_w * 0.75)
+                        .max(min_thread_w);
+                    let default_thread_w = (available_w * 0.5).clamp(min_thread_w, max_thread_w);
+
+                    let thread_resp = egui::SidePanel::right("thread_drawer_test")
+                        .default_width(default_thread_w)
+                        .min_width(min_thread_w)
+                        .max_width(max_thread_w)
+                        .show(ctx, |ui| {
+                            egui::TopBottomPanel::bottom("thread_composer_test")
+                                .frame(egui::Frame::new().inner_margin(Margin {
+                                    left: 4,
+                                    right: 4,
+                                    top: 8,
+                                    bottom: 4,
+                                }))
+                                .show_inside(ui, |ui| {
+                                    render_composer(
+                                        ui,
+                                        "thread_input_test",
+                                        &mut thread_text,
+                                        &mut thread_mention,
+                                        "Reply in thread... (@ to mention, Shift+Enter for newline)",
+                                        &[],
+                                    );
+                                });
+                        });
+                    thread_left = thread_resp.response.rect.left();
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("# general");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "Shared workspace for humans and agents with a very long description",
+                                    )
+                                    .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate(),
+                            );
+                        });
+                        ui.separator();
+
+                        let composer_resp = egui::TopBottomPanel::bottom("channel_composer_test")
+                            .frame(egui::Frame::new().inner_margin(Margin {
+                                left: 4,
+                                right: 4,
+                                top: 8,
+                                bottom: 4,
+                            }))
+                            .show_inside(ui, |ui| {
+                                render_composer(
+                                    ui,
+                                    "channel_input_test",
+                                    &mut channel_text,
+                                    &mut channel_mention,
+                                    "Message #general (@ to mention, Shift+Enter for newline)",
+                                    &[],
+                                );
+                            });
+                        composer_right = composer_resp.response.rect.right();
+                    });
+                });
+            }
+
+            assert!(
+                composer_right <= thread_left + 0.5,
+                "at window width {screen_w}, channel composer right ({composer_right}) overflowed into thread pane left ({thread_left})"
             );
         }
     }
