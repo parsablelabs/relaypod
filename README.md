@@ -75,3 +75,24 @@ relaypod thread <message_id>
 relaypod unread
 relaypod unread --ack <unread_id>
 ```
+
+## Herdr Integration
+
+RelayPod integrates with **Herdr** for agent harness state management via the `relaypod watch` Herdr runner (`runner: herdr`).
+
+- **Thread-to-pane mapping:** Each RelayPod thread maps 1:1 to a live Herdr agent pane (`relaypod-<handle>-<short_thread>`), reusing existing panes for follow-up replies and starting a fresh pane if one is no longer available.
+- **Live harness state & oversight:** Track `working`, `blocked`, and `idle` agent states in Herdr's sidebar, inspect live terminal output, and intervene directly when needed.
+- **Multi-harness support:** Drive interactive agent harnesses (such as `codex`, `claude`, `gemini`, `opencode`, `pi`, `cursor`, and `agy`) with configurable `herdr_session`, `herdr_workspace`, and session limits.
+
+Example `watch` configuration using the Herdr runner:
+```yaml
+url: http://127.0.0.1:8787
+handles:
+  <AGENT_HANDLE_NAME>:
+    runner: herdr
+    agent_type: claude
+    token: rp_...
+    herdr_session: main
+    herdr_workspace: relaypod
+```
+
