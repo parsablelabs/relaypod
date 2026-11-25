@@ -61,6 +61,10 @@ struct RelayPodApp {
     pending_delete_message: Option<Message>,
     pending_delete_channel: Option<Channel>,
     channel_edit: Option<Channel>,
+
+    channel_search: String,
+    channels_section_open: bool,
+    archived_channels_section_open: bool,
 }
 
 impl RelayPodApp {
@@ -70,8 +74,8 @@ impl RelayPodApp {
         let egui_ctx = cc.egui_ctx.clone();
         let runtime = spawn_runtime(move || egui_ctx.request_repaint());
 
-        let server_url = std::env::var("RELAYPOD_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+        let server_url =
+            std::env::var("RELAYPOD_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
         let token = std::env::var("RELAYPOD_TOKEN").unwrap_or_default();
 
         if !token.is_empty() {
@@ -103,6 +107,9 @@ impl RelayPodApp {
             pending_delete_message: None,
             pending_delete_channel: None,
             channel_edit: None,
+            channel_search: String::new(),
+            channels_section_open: true,
+            archived_channels_section_open: false,
         }
     }
 
@@ -275,7 +282,10 @@ impl RelayPodApp {
                         ui.separator();
                         ui.colored_label(
                             Color32::LIGHT_GREEN,
-                            format!("Created @{} — save this token now:", created.identity.handle),
+                            format!(
+                                "Created @{} — save this token now:",
+                                created.identity.handle
+                            ),
                         );
                         let mut tok = created.token.clone();
                         ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
@@ -376,8 +386,7 @@ impl RelayPodApp {
                         ui.set_width(ui.available_width());
                         ui.strong(format!("@{}", msg.author_handle));
                         ui.label(
-                            egui::RichText::new(preview)
-                                .color(ui.visuals().weak_text_color()),
+                            egui::RichText::new(preview).color(ui.visuals().weak_text_color()),
                         );
                     });
 
@@ -401,11 +410,10 @@ impl RelayPodApp {
 
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let delete_btn = egui::Button::new(
-                        egui::RichText::new("Delete").color(Color32::WHITE),
-                    )
-                    .fill(Color32::from_rgb(220, 38, 38))
-                    .corner_radius(CornerRadius::same(8));
+                    let delete_btn =
+                        egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(220, 38, 38))
+                            .corner_radius(CornerRadius::same(8));
                     if ui.add(delete_btn).clicked() {
                         confirmed = true;
                         close_modal = true;
@@ -420,9 +428,8 @@ impl RelayPodApp {
                 close_modal = true;
             }
             if confirmed {
-                self.runtime.send(ClientCommand::DeleteMessage {
-                    message_id: msg.id,
-                });
+                self.runtime
+                    .send(ClientCommand::DeleteMessage { message_id: msg.id });
             }
             if close_modal {
                 self.pending_delete_message = None;
@@ -481,25 +488,101 @@ impl eframe::App for RelayPodApp {
             .default_width(220.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("CHANNELS");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("+").clicked() {
-                            self.show_new_channel_modal = true;
-                        }
-                    });
+                    let has_query = !self.channel_search.is_empty();
+                    let clear_space = if has_query { 26.0 } else { 0.0 };
+                    let input_width = (ui.available_width() - clear_space).max(60.0);
+                    let search_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.channel_search)
+                            .hint_text("Search channels...")
+                            .desired_width(input_width),
+                    );
+                    if search_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.channel_search.clear();
+                    }
+                    if has_query
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("Clear channel search")
+                            .clicked()
+                    {
+                        self.channel_search.clear();
+                    }
                 });
+                ui.add_space(6.0);
 
                 let channels = self.state.channels.clone();
-                for channel in channels.iter().filter(|ch| !ch.archived) {
-                    self.render_channel_row(ui, channel);
-                }
-                if channels.iter().any(|ch| ch.archived) {
-                    ui.add_space(8.0);
-                    ui.strong("ARCHIVED");
-                    for channel in channels.iter().filter(|ch| ch.archived) {
-                        self.render_channel_row(ui, channel);
-                    }
-                }
+                let filtered = filter_channels(&channels, &self.channel_search);
+                let is_searching = !self.channel_search.trim().is_empty();
+                let channels_open = section_is_expanded(
+                    self.channels_section_open,
+                    &self.channel_search,
+                    !filtered.active.is_empty(),
+                );
+                let archived_open = section_is_expanded(
+                    self.archived_channels_section_open,
+                    &self.channel_search,
+                    !filtered.archived.is_empty(),
+                );
+
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_channels_scroll")
+                    .max_height((ui.available_height() * 0.6).max(120.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if render_collapsible_section_header(
+                                ui,
+                                "CHANNELS",
+                                channels_open,
+                                None,
+                            ) {
+                                self.channels_section_open = !self.channels_section_open;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("+").clicked() {
+                                        self.show_new_channel_modal = true;
+                                    }
+                                },
+                            );
+                        });
+
+                        if channels_open {
+                            for channel in &filtered.active {
+                                self.render_channel_row(ui, channel);
+                            }
+                        }
+
+                        if !filtered.archived.is_empty() {
+                            ui.add_space(8.0);
+                            if render_collapsible_section_header(
+                                ui,
+                                "ARCHIVED CHANNELS",
+                                archived_open,
+                                Some(filtered.archived.len()),
+                            ) {
+                                self.archived_channels_section_open =
+                                    !self.archived_channels_section_open;
+                            }
+                            if archived_open {
+                                for channel in &filtered.archived {
+                                    self.render_channel_row(ui, channel);
+                                }
+                            }
+                        }
+
+                        if is_searching
+                            && filtered.active.is_empty()
+                            && filtered.archived.is_empty()
+                        {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("No matching channels")
+                                    .size(12.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -684,21 +767,19 @@ impl eframe::App for RelayPodApp {
 
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "{} {}",
-                                            thread.replies.len(),
-                                            if thread.replies.len() == 1 {
-                                                "reply"
-                                            } else {
-                                                "replies"
-                                            }
-                                        ))
-                                        .size(11.5)
-                                        .color(ui.visuals().weak_text_color()),
-                                    ),
-                                );
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} {}",
+                                        thread.replies.len(),
+                                        if thread.replies.len() == 1 {
+                                            "reply"
+                                        } else {
+                                            "replies"
+                                        }
+                                    ))
+                                    .size(11.5)
+                                    .color(ui.visuals().weak_text_color()),
+                                ));
                                 ui.separator();
                             });
                             ui.add_space(6.0);
@@ -910,8 +991,8 @@ fn last_mentioned_handle_in_text(
                 }
                 if end > start {
                     let candidate = &text[start..end];
-                    let is_self = exclude_handle
-                        .is_some_and(|me| me.eq_ignore_ascii_case(candidate));
+                    let is_self =
+                        exclude_handle.is_some_and(|me| me.eq_ignore_ascii_case(candidate));
                     if !is_self {
                         if let Some(id) = identities
                             .iter()
@@ -966,6 +1047,82 @@ fn filter_identities<'a>(identities: &'a [Identity], query: &str) -> Vec<&'a Ide
 
     prefix_matches.extend(contains_matches);
     prefix_matches
+}
+
+#[derive(Debug, Default)]
+struct FilteredChannels<'a> {
+    active: Vec<&'a Channel>,
+    archived: Vec<&'a Channel>,
+}
+
+fn channel_matches_query(channel: &Channel, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    channel.name.to_lowercase().contains(&q) || channel.description.to_lowercase().contains(&q)
+}
+
+fn filter_channels<'a>(channels: &'a [Channel], query: &str) -> FilteredChannels<'a> {
+    let mut filtered = FilteredChannels::default();
+    for channel in channels {
+        if !channel_matches_query(channel, query) {
+            continue;
+        }
+        if channel.archived {
+            filtered.archived.push(channel);
+        } else {
+            filtered.active.push(channel);
+        }
+    }
+    filtered
+}
+
+fn section_is_expanded(user_open: bool, search_query: &str, has_matches: bool) -> bool {
+    user_open || (!search_query.trim().is_empty() && has_matches)
+}
+
+fn render_collapsible_section_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    open: bool,
+    count: Option<usize>,
+) -> bool {
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (rect, icon_resp) =
+                ui.allocate_exact_size(egui::vec2(10.0, 12.0), egui::Sense::click());
+            let c = rect.center();
+            let color = ui.visuals().weak_text_color();
+            let pts = if open {
+                vec![
+                    egui::pos2(c.x - 3.5, c.y - 2.0),
+                    egui::pos2(c.x + 3.5, c.y - 2.0),
+                    egui::pos2(c.x, c.y + 3.0),
+                ]
+            } else {
+                vec![
+                    egui::pos2(c.x - 2.0, c.y - 3.5),
+                    egui::pos2(c.x + 3.0, c.y),
+                    egui::pos2(c.x - 2.0, c.y + 3.5),
+                ]
+            };
+            ui.painter()
+                .add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+
+            let label = match count {
+                Some(n) => format!("{title} ({n})"),
+                None => title.to_string(),
+            };
+            let btn_resp =
+                ui.add(egui::Button::new(egui::RichText::new(label).strong()).frame(false));
+            icon_resp.union(btn_resp)
+        })
+        .inner;
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 fn apply_mention_completion(
@@ -1101,7 +1258,10 @@ fn render_composer(
 
     let frame_resp = egui::Frame::new()
         .fill(frame_bg)
-        .stroke(Stroke::new(if has_focus { 1.5_f32 } else { 1.0_f32 }, border_color))
+        .stroke(Stroke::new(
+            if has_focus { 1.5_f32 } else { 1.0_f32 },
+            border_color,
+        ))
         .corner_radius(CornerRadius::same(14))
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -1495,10 +1655,7 @@ fn render_thread_bubble(ui: &mut egui::Ui, msg: &Message, is_me: bool) {
             )
         }
     } else if dark {
-        (
-            Color32::from_rgb(38, 41, 49),
-            Color32::from_rgb(60, 65, 78),
-        )
+        (Color32::from_rgb(38, 41, 49), Color32::from_rgb(60, 65, 78))
     } else {
         (
             Color32::from_rgb(241, 243, 247),
@@ -1596,5 +1753,49 @@ mod tests {
             last_mentioned_handle_in_text("email@marcin-codex.com @unknown", &ids, Some("marcin")),
             None
         );
+    }
+
+    #[test]
+    fn filters_channels_case_insensitively_by_name_and_description() {
+        let mk = |id: &str, name: &str, description: &str, archived: bool| Channel {
+            id: id.into(),
+            name: name.into(),
+            description: description.into(),
+            archived,
+            archived_at: archived.then_some(1),
+            created_at: 0,
+        };
+        let channels = vec![
+            mk("c1", "general", "Shared workspace", false),
+            mk("c2", "relaypod", "Backend and UI work", false),
+            mk("c3", "legacy-ops", "Old incident triage", true),
+        ];
+
+        let all = filter_channels(&channels, "   ");
+        assert_eq!(all.active.len(), 2);
+        assert_eq!(all.archived.len(), 1);
+
+        let by_name = filter_channels(&channels, "RELAY");
+        assert_eq!(by_name.active.len(), 1);
+        assert_eq!(by_name.active[0].id, "c2");
+        assert!(by_name.archived.is_empty());
+
+        let by_desc = filter_channels(&channels, "TRIAGE");
+        assert!(by_desc.active.is_empty());
+        assert_eq!(by_desc.archived.len(), 1);
+        assert_eq!(by_desc.archived[0].id, "c3");
+
+        let none = filter_channels(&channels, "nonexistent");
+        assert!(none.active.is_empty());
+        assert!(none.archived.is_empty());
+    }
+
+    #[test]
+    fn expands_folded_section_only_when_search_has_matches() {
+        assert!(!section_is_expanded(false, "", true));
+        assert!(section_is_expanded(true, "", false));
+        assert!(section_is_expanded(false, "ops", true));
+        assert!(!section_is_expanded(false, "ops", false));
+        assert!(!section_is_expanded(false, "   ", true));
     }
 }
