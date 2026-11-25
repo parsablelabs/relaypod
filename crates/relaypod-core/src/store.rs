@@ -3,9 +3,15 @@ use crate::auth::{
 };
 use crate::models::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedChannel,
-    DeletedIdentity, DeletedMessage, Identity, IdentityKind, Message, PostMessageResult,
-    ThreadView, UnreadItem, UnreadReason, UpdateChannelRequest, UpdateIdentityRequest,
+    DeletedIdentity, DeletedMessage, Identity, IdentityKind, Message, MessageDeleteInfo,
+    PostMessageResult, ThreadView, UnreadItem, UnreadReason, UpdateChannelRequest,
+    UpdateIdentityRequest,
 };
+
+pub const MAX_HANDLE_LEN: usize = 64;
+pub const MAX_CHANNEL_NAME_LEN: usize = 64;
+pub const MAX_CHANNEL_DESCRIPTION_LEN: usize = 500;
+pub const MAX_MESSAGE_BODY_LEN: usize = 65_536;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -63,21 +69,25 @@ impl Store {
     }
 
     fn init(&self) -> CoreResult<()> {
-        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let conn = self.conn.lock().expect("store lock poisoned");
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
 
             CREATE TABLE IF NOT EXISTS identities (
                 id TEXT PRIMARY KEY,
                 handle TEXT UNIQUE NOT NULL,
-                kind TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
                 owner_id TEXT NULL REFERENCES identities(id),
                 token_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 deleted_at INTEGER NULL
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_token_hash
+                ON identities(token_hash);
 
             CREATE TABLE IF NOT EXISTS channels (
                 id TEXT PRIMARY KEY,
@@ -106,7 +116,7 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 identity_id TEXT NOT NULL REFERENCES identities(id),
                 message_id TEXT NOT NULL REFERENCES messages(id),
-                reason TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK (reason IN ('mention', 'thread_reply')),
                 acked_at INTEGER NULL,
                 created_at INTEGER NOT NULL
             );
@@ -115,40 +125,6 @@ impl Store {
                 ON unread_items(identity_id, acked_at, created_at);
             "#,
         )?;
-
-        // Lock the schema check and alteration together in case another process opens the database.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let has_archived_at: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('channels') WHERE name = 'archived_at')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_archived_at {
-            tx.execute(
-                "ALTER TABLE channels ADD COLUMN archived_at INTEGER NULL",
-                [],
-            )?;
-        }
-        let has_display_name: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('identities') WHERE name = 'display_name')",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_display_name {
-            tx.execute("ALTER TABLE identities DROP COLUMN display_name", [])?;
-        }
-        let has_deleted_at: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('identities') WHERE name = 'deleted_at')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_deleted_at {
-            tx.execute(
-                "ALTER TABLE identities ADD COLUMN deleted_at INTEGER NULL",
-                [],
-            )?;
-        }
-        tx.commit()?;
 
         Ok(())
     }
@@ -162,7 +138,7 @@ impl Store {
         };
 
         if count == 0 {
-            if self.get_channel_by_name("general")?.is_none() {
+            if self.get_channel("general")?.is_none() {
                 self.create_channel(
                     CreateChannelRequest {
                         name: "general".to_string(),
@@ -183,16 +159,7 @@ impl Store {
     }
 
     pub fn create_identity(&self, req: CreateIdentityRequest) -> CoreResult<CreatedIdentity> {
-        let handle = normalize_handle(&req.handle);
-        if handle.is_empty()
-            || !handle
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(CoreError::InvalidInput(
-                "handle must be non-empty and contain only letters, digits, '-' or '_'".into(),
-            ));
-        }
+        let handle = validate_handle(&req.handle)?;
 
         let id = new_id();
         let token = generate_token();
@@ -229,7 +196,7 @@ impl Store {
                 token,
             }),
             Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
             {
                 Err(CoreError::Conflict(format!(
                     "identity '@{handle}' already exists"
@@ -287,17 +254,7 @@ impl Store {
             .ok_or_else(|| CoreError::NotFound(format!("identity '{id_or_handle}'")))?;
 
         if let Some(raw_handle) = request.handle {
-            let handle = normalize_handle(&raw_handle);
-            if handle.is_empty()
-                || !handle
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
-                return Err(CoreError::InvalidInput(
-                    "handle must be non-empty and contain only letters, digits, '-' or '_'".into(),
-                ));
-            }
-            identity.handle = handle;
+            identity.handle = validate_handle(&raw_handle)?;
         }
 
         let res = tx.execute(
@@ -341,8 +298,10 @@ impl Store {
         let has_mentions = if has_authored {
             true
         } else {
-            let mut stmt = tx.prepare("SELECT body FROM messages")?;
-            let bodies = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mention_needle = format!("@{}", identity.handle);
+            let mut stmt =
+                tx.prepare("SELECT body FROM messages WHERE instr(lower(body), ?1) > 0")?;
+            let bodies = stmt.query_map(params![mention_needle], |r| r.get::<_, String>(0))?;
             let mut mentioned = false;
             for body in bodies {
                 let body = body?;
@@ -359,7 +318,7 @@ impl Store {
             params![&identity.id],
         )?;
 
-        let hard_deleted = if !has_authored && !has_mentions {
+        if !has_authored && !has_mentions {
             tx.execute(
                 "UPDATE channels SET created_by = NULL WHERE created_by = ?1",
                 params![&identity.id],
@@ -369,7 +328,6 @@ impl Store {
                 params![&identity.id],
             )?;
             tx.execute("DELETE FROM identities WHERE id = ?1", params![&identity.id])?;
-            true
         } else {
             let deleted_at = now_ms();
             let revoked_hash = format!("revoked:{}:{deleted_at}", identity.id);
@@ -377,13 +335,11 @@ impl Store {
                 "UPDATE identities SET deleted_at = ?2, token_hash = ?3 WHERE id = ?1",
                 params![&identity.id, deleted_at, revoked_hash],
             )?;
-            false
-        };
+        }
 
         tx.commit()?;
         Ok(DeletedIdentity {
             identity_id: identity.id,
-            hard_deleted,
         })
     }
 
@@ -393,6 +349,7 @@ impl Store {
         created_by: Option<String>,
     ) -> CoreResult<Channel> {
         let name = validate_channel_name(&req.name)?;
+        validate_channel_description(&req.description)?;
 
         let id = new_id();
         let created_at = now_ms();
@@ -458,6 +415,7 @@ impl Store {
             channel.name = validate_channel_name(&name)?;
         }
         if let Some(description) = request.description {
+            validate_channel_description(&description)?;
             channel.description = description;
         }
         match request.archived {
@@ -495,21 +453,6 @@ impl Store {
         Ok(channel)
     }
 
-    /// Updates archive status while preserving channel details and messages.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the channel does not exist or the database update fails.
-    pub fn set_channel_archived(&self, id_or_name: &str, archived: bool) -> CoreResult<Channel> {
-        self.update_channel(
-            id_or_name,
-            UpdateChannelRequest {
-                archived: Some(archived),
-                ..Default::default()
-            },
-        )
-    }
-
     /// Permanently removes a channel and its messages and unread items in one transaction.
     pub fn delete_channel(&self, id_or_name: &str) -> CoreResult<DeletedChannel> {
         let mut conn = self.conn.lock().expect("store lock poisoned");
@@ -537,17 +480,6 @@ impl Store {
         })
     }
 
-    pub fn get_channel_by_name(&self, name: &str) -> CoreResult<Option<Channel>> {
-        let normalized = normalize_channel_name(name);
-        let conn = self.conn.lock().expect("store lock poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, archived_at, created_by FROM channels WHERE name = ?1",
-        )?;
-        Ok(stmt
-            .query_row(params![normalized], row_to_channel)
-            .optional()?)
-    }
-
     pub fn post_message(
         &self,
         channel_id_or_name: &str,
@@ -558,6 +490,11 @@ impl Store {
         let trimmed = body.trim();
         if trimmed.is_empty() {
             return Err(CoreError::InvalidInput("message body cannot be empty".into()));
+        }
+        if trimmed.len() > MAX_MESSAGE_BODY_LEN {
+            return Err(CoreError::InvalidInput(format!(
+                "message body exceeds maximum length of {MAX_MESSAGE_BODY_LEN} bytes"
+            )));
         }
 
         let mut conn = self.conn.lock().expect("store lock poisoned");
@@ -654,7 +591,9 @@ impl Store {
                 "SELECT DISTINCT m.author_id
                  FROM messages m
                  JOIN identities i ON i.id = m.author_id
-                 WHERE (m.id = ?1 OR m.parent_id = ?1) AND i.kind = 'human'",
+                 WHERE (m.id = ?1 OR m.parent_id = ?1)
+                   AND i.kind = 'human'
+                   AND i.deleted_at IS NULL",
             )?;
             let participants = stmt.query_map(params![root_id], |r| r.get::<_, String>(0))?;
             for participant in participants {
@@ -816,6 +755,31 @@ impl Store {
         Ok(())
     }
 
+    /// Returns author metadata for a message, used to authorize message deletion.
+    pub fn get_message_delete_info(&self, message_id: &str) -> CoreResult<Option<MessageDeleteInfo>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT m.id, m.parent_id, m.author_id, i.kind, i.owner_id
+                 FROM messages m
+                 JOIN identities i ON i.id = m.author_id
+                 WHERE m.id = ?1",
+                params![message_id],
+                |r| {
+                    let kind_str: String = r.get(3)?;
+                    let author_kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+                    Ok(MessageDeleteInfo {
+                        message_id: r.get(0)?,
+                        parent_id: r.get(1)?,
+                        author_id: r.get(2)?,
+                        author_kind,
+                        author_owner_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Deletes a message (and any child thread replies + associated unread items).
     pub fn delete_message(&self, message_id: &str) -> CoreResult<DeletedMessage> {
         let mut conn = self.conn.lock().expect("store lock poisoned");
@@ -872,19 +836,44 @@ impl Store {
     }
 }
 
+fn validate_handle(raw: &str) -> CoreResult<String> {
+    let handle = normalize_handle(raw);
+    if handle.is_empty()
+        || handle.len() > MAX_HANDLE_LEN
+        || !handle
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "handle must be 1-{MAX_HANDLE_LEN} characters and contain only letters, digits, '-' or '_'"
+        )));
+    }
+    Ok(handle)
+}
+
 fn validate_channel_name(raw: &str) -> CoreResult<String> {
     let name = normalize_channel_name(raw);
     if name.is_empty()
+        || name.len() > MAX_CHANNEL_NAME_LEN
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(CoreError::InvalidInput(
-            "channel name must be non-empty and contain only letters, digits, '-' or '_'".into(),
-        ));
+        return Err(CoreError::InvalidInput(format!(
+            "channel name must be 1-{MAX_CHANNEL_NAME_LEN} characters and contain only letters, digits, '-' or '_'"
+        )));
     }
 
     Ok(name)
+}
+
+fn validate_channel_description(desc: &str) -> CoreResult<()> {
+    if desc.chars().count() > MAX_CHANNEL_DESCRIPTION_LEN {
+        return Err(CoreError::InvalidInput(format!(
+            "channel description exceeds maximum length of {MAX_CHANNEL_DESCRIPTION_LEN} characters"
+        )));
+    }
+    Ok(())
 }
 
 fn find_identity(conn: &Connection, id_or_handle: &str) -> CoreResult<Option<Identity>> {
@@ -1018,7 +1007,15 @@ mod tests {
         assert!(!channels[0].archived);
         assert_eq!(channels[0].archived_at, None);
 
-        let archived = store.set_channel_archived(&ch.id, true).unwrap();
+        let archived = store
+            .update_channel(
+                &ch.id,
+                UpdateChannelRequest {
+                    archived: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store.init().unwrap();
         assert!(store.list_channels(false).unwrap().is_empty());
         let channels = store.list_channels(true).unwrap();
@@ -1052,14 +1049,26 @@ mod tests {
         assert_eq!(updated.description, "Build results");
         assert!(store.get_channel("general").unwrap().is_none());
 
-        let archived = store.set_channel_archived("ci", true).unwrap();
+        let archive_req = UpdateChannelRequest {
+            archived: Some(true),
+            ..Default::default()
+        };
+        let archived = store.update_channel("ci", archive_req.clone()).unwrap();
         assert!(archived.archived);
         let archive_time = archived.archived_at.expect("archive time was recorded");
-        let retried = store.set_channel_archived("ci", true).unwrap();
+        let retried = store.update_channel("ci", archive_req).unwrap();
         assert_eq!(retried.archived_at, Some(archive_time));
         assert_eq!(store.get_thread(&message.id).unwrap().parent.id, message.id);
 
-        let restored = store.set_channel_archived("ci", false).unwrap();
+        let restored = store
+            .update_channel(
+                "ci",
+                UpdateChannelRequest {
+                    archived: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(!restored.archived);
         assert_eq!(restored.archived_at, None);
         let active = store.list_channels(false).unwrap();
@@ -1090,7 +1099,15 @@ mod tests {
         store
             .post_message(&channel.id, &bot.identity, "Passed", Some(root.message.id))
             .unwrap();
-        store.set_channel_archived(&channel.id, true).unwrap();
+        store
+            .update_channel(
+                &channel.id,
+                UpdateChannelRequest {
+                    archived: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         let deleted = store.delete_channel(&channel.id).unwrap();
         assert_eq!(deleted.channel_id, channel.id);
@@ -1109,11 +1126,11 @@ mod tests {
     #[test]
     fn test_bootstrap_mentions_threads_and_unread_queue() {
         let store = Store::open_in_memory().unwrap();
-        let admin = store.bootstrap("martek").unwrap().expect("admin created");
-        assert_eq!(admin.identity.handle, "martek");
+        let admin = store.bootstrap("alice").unwrap().expect("admin created");
+        assert_eq!(admin.identity.handle, "alice");
 
         // Second bootstrap is a no-op
-        assert!(store.bootstrap("martek").unwrap().is_none());
+        assert!(store.bootstrap("alice").unwrap().is_none());
 
         // Auth works
         let authed = store.authenticate(&admin.token).unwrap().unwrap();
@@ -1196,5 +1213,51 @@ mod tests {
         assert_eq!(deleted.affected_unread.len(), 2);
         assert!(store.list_channel_messages("general", 20).unwrap().is_empty());
         assert!(store.list_unread(&admin.identity.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enforces_input_length_limits() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = store.bootstrap("alice").unwrap().unwrap();
+
+        let long_handle = "a".repeat(MAX_HANDLE_LEN + 1);
+        assert!(matches!(
+            store.create_identity(CreateIdentityRequest {
+                handle: long_handle,
+                kind: IdentityKind::Agent,
+                owner_id: Some(admin.identity.id.clone()),
+            }),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let long_channel = "c".repeat(MAX_CHANNEL_NAME_LEN + 1);
+        assert!(matches!(
+            store.create_channel(
+                CreateChannelRequest {
+                    name: long_channel,
+                    description: String::new(),
+                },
+                Some(admin.identity.id.clone()),
+            ),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let long_desc = "d".repeat(MAX_CHANNEL_DESCRIPTION_LEN + 1);
+        assert!(matches!(
+            store.create_channel(
+                CreateChannelRequest {
+                    name: "valid".into(),
+                    description: long_desc,
+                },
+                Some(admin.identity.id.clone()),
+            ),
+            Err(CoreError::InvalidInput(_))
+        ));
+
+        let long_body = "x".repeat(MAX_MESSAGE_BODY_LEN + 1);
+        assert!(matches!(
+            store.post_message("general", &admin.identity, &long_body, None),
+            Err(CoreError::InvalidInput(_))
+        ));
     }
 }

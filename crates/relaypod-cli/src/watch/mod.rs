@@ -24,14 +24,22 @@ use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
 
 pub fn default_config_candidates() -> Vec<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from("config/.relaypod.yaml"),
-        PathBuf::from(".relaypod.yaml"),
-    ];
+    let mut paths = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         paths.push(PathBuf::from(home).join(".relaypod").join("config.yaml"));
     }
     paths
+}
+
+fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+    if let Some(p) = explicit_path {
+        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
+        if !expanded.exists() {
+            return Err(anyhow!("config file not found: {}", expanded.display()));
+        }
+        return Ok(Some(expanded));
+    }
+    Ok(default_config_candidates().into_iter().find(|p| p.exists()))
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -82,20 +90,14 @@ pub struct ResolvedTarget {
     pub env: BTreeMap<String, String>,
 }
 
-/// Persistent mapping of `(handle, relaypod_thread_id) -> adapter_session_id`
-/// stored at `~/.relaypod/sessions.json`, plus in-memory LRU timestamps for session eviction.
+/// Persistent mapping of `(identity_id, relaypod_thread_id) -> adapter_session_id`
+/// stored at `~/.relaypod/sessions.json`, plus in-memory LRU counters for session eviction.
 #[derive(Clone)]
 pub struct SessionStore {
     path: PathBuf,
     map: Arc<Mutex<BTreeMap<String, String>>>,
-    last_used: Arc<Mutex<BTreeMap<String, u128>>>,
-}
-
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    last_used: Arc<Mutex<BTreeMap<String, u64>>>,
+    tick: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionStore {
@@ -103,7 +105,7 @@ impl SessionStore {
         if let Ok(home) = std::env::var("HOME") {
             PathBuf::from(home).join(".relaypod").join("sessions.json")
         } else {
-            PathBuf::from(".relaypod-sessions.json")
+            std::env::temp_dir().join("relaypod-sessions.json")
         }
     }
 
@@ -116,6 +118,7 @@ impl SessionStore {
             path,
             map: Arc::new(Mutex::new(map)),
             last_used: Arc::new(Mutex::new(BTreeMap::new())),
+            tick: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -123,40 +126,60 @@ impl SessionStore {
         Self::load_from(Self::default_path())
     }
 
-    fn key(handle: &str, thread_id: &str) -> String {
-        format!("{handle}:{thread_id}")
+    fn next_tick(&self) -> u64 {
+        self.tick
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn key(identity_id: &str, thread_id: &str) -> String {
+        format!("{identity_id}:{thread_id}")
     }
 
     fn persist_locked(&self, map: &BTreeMap<String, String>) {
-        if let Ok(json) = serde_json::to_string_pretty(map) {
-            if let Some(parent) = self.path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        let Ok(json) = serde_json::to_string_pretty(map) else {
+            return;
+        };
+        if let Some(parent) = self.path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                warn!(path = %parent.display(), error = %err, "failed to create sessions directory");
+                return;
             }
-            if let Err(err) = std::fs::write(&self.path, json) {
-                warn!(path = %self.path.display(), error = %err, "failed to persist sessions.json");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
+        }
+        let tmp_path = self.path.with_extension("json.tmp");
+        if let Err(err) = write_private_file(&tmp_path, json.as_bytes()) {
+            warn!(path = %tmp_path.display(), error = %err, "failed to write temporary sessions.json");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(path = %self.path.display(), error = %err, "failed to persist sessions.json");
         }
     }
 
-    pub fn get(&self, handle: &str, thread_id: &str) -> Option<String> {
+    pub fn get(&self, identity_id: &str, thread_id: &str) -> Option<String> {
         let guard = self.map.lock().expect("session store lock poisoned");
-        guard.get(&Self::key(handle, thread_id)).cloned()
+        guard.get(&Self::key(identity_id, thread_id)).cloned()
     }
 
-    pub fn touch(&self, handle: &str, thread_id: &str) {
+    pub fn touch(&self, identity_id: &str, thread_id: &str) {
         let mut ts = self.last_used.lock().expect("last_used lock poisoned");
-        ts.insert(Self::key(handle, thread_id), now_millis());
+        ts.insert(Self::key(identity_id, thread_id), self.next_tick());
     }
 
-    pub fn set(&self, handle: &str, thread_id: &str, session_id: String) {
-        let key = Self::key(handle, thread_id);
+    pub fn set(&self, identity_id: &str, thread_id: &str, session_id: String) {
+        let key = Self::key(identity_id, thread_id);
         {
             let mut guard = self.map.lock().expect("session store lock poisoned");
             guard.insert(key.clone(), session_id);
             self.persist_locked(&guard);
         }
         let mut ts = self.last_used.lock().expect("last_used lock poisoned");
-        ts.insert(key, now_millis());
+        ts.insert(key, self.next_tick());
     }
 
     pub fn remove(&self, identity_id: &str, thread_id: &str) {
@@ -171,9 +194,9 @@ impl SessionStore {
         ts.remove(&key);
     }
 
-    /// Returns `(thread_id, session_id)` for a given handle, ordered least-recently-used first.
-    pub fn list_for_handle_lru(&self, handle: &str) -> Vec<(String, String)> {
-        let prefix = format!("{handle}:");
+    /// Returns `(thread_id, session_id)` for a given identity, ordered least-recently-used first.
+    pub fn list_for_handle_lru(&self, identity_id: &str) -> Vec<(String, String)> {
+        let prefix = format!("{identity_id}:");
         let entries: Vec<(String, String, String)> = {
             let guard = self.map.lock().expect("session store lock poisoned");
             guard
@@ -185,7 +208,7 @@ impl SessionStore {
                 .collect()
         };
         let ts = self.last_used.lock().expect("last_used lock poisoned");
-        let mut scored: Vec<(u128, String, String)> = entries
+        let mut scored: Vec<(u64, String, String)> = entries
             .into_iter()
             .map(|(k, tid, sid)| (ts.get(&k).copied().unwrap_or(0), tid, sid))
             .collect();
@@ -209,7 +232,7 @@ impl SessionStore {
                 .collect()
         };
         let ts = self.last_used.lock().expect("last_used lock poisoned");
-        let mut scored: Vec<(u128, String, String, String)> = entries
+        let mut scored: Vec<(u64, String, String, String)> = entries
             .into_iter()
             .map(|(k, h, tid, sid)| (ts.get(&k).copied().unwrap_or(0), h, tid, sid))
             .collect();
@@ -271,18 +294,7 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
 pub fn load_optional_config(
     explicit_path: Option<&std::path::Path>,
 ) -> Result<Option<(PathBuf, config::RelayPodConfig)>> {
-    let candidates = default_config_candidates();
-    let discovered = if let Some(p) = explicit_path {
-        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
-        if !expanded.exists() {
-            return Err(anyhow!("config file not found: {}", expanded.display()));
-        }
-        Some(expanded)
-    } else {
-        candidates.iter().find(|p| p.exists()).cloned()
-    };
-
-    match discovered {
+    match resolve_config_path(explicit_path)? {
         Some(path) => {
             let cfg = load_config_file(&path)?;
             Ok(Some((path, cfg)))
@@ -291,18 +303,22 @@ pub fn load_optional_config(
     }
 }
 
-fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
-    let candidates = default_config_candidates();
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
 
-    let discovered_config = if let Some(ref p) = opts.config_path {
-        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
-        if !expanded.exists() {
-            return Err(anyhow!("config file not found: {}", expanded.display()));
-        }
-        Some(expanded)
-    } else {
-        candidates.iter().find(|p| p.exists()).cloned()
-    };
+fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
+    let discovered_config = resolve_config_path(opts.config_path.as_deref())?;
 
     // Direct CLI mode: `--exec` provided and no `--handle` selected from config
     if let Some(ref exec_cmd) = opts.exec_override {
@@ -336,7 +352,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     }
 
     let cfg_path = discovered_config.ok_or_else(|| {
-        let searched = candidates
+        let searched = default_config_candidates()
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
@@ -496,14 +512,16 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 .expect("live_handle lock poisoned")
                 .clone();
             dispatch_unread_item(
-                worker_adapter.as_ref(),
-                &worker_client,
-                &worker_target,
-                &worker_identity_id,
+                &DispatchEnv {
+                    adapter: worker_adapter.as_ref(),
+                    client: &worker_client,
+                    target: &worker_target,
+                    identity_id: &worker_identity_id,
+                    sessions: &worker_sessions,
+                    ws_out_tx: &worker_ws_tx,
+                },
                 &current_handle,
                 &item,
-                &worker_sessions,
-                &worker_ws_tx,
             )
             .await;
             if worker_target.cooldown_secs > 0 {
@@ -514,6 +532,7 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
 
     let seen_unread = Arc::new(Mutex::new(HashSet::<String>::new()));
     let ws_url = client.ws_url();
+    let ws_token = client.token().to_string();
 
     let status_handle = Arc::clone(&live_handle);
     let status_client = client.clone();
@@ -528,6 +547,7 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
 
     run_live_ws_loop_with_outgoing(
         ws_url,
+        ws_token,
         DEFAULT_PING_INTERVAL,
         ws_out_rx,
         move |live| {
@@ -646,16 +666,22 @@ pub(crate) fn analyze_agent_turns(
     (consecutive_agent_turns, last_human, already_paused)
 }
 
-async fn dispatch_unread_item(
-    adapter: &dyn WatcherAdapter,
-    client: &RelayPodClient,
-    target: &ResolvedTarget,
-    identity_id: &str,
-    handle: &str,
-    item: &UnreadItem,
-    sessions: &SessionStore,
-    ws_out_tx: &mpsc::UnboundedSender<WsClientMessage>,
-) {
+struct DispatchEnv<'a> {
+    adapter: &'a dyn WatcherAdapter,
+    client: &'a RelayPodClient,
+    target: &'a ResolvedTarget,
+    identity_id: &'a str,
+    sessions: &'a SessionStore,
+    ws_out_tx: &'a mpsc::UnboundedSender<WsClientMessage>,
+}
+
+async fn dispatch_unread_item(env: &DispatchEnv<'_>, handle: &str, item: &UnreadItem) {
+    let adapter = env.adapter;
+    let client = env.client;
+    let target = env.target;
+    let identity_id = env.identity_id;
+    let sessions = env.sessions;
+    let ws_out_tx = env.ws_out_tx;
     let thread_id = item
         .parent_id
         .clone()
@@ -940,6 +966,30 @@ pub(crate) fn split_shell_words(s: &str) -> Vec<String> {
     words
 }
 
+pub(crate) fn shell_escape_posix(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Renders a template for `sh -c` execution, POSIX single-quote escaping all substituted fields
+/// to prevent shell command injection via message bodies or metadata.
+pub(crate) fn render_shell_exec_template(
+    template: &str,
+    handle: &str,
+    item: &UnreadItem,
+    thread_id: &str,
+) -> String {
+    template
+        .replace("{{handle}}", &shell_escape_posix(handle))
+        .replace("{{unread_id}}", &shell_escape_posix(&item.id))
+        .replace("{{message_id}}", &shell_escape_posix(&item.message_id))
+        .replace("{{thread_id}}", &shell_escape_posix(thread_id))
+        .replace("{{channel_id}}", &shell_escape_posix(&item.channel_id))
+        .replace("{{channel}}", &shell_escape_posix(&item.channel_name))
+        .replace("{{author}}", &shell_escape_posix(&item.author_handle))
+        .replace("{{reason}}", &shell_escape_posix(&item.reason.to_string()))
+        .replace("{{body}}", &shell_escape_posix(&item.body))
+}
+
 pub(crate) fn render_exec_template(
     template: &str,
     handle: &str,
@@ -971,6 +1021,25 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_template_escapes_untrusted_body() {
+        let item = UnreadItem {
+            id: "u1".into(),
+            identity_id: "a1".into(),
+            message_id: "m1".into(),
+            channel_id: "c1".into(),
+            channel_name: "general".into(),
+            parent_id: None,
+            author_handle: "alice".into(),
+            body: "hi'; rm -rf / #".into(),
+            reason: relaypod_core::UnreadReason::Mention,
+            acked_at: None,
+            created_at: 0,
+        };
+        let rendered = render_shell_exec_template("echo {{body}}", "codex", &item, "m1");
+        assert_eq!(rendered, "echo 'hi'\\''; rm -rf / #'");
+    }
+
+    #[test]
     fn session_store_orders_by_lru_and_removes() {
         let tmp = std::env::temp_dir().join(format!(
             "relaypod-sessions-lru-test-{}.json",
@@ -980,11 +1049,8 @@ mod tests {
         let store = SessionStore::load_from(tmp.clone());
 
         store.set("codex", "t1", "herdr:w1:p1".into());
-        std::thread::sleep(Duration::from_millis(5));
         store.set("codex", "t2", "herdr:w1:p2".into());
-        std::thread::sleep(Duration::from_millis(5));
         store.set("codex", "t3", "herdr:w1:p3".into());
-        std::thread::sleep(Duration::from_millis(5));
         // Touch t1 so t2 becomes the oldest (LRU)
         store.touch("codex", "t1");
 
@@ -1016,16 +1082,16 @@ mod tests {
             }
         };
         let thread = relaypod_core::ThreadView {
-            parent: mk_msg("m1", "marcin", "Let's fix issue #4", None),
+            parent: mk_msg("m1", "alice", "Let's fix issue #4", None),
             replies: vec![
-                mk_msg("m2", "marcin-codex", "Working on it", Some("m1")),
-                mk_msg("m3", "marcin", "@claude can you review?", Some("m1")),
+                mk_msg("m2", "codex-local", "Working on it", Some("m1")),
+                mk_msg("m3", "alice", "@claude can you review?", Some("m1")),
             ],
         };
 
         let ctx = format_prior_thread_context(&thread, "m3").expect("should have prior history");
-        assert!(ctx.contains("@marcin (thread root): Let's fix issue #4"));
-        assert!(ctx.contains("@marcin-codex: Working on it"));
+        assert!(ctx.contains("@alice (thread root): Let's fix issue #4"));
+        assert!(ctx.contains("@codex-local: Working on it"));
         assert!(!ctx.contains("@claude can you review?"));
 
         // Top-level message itself has no prior context
@@ -1049,12 +1115,12 @@ mod tests {
                 }
             };
         let thread = relaypod_core::ThreadView {
-            parent: mk_msg("m1", "marcin", relaypod_core::IdentityKind::Human, "go"),
+            parent: mk_msg("m1", "alice", relaypod_core::IdentityKind::Human, "go"),
             replies: vec![
                 mk_msg("m2", "agy", relaypod_core::IdentityKind::Agent, "opened PR"),
                 mk_msg("m3", "codex", relaypod_core::IdentityKind::Agent, "nit 1"),
                 mk_msg("m4", "agy", relaypod_core::IdentityKind::Agent, "fixed 1"),
-                mk_msg("m5", "marcin", relaypod_core::IdentityKind::Human, "keep going"),
+                mk_msg("m5", "alice", relaypod_core::IdentityKind::Human, "keep going"),
                 mk_msg("m6", "codex", relaypod_core::IdentityKind::Agent, "nit 2"),
                 mk_msg("m7", "agy", relaypod_core::IdentityKind::Agent, "fixed 2"),
             ],
@@ -1063,17 +1129,17 @@ mod tests {
         // At m4: 3 consecutive agent turns since m1
         assert_eq!(
             analyze_agent_turns(&thread, "m4"),
-            (3, Some("marcin".into()), false)
+            (3, Some("alice".into()), false)
         );
         // At m5 (human): resets to 0
         assert_eq!(
             analyze_agent_turns(&thread, "m5"),
-            (0, Some("marcin".into()), false)
+            (0, Some("alice".into()), false)
         );
         // At m7: 2 consecutive agent turns since m5
         assert_eq!(
             analyze_agent_turns(&thread, "m7"),
-            (2, Some("marcin".into()), false)
+            (2, Some("alice".into()), false)
         );
 
         let mut paused_thread = thread;
@@ -1081,7 +1147,7 @@ mod tests {
             "m8",
             "codex",
             relaypod_core::IdentityKind::Agent,
-            "@marcin Paused automatic agent collaboration after 6 consecutive agent turns",
+            "@alice Paused automatic agent collaboration after 6 consecutive agent turns",
         ));
         let (_, _, already_paused) = analyze_agent_turns(&paused_thread, "m7");
         assert!(already_paused);

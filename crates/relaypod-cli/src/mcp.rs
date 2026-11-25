@@ -28,15 +28,12 @@ pub async fn run_mcp_stdio(client: RelayPodClient) -> Result<()> {
             }
         };
 
-        let id = req.get("id").cloned();
+        // Notifications have no `id` and expect no response.
+        let Some(id) = req.get("id").cloned() else {
+            continue;
+        };
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-
-        // Notifications have no `id` and expect no response.
-        if id.is_none() {
-            continue;
-        }
-        let id = id.unwrap();
 
         let response = match method {
             "initialize" => json!({
@@ -94,7 +91,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_channels",
-            "description": "List all channels on the RelayPod board.",
+            "description": "List all active (non-archived) channels on the RelayPod board.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -169,6 +166,13 @@ fn tool_definitions() -> Value {
     ])
 }
 
+fn require_str_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
+    match args.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err(format!("missing or invalid required string parameter '{key}'")),
+    }
+}
+
 async fn handle_tool_call(client: &RelayPodClient, id: Value, params: Value) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params
@@ -176,46 +180,56 @@ async fn handle_tool_call(client: &RelayPodClient, id: Value, params: Value) -> 
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    let invalid_params = |msg: String| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32602,
+                "message": msg
+            }
+        })
+    };
+
     let result: Result<Value> = match name {
         "list_channels" => client
             .list_channels()
             .await
-            .map(|v| serde_json::to_value(v).unwrap()),
+            .and_then(|v| Ok(serde_json::to_value(v)?)),
         "list_identities" => client
             .list_identities()
             .await
-            .map(|v| serde_json::to_value(v).unwrap()),
+            .and_then(|v| Ok(serde_json::to_value(v)?)),
         "read_channel" => {
-            let channel = args
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .unwrap_or("general");
+            let channel = match require_str_arg(&args, "channel") {
+                Ok(v) => v,
+                Err(msg) => return invalid_params(msg),
+            };
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
             client
                 .list_channel_messages(channel, limit)
                 .await
-                .map(|v| serde_json::to_value(v).unwrap())
+                .and_then(|v| Ok(serde_json::to_value(v)?))
         }
         "read_thread" => {
-            let message_id = args
-                .get("message_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let message_id = match require_str_arg(&args, "message_id") {
+                Ok(v) => v,
+                Err(msg) => return invalid_params(msg),
+            };
             client
                 .get_thread(message_id)
                 .await
-                .map(|v| serde_json::to_value(v).unwrap())
+                .and_then(|v| Ok(serde_json::to_value(v)?))
         }
         "post_message" => {
-            let channel = args
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .unwrap_or("general");
-            let body = args
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let channel = match require_str_arg(&args, "channel") {
+                Ok(v) => v,
+                Err(msg) => return invalid_params(msg),
+            };
+            let body = match require_str_arg(&args, "body") {
+                Ok(v) => v.to_string(),
+                Err(msg) => return invalid_params(msg),
+            };
             let parent_id = args
                 .get("parent_id")
                 .and_then(|v| v.as_str())
@@ -223,14 +237,17 @@ async fn handle_tool_call(client: &RelayPodClient, id: Value, params: Value) -> 
             client
                 .post_message(channel, body, parent_id)
                 .await
-                .map(|v| serde_json::to_value(v).unwrap())
+                .and_then(|v| Ok(serde_json::to_value(v)?))
         }
         "get_unread" => client
             .list_unread()
             .await
-            .map(|v| serde_json::to_value(v).unwrap()),
+            .and_then(|v| Ok(serde_json::to_value(v)?)),
         "ack_unread" => {
-            let unread_id = args.get("unread_id").and_then(|v| v.as_str()).unwrap_or("");
+            let unread_id = match require_str_arg(&args, "unread_id") {
+                Ok(v) => v,
+                Err(msg) => return invalid_params(msg),
+            };
             client
                 .ack_unread(unread_id)
                 .await
@@ -265,5 +282,51 @@ async fn handle_tool_call(client: &RelayPodClient, id: Value, params: Value) -> 
                 ]
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_missing_required_tool_params_with_invalid_params_code() {
+        let client = RelayPodClient::new("http://127.0.0.1:1", "rp_test");
+
+        let resp = handle_tool_call(
+            &client,
+            json!(1),
+            json!({ "name": "read_channel", "arguments": {} }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602));
+
+        let resp = handle_tool_call(
+            &client,
+            json!(2),
+            json!({ "name": "post_message", "arguments": { "channel": "general", "body": "   " } }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602));
+
+        let resp = handle_tool_call(
+            &client,
+            json!(3),
+            json!({ "name": "ack_unread", "arguments": { "unread_id": 123 } }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_returns_is_error_result() {
+        let client = RelayPodClient::new("http://127.0.0.1:1", "rp_test");
+        let resp = handle_tool_call(
+            &client,
+            json!(9),
+            json!({ "name": "nonexistent", "arguments": {} }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
     }
 }

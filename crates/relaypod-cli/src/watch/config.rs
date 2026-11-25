@@ -518,10 +518,11 @@ fn strip_yaml_comment(line: &str) -> &str {
             '\\' if in_double => escaped = true,
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => {
-                if idx == 0 || line[..idx].ends_with(' ') || line[..idx].ends_with('\t') {
-                    return &line[..idx];
-                }
+            '#' if !in_single
+                && !in_double
+                && (idx == 0 || line[..idx].ends_with(' ') || line[..idx].ends_with('\t')) =>
+            {
+                return &line[..idx];
             }
             _ => {}
         }
@@ -617,13 +618,13 @@ mod tests {
         let yaml = r#"
 server:
         admin_handles:
-        - martek
+        - admin
         - "@Alice"
 
 watcher:
         url: http://127.0.0.1:8787
         handles:
-          marcin-codex:
+          codex-local:
             token: rp_test_123
             exec: 'codex exec "Check #{{channel}} from @{{author}}: $RELAYPOD_BODY"'
             cwd: /tmp/repo
@@ -640,11 +641,11 @@ watcher:
 "#;
 
         let cfg = parse_yaml_config(yaml).expect("valid yaml");
-        assert_eq!(cfg.server.admin_handles, vec!["martek", "alice"]);
+        assert_eq!(cfg.server.admin_handles, vec!["admin", "alice"]);
         assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(cfg.watcher.handles.len(), 2);
 
-        let codex = &cfg.watcher.handles["marcin-codex"];
+        let codex = &cfg.watcher.handles["codex-local"];
         assert_eq!(codex.runner, RunnerKind::Exec);
         assert_eq!(codex.token.as_deref(), Some("rp_test_123"));
         assert_eq!(
@@ -687,16 +688,16 @@ watcher:
     fn parses_herdr_runner_and_agent_types() {
         let yaml = r#"
 server:
-  admin_handles: [martek, bob]
+  admin_handles: [alice, bob]
 watcher:
   url: http://127.0.0.1:8787
   global_max_sessions: 4
   handles:
-    marcin-codex:
+    codex-local:
       runner: herdr
       agent_type: codex
       token: rp_123
-      args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox
+      args: -m gpt-5.2-codex -c model_reasoning_effort=medium
       cwd: ~/projects
       herdr_session: main
       herdr_workspace: w1
@@ -711,14 +712,14 @@ watcher:
       token: rp_789
 "#;
         let cfg = parse_yaml_config(yaml).unwrap();
-        assert_eq!(cfg.server.admin_handles, vec!["martek", "bob"]);
+        assert_eq!(cfg.server.admin_handles, vec!["alice", "bob"]);
         assert_eq!(cfg.watcher.global_max_sessions, Some(4));
         assert_eq!(
             cfg.watcher.max_consecutive_agent_turns,
             Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS)
         );
 
-        let codex = &cfg.watcher.handles["marcin-codex"];
+        let codex = &cfg.watcher.handles["codex-local"];
         assert_eq!(codex.runner, RunnerKind::Herdr);
         assert_eq!(codex.agent_type, Some(AgentType::Codex));
         assert_eq!(codex.herdr_session.as_deref(), Some("main"));
@@ -752,9 +753,9 @@ watcher:
 
     #[test]
     fn parses_tab_indented_config() {
-        let yaml = "server:\n\tadmin_handles:\n\t- martek\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\thandles:\n\t  bot:\n\t    token: rp_123\n\t    exec: echo hi\n";
+        let yaml = "server:\n\tadmin_handles:\n\t- alice\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\thandles:\n\t  bot:\n\t    token: rp_123\n\t    exec: echo hi\n";
         let cfg = parse_yaml_config(yaml).expect("tab-indented config should parse");
-        assert_eq!(cfg.server.admin_handles, vec!["martek"]);
+        assert_eq!(cfg.server.admin_handles, vec!["alice"]);
         assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(cfg.watcher.handles["bot"].token.as_deref(), Some("rp_123"));
     }

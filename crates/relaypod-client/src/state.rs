@@ -52,16 +52,6 @@ impl WorkspaceState {
             .collect()
     }
 
-    pub fn is_identity_working(&self, identity_id: &str) -> bool {
-        self.active_workers
-            .iter()
-            .any(|w| w.identity_id == identity_id)
-    }
-
-    pub fn has_active_workers(&self) -> bool {
-        !self.active_workers.is_empty()
-    }
-
     fn sort_channels(&mut self) {
         self.channels.sort_by(|a, b| {
             a.name
@@ -106,6 +96,7 @@ impl WorkspaceState {
             ClientEvent::Disconnected => {
                 self.connected = false;
                 self.ws_live = false;
+                self.status_error = None;
                 self.me = None;
                 self.channels.clear();
                 self.identities.clear();
@@ -119,11 +110,13 @@ impl WorkspaceState {
                 channel_id,
                 messages,
             } => {
+                self.status_error = None;
                 if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
                     self.messages = messages;
                 }
             }
             ClientEvent::ThreadLoaded(thread) => {
+                self.status_error = None;
                 if self
                     .channels
                     .iter()
@@ -133,6 +126,7 @@ impl WorkspaceState {
                 }
             }
             ClientEvent::ChannelCreated(ch) => {
+                self.status_error = None;
                 if !self.channels.iter().any(|c| c.id == ch.id) {
                     self.channels.push(ch.clone());
                     self.sort_channels();
@@ -142,6 +136,7 @@ impl WorkspaceState {
                 effects.channel_just_created = true;
             }
             ClientEvent::IdentityCreated(created) => {
+                self.status_error = None;
                 if !self
                     .identities
                     .iter()
@@ -425,7 +420,7 @@ mod tests {
     #[test]
     fn test_workspace_state_ws_reduction() {
         let mut state = WorkspaceState::default();
-        let me = sample_identity("u1", "martek", IdentityKind::Human);
+        let me = sample_identity("u1", "alice", IdentityKind::Human);
         let agent = sample_identity("a1", "codex", IdentityKind::Agent);
         let ch = Channel {
             id: "c1".into(),
@@ -453,7 +448,7 @@ mod tests {
             channel_id: "c1".into(),
             parent_id: None,
             author_id: "u1".into(),
-            author_handle: "martek".into(),
+            author_handle: "alice".into(),
             author_kind: IdentityKind::Human,
             body: "@codex check build".into(),
             created_at: 1,
@@ -470,7 +465,7 @@ mod tests {
             channel_id: "c1".into(),
             channel_name: "general".into(),
             parent_id: None,
-            author_handle: "martek".into(),
+            author_handle: "alice".into(),
             body: "@codex check build".into(),
             reason: UnreadReason::Mention,
             acked_at: None,

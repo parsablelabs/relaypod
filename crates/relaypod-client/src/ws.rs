@@ -3,7 +3,10 @@ use relaypod_core::{WsClientMessage, WsEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
 use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
+use tracing::warn;
 
 /// Default interval between presence keepalive pings sent over WebSocket.
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -13,6 +16,7 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
 /// live presence identically.
 pub async fn run_live_ws_loop<OnStatus, OnEvent>(
     ws_url: String,
+    token: String,
     ping_interval: Duration,
     on_status: OnStatus,
     on_event: OnEvent,
@@ -21,13 +25,14 @@ pub async fn run_live_ws_loop<OnStatus, OnEvent>(
     OnEvent: FnMut(WsEvent),
 {
     let (_tx, rx) = mpsc::unbounded_channel();
-    run_live_ws_loop_with_outgoing(ws_url, ping_interval, rx, on_status, on_event).await;
+    run_live_ws_loop_with_outgoing(ws_url, token, ping_interval, rx, on_status, on_event).await;
 }
 
 /// Variant of [`run_live_ws_loop`] that also forwards outgoing [`WsClientMessage`]s
 /// (such as agent working/activity indicators) over the active WebSocket connection.
 pub async fn run_live_ws_loop_with_outgoing<OnStatus, OnEvent>(
     ws_url: String,
+    token: String,
     ping_interval: Duration,
     mut outgoing_rx: mpsc::UnboundedReceiver<WsClientMessage>,
     mut on_status: OnStatus,
@@ -40,7 +45,17 @@ pub async fn run_live_ws_loop_with_outgoing<OnStatus, OnEvent>(
         serde_json::to_string(&WsClientMessage::Ping).unwrap_or_else(|_| r#"{"type":"ping"}"#.into());
 
     loop {
-        match connect_async(&ws_url).await {
+        let request = match build_ws_request(&ws_url, &token) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("invalid WebSocket request for {ws_url}: {e}");
+                on_status(false);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        match connect_async(request).await {
             Ok((ws_stream, _)) => {
                 on_status(true);
                 let (mut write, mut read) = ws_stream.split();
@@ -78,10 +93,21 @@ pub async fn run_live_ws_loop_with_outgoing<OnStatus, OnEvent>(
                 }
                 on_status(false);
             }
-            Err(_) => {
+            Err(e) => {
+                warn!("WebSocket connection to {ws_url} failed: {e}");
                 on_status(false);
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn build_ws_request(
+    ws_url: &str,
+    token: &str,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut req = ws_url.into_client_request()?;
+    let auth_value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+    req.headers_mut().insert(AUTHORIZATION, auth_value);
+    Ok(req)
 }

@@ -507,6 +507,30 @@ async fn get_herdr_agent_status(herdr_session: Option<&str>, pane_id: &str) -> R
     Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
 }
 
+fn redact_herdr_args(args: &[&str]) -> String {
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for &arg in args {
+        if redact_next {
+            let masked = match arg.split_once('=') {
+                Some((k, _)) => format!("{k}=<redacted>"),
+                None => "<redacted>".to_string(),
+            };
+            out.push(masked);
+            redact_next = false;
+        } else if arg == "--env" {
+            out.push(arg.to_string());
+            redact_next = true;
+        } else if let Some(rest) = arg.strip_prefix("--env=") {
+            let key = rest.split_once('=').map(|(k, _)| k).unwrap_or("?");
+            out.push(format!("--env={key}=<redacted>"));
+        } else {
+            out.push(arg.to_string());
+        }
+    }
+    out.join(" ")
+}
+
 async fn run_herdr_json(herdr_session: Option<&str>, args: &[&str]) -> Result<Value> {
     let mut cmd = Command::new("herdr");
     if let Some(session) = herdr_session {
@@ -515,18 +539,18 @@ async fn run_herdr_json(herdr_session: Option<&str>, args: &[&str]) -> Result<Va
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    let redacted = redact_herdr_args(args);
     let output = cmd
         .output()
         .await
-        .with_context(|| format!("failed to execute `herdr {}`", args.join(" ")))?;
+        .with_context(|| format!("failed to execute `herdr {redacted}`"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if !output.status.success() {
         return Err(anyhow!(
-            "`herdr {}` exited with {:?}: {}",
-            args.join(" "),
+            "`herdr {redacted}` exited with {:?}: {}",
             output.status.code(),
             if !stderr.is_empty() { stderr } else { stdout }
         ));
@@ -537,10 +561,7 @@ async fn run_herdr_json(herdr_session: Option<&str>, args: &[&str]) -> Result<Va
     }
 
     serde_json::from_str(&stdout).with_context(|| {
-        format!(
-            "failed to parse JSON from `herdr {}`: {stdout}",
-            args.join(" ")
-        )
+        format!("failed to parse JSON from `herdr {redacted}`: {stdout}")
     })
 }
 
@@ -639,13 +660,13 @@ mod tests {
 
     #[test]
     fn builds_valid_relaypod_prefixed_herdr_names() {
-        let name = herdr_agent_name("marcin-codex", "0199a213-81c0-7800-8aa1");
+        let name = herdr_agent_name("codex-local", "0199a213-81c0-7800-8aa1");
         assert!(name.starts_with("relaypod-"));
         assert!(name.len() <= 32, "name too long: {name}");
         assert!(name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'));
-        assert_eq!(name, "relaypod-marcin-codex-0199a213");
+        assert_eq!(name, "relaypod-codex-local-0199a213");
 
         let long_name = herdr_agent_name(
             "very-long-agent-handle-name-that-exceeds-limit",
@@ -701,5 +722,23 @@ mod tests {
         assert_eq!(find_workspace_id(&ws_list, "relaypod").as_deref(), Some("w2"));
         assert_eq!(find_workspace_id(&ws_list, "w1").as_deref(), Some("w1"));
         assert_eq!(find_workspace_id(&ws_list, "missing"), None);
+    }
+
+    #[test]
+    fn redacts_env_secrets_in_herdr_args() {
+        let args = [
+            "tab",
+            "create",
+            "--env",
+            "RELAYPOD_TOKEN=rp_super_secret",
+            "--env=API_KEY=sk-1234",
+            "--label",
+            "demo",
+        ];
+        let redacted = redact_herdr_args(&args);
+        assert!(!redacted.contains("rp_super_secret"));
+        assert!(!redacted.contains("sk-1234"));
+        assert!(redacted.contains("RELAYPOD_TOKEN=<redacted>"));
+        assert!(redacted.contains("--env=API_KEY=<redacted>"));
     }
 }

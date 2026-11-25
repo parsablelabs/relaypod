@@ -127,6 +127,7 @@ where
                         match fetch_initial(&new_client).await {
                             Ok((me, channels, identities, unread)) => {
                                 let ws_url = new_client.ws_url();
+                                let ws_token = new_client.token().to_string();
                                 client = Some(new_client);
                                 emit(
                                     &event_tx,
@@ -141,7 +142,7 @@ where
                                 let tx_ws = event_tx.clone();
                                 let notify_ws = Arc::clone(&notify);
                                 ws_task = Some(tokio::spawn(async move {
-                                    run_ws_loop(ws_url, tx_ws, notify_ws).await;
+                                    run_ws_loop(ws_url, ws_token, tx_ws, notify_ws).await;
                                 }));
                             }
                             Err(e) => emit(&event_tx, &notify, ClientEvent::Error(e.to_string())),
@@ -323,14 +324,15 @@ where
 async fn fetch_initial(
     client: &RelayPodClient,
 ) -> anyhow::Result<(Identity, Vec<Channel>, Vec<Identity>, Vec<UnreadItem>)> {
-    let me = client.me().await?;
-    let channels = client.list_channels_including_archived().await?;
-    let identities = client.list_identities().await?;
-    let unread = client.list_unread().await?;
-    Ok((me, channels, identities, unread))
+    tokio::try_join!(
+        client.me(),
+        client.list_channels_including_archived(),
+        client.list_identities(),
+        client.list_unread(),
+    )
 }
 
-async fn run_ws_loop<F>(ws_url: String, tx: Sender<ClientEvent>, notify: Arc<F>)
+async fn run_ws_loop<F>(ws_url: String, token: String, tx: Sender<ClientEvent>, notify: Arc<F>)
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -338,6 +340,7 @@ where
     let notify_status = Arc::clone(&notify);
     run_live_ws_loop(
         ws_url,
+        token,
         DEFAULT_PING_INTERVAL,
         move |live| {
             let _ = tx_status.send(ClientEvent::WsStatus(live));

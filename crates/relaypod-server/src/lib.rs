@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Path, Query, State,
+        DefaultBodyLimit, FromRequestParts, Path, Query, State,
     },
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
@@ -10,19 +10,24 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use relaypod_core::{
-    CoreError, CreateChannelRequest, CreateIdentityRequest, Identity, IdentityKind,
-    PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage, WsEvent,
+    auth::normalize_handle, CoreError, CreateChannelRequest, CreateIdentityRequest, Identity,
+    IdentityKind, PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage, WsEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tokio::sync::{broadcast, Notify};
+use tracing::{error, info, warn};
 
 const PRESENCE_TTL: Duration = Duration::from_secs(30);
+const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_ACTIVITY_PER_IDENTITY: usize = 16;
+const MAX_ACTIVITY_ID_LEN: usize = 128;
+
+type ActivityKey = (String, String, Option<String>);
 
 struct PresenceEntry {
     connections: usize,
@@ -36,7 +41,7 @@ pub struct AppState {
     admin_handles: HashSet<String>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
     /// Active working/typing indicators keyed by `(identity_id, channel_id, thread_id) -> handle`.
-    activity: Mutex<HashMap<(String, String, Option<String>), String>>,
+    activity: Mutex<HashMap<ActivityKey, String>>,
     // Keep board events in the same order as their committed writes.
     board_writes: Mutex<()>,
 }
@@ -54,7 +59,7 @@ impl AppState {
         let (events, _) = broadcast::channel(512);
         let admin_handles = admin_handles
             .into_iter()
-            .map(|h| h.into().trim().trim_start_matches('@').to_lowercase())
+            .map(|h| normalize_handle(&h.into()))
             .filter(|h| !h.is_empty())
             .collect();
         Arc::new(Self {
@@ -195,10 +200,24 @@ impl AppState {
         thread_id: Option<String>,
         active: bool,
     ) {
+        if channel_id.is_empty()
+            || channel_id.len() > MAX_ACTIVITY_ID_LEN
+            || thread_id
+                .as_deref()
+                .is_some_and(|t| t.is_empty() || t.len() > MAX_ACTIVITY_ID_LEN)
+        {
+            return;
+        }
         let changed = {
             let mut guard = self.activity.lock().expect("activity lock poisoned");
             let key = (identity_id.to_string(), channel_id.clone(), thread_id.clone());
             if active {
+                if !guard.contains_key(&key) {
+                    let count = guard.keys().filter(|(id, _, _)| id == identity_id).count();
+                    if count >= MAX_ACTIVITY_PER_IDENTITY {
+                        return;
+                    }
+                }
                 guard.insert(key, handle.to_string());
                 true
             } else {
@@ -296,7 +315,10 @@ impl From<CoreError> for ApiError {
             CoreError::NotFound(m) => Self::new(StatusCode::NOT_FOUND, m),
             CoreError::InvalidInput(m) => Self::new(StatusCode::BAD_REQUEST, m),
             CoreError::Conflict(m) => Self::new(StatusCode::CONFLICT, m),
-            CoreError::Db(e) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            CoreError::Db(e) => {
+                error!("database error: {e}");
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+            }
         }
     }
 }
@@ -316,7 +338,7 @@ impl FromRequestParts<Arc<AppState>> for AuthIdentity {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_bearer_or_query_token(parts).ok_or_else(|| {
+        let token = extract_bearer_token(parts).ok_or_else(|| {
             ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "missing Authorization: Bearer <token>",
@@ -343,7 +365,7 @@ fn require_human(identity: &Identity) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn extract_bearer_or_query_token(parts: &Parts) -> Option<String> {
+fn extract_bearer_token(parts: &Parts) -> Option<String> {
     if let Some(val) = parts
         .headers
         .get(header::AUTHORIZATION)
@@ -357,25 +379,10 @@ fn extract_bearer_or_query_token(parts: &Parts) -> Option<String> {
         }
     }
 
-    if let Some(query) = parts.uri.query() {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "token" && !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-
     None
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     Router::new()
         .route("/health", get(health))
         .route("/api/me", get(get_me))
@@ -398,7 +405,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/unread", get(list_unread))
         .route("/api/unread/{id}/ack", post(ack_unread))
         .route("/api/ws", get(ws_handler))
-        .layer(cors)
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
 
@@ -407,6 +414,11 @@ pub async fn serve(
     store: Arc<Store>,
     admin_handles: Vec<String>,
 ) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() {
+        warn!(
+            "RelayPod is binding to non-loopback address {addr} over plaintext HTTP/WS; terminate TLS with a reverse proxy"
+        );
+    }
     let state = AppState::with_admin_handles(store, admin_handles);
     let sweeper_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -453,6 +465,10 @@ async fn create_identity(
     Json(mut req): Json<CreateIdentityRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::CreatedIdentity>), ApiError> {
     require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
     if req.kind == IdentityKind::Human {
         if !state.is_admin(&caller) {
             return Err(ApiError::new(
@@ -702,6 +718,31 @@ async fn delete_message(
         .board_writes
         .lock()
         .expect("board write lock poisoned");
+    let info = state
+        .store
+        .get_message_delete_info(&message_id)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("message '{message_id}' not found"),
+            )
+        })?;
+    if info.parent_id.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cannot delete an individual thread reply; delete the top-level message instead",
+        ));
+    }
+    let allowed = state.is_admin(&caller)
+        || info.author_id == caller.id
+        || (info.author_kind == IdentityKind::Agent
+            && info.author_owner_id.as_deref() == Some(caller.id.as_str()));
+    if !allowed {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only an admin, the message author, or the owner of the authoring agent can delete this message",
+        ));
+    }
     let deleted = state.store.delete_message(&message_id)?;
     for (unread_id, identity_id) in deleted.affected_unread {
         state.emit(WsEvent::UnreadAcked {
@@ -756,7 +797,9 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     AuthIdentity(identity): AuthIdentity,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state, identity))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, state, identity))
 }
 
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) {
@@ -767,6 +810,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
     info!("ws connected: @{}", identity.handle);
 
     let initial_activity = state.snapshot_active_events();
+    let my_id = identity.id.clone();
+    let my_kind = identity.kind;
+    let revoked = Arc::new(Notify::new());
+    let revoked_tx = Arc::clone(&revoked);
     let send_task = tokio::spawn(async move {
         for event in initial_activity {
             if let Ok(text) = serde_json::to_string(&event) {
@@ -775,7 +822,32 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
                 }
             }
         }
-        while let Ok(event) = rx.recv().await {
+        loop {
+            let event = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("ws client {my_id} lagged by {skipped} events");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+
+            if let WsEvent::IdentityDeleted { ref identity_id } = event {
+                if identity_id == &my_id {
+                    revoked_tx.notify_one();
+                    break;
+                }
+            }
+
+            // Agents only receive their own unread queue events; humans see board-wide badges.
+            if my_kind == IdentityKind::Agent {
+                match &event {
+                    WsEvent::UnreadCreated(item) if item.identity_id != my_id => continue,
+                    WsEvent::UnreadAcked { identity_id, .. } if identity_id != &my_id => continue,
+                    _ => {}
+                }
+            }
+
             match serde_json::to_string(&event) {
                 Ok(text) => {
                     if sender.send(WsMessage::Text(text.into())).await.is_err() {
@@ -787,34 +859,47 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
         }
     });
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            WsMessage::Text(text) => {
-                if let Ok(client_msg) = serde_json::from_str::<WsClientMessage>(&text) {
-                    match client_msg {
-                        WsClientMessage::Ping => state.on_ws_ping(&identity.id),
-                        WsClientMessage::Activity {
-                            channel_id,
-                            thread_id,
-                            active,
-                        } => {
-                            state.on_ws_ping(&identity.id);
-                            state.set_activity(
-                                &identity.id,
-                                &identity.handle,
-                                channel_id,
-                                thread_id,
-                                active,
-                            );
+    loop {
+        tokio::select! {
+            _ = revoked.notified() => break,
+            next = receiver.next() => {
+                let Some(Ok(msg)) = next else { break; };
+                match msg {
+                    WsMessage::Text(text) => {
+                        if let Ok(client_msg) = serde_json::from_str::<WsClientMessage>(&text) {
+                            match client_msg {
+                                WsClientMessage::Ping => state.on_ws_ping(&identity.id),
+                                WsClientMessage::Activity {
+                                    channel_id,
+                                    thread_id,
+                                    active,
+                                } => {
+                                    state.on_ws_ping(&identity.id);
+                                    let current_handle = state
+                                        .store
+                                        .get_identity(&identity.id)
+                                        .ok()
+                                        .flatten()
+                                        .map(|i| i.handle)
+                                        .unwrap_or_else(|| identity.handle.clone());
+                                    state.set_activity(
+                                        &identity.id,
+                                        &current_handle,
+                                        channel_id,
+                                        thread_id,
+                                        active,
+                                    );
+                                }
+                            }
                         }
                     }
+                    WsMessage::Ping(_) => {
+                        state.on_ws_ping(&identity.id);
+                    }
+                    WsMessage::Close(_) => break,
+                    _ => {}
                 }
             }
-            WsMessage::Ping(_) => {
-                state.on_ws_ping(&identity.id);
-            }
-            WsMessage::Close(_) => break,
-            _ => {}
         }
     }
 

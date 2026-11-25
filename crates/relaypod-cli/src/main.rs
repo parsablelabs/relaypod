@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use relaypod_client::{mcp_config_snippet, RelayPodClient};
 use relaypod_core::{
     CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store, UpdateChannelRequest,
+    UpdateIdentityRequest,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ enum Commands {
         /// Handle for the initial human identity if the database is empty
         #[arg(long, default_value = "admin")]
         admin: String,
-        /// Path to YAML config file (defaults to ./config/.relaypod.yaml, ./.relaypod.yaml, or ~/.relaypod/config.yaml)
+        /// Path to YAML config file (defaults to ~/.relaypod/config.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -47,7 +48,7 @@ enum Commands {
     Mcp,
     /// Watch for unread mentions/replies over WebSocket and execute configured commands
     Watch {
-        /// Path to YAML config file (defaults to ./config/.relaypod.yaml, ./.relaypod.yaml, or ~/.relaypod/config.yaml)
+        /// Path to YAML config file (defaults to ~/.relaypod/config.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
         /// Only watch a specific handle from the config file
@@ -109,46 +110,80 @@ enum Commands {
     /// Inspect or acknowledge items in your unread queue
     Unread {
         /// Acknowledge the given unread item ID
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ack_all")]
         ack: Option<String>,
+        /// Acknowledge all pending unread items
+        #[arg(long)]
+        ack_all: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum IdentityAction {
+    /// List all active human and agent identities
     List,
+    /// Register a new human (admin only) or agent identity
     Create {
+        /// Handle for the new identity (without leading '@')
         handle: String,
+        /// Identity kind: 'agent' or 'human'
         #[arg(long, default_value = "agent")]
         kind: String,
+    },
+    /// Rename an agent identity you registered
+    Rename {
+        /// Current agent handle or ID
+        identity: String,
+        /// New handle for the agent
+        handle: String,
+    },
+    /// Delete an agent identity you registered (or a human identity, if admin)
+    Delete {
+        /// Identity handle or ID to delete
+        identity: String,
     },
 }
 
 #[derive(Subcommand)]
 enum ChannelAction {
+    /// List channels on the board
     List {
+        /// Include archived read-only channels
         #[arg(long)]
         include_archived: bool,
     },
+    /// Create a new channel
     Create {
+        /// Channel name (without leading '#')
         name: String,
+        /// Optional channel description
         #[arg(long, default_value = "")]
         description: String,
     },
+    /// Update a channel's name and/or description
     Update {
+        /// Channel name or ID
         channel: String,
+        /// New channel name
         #[arg(long, required_unless_present = "description")]
         name: Option<String>,
+        /// New channel description
         #[arg(long)]
         description: Option<String>,
     },
+    /// Archive a channel (makes it read-only)
     Archive {
+        /// Channel name or ID
         channel: String,
     },
+    /// Unarchive a previously archived channel
     Unarchive {
+        /// Channel name or ID
         channel: String,
     },
+    /// Permanently delete a channel and all its messages
     Delete {
+        /// Channel name or ID
         channel: String,
         /// Confirm permanent deletion of the channel and all its messages.
         #[arg(long)]
@@ -192,6 +227,11 @@ async fn main() -> Result<()> {
                 }
                 None => Vec::new(),
             };
+            if admin_handles.is_empty() {
+                tracing::warn!(
+                    "No server.admin_handles configured in ~/.relaypod/config.yaml; no human handles will have admin privileges"
+                );
+            }
 
             let store = Arc::new(Store::open(db)?);
             if let Some(created) = store.bootstrap(admin)? {
@@ -249,11 +289,18 @@ async fn main() -> Result<()> {
                 IdentityAction::List => {
                     let list = client.list_identities().await?;
                     for id in list {
-                        let badge = match id.kind {
-                            IdentityKind::Human => "human",
-                            IdentityKind::Agent => "agent",
+                        let admin_tag = if id.is_admin { " [admin]" } else { "" };
+                        let status = if id.busy {
+                            "busy"
+                        } else if id.online {
+                            "online"
+                        } else {
+                            "offline"
                         };
-                        println!("@{} [{}] unread={}", id.handle, badge, id.unread_count);
+                        println!(
+                            "@{} [{}]{} ({}) unread={}",
+                            id.handle, id.kind, admin_tag, status, id.unread_count
+                        );
                     }
                 }
                 IdentityAction::Create { handle, kind } => {
@@ -273,6 +320,21 @@ async fn main() -> Result<()> {
                         println!("\nMCP config snippet:");
                         println!("{}", mcp_config_snippet(&cli.url, &created.token));
                     }
+                }
+                IdentityAction::Rename { identity, handle } => {
+                    let updated = client
+                        .update_identity(
+                            identity,
+                            &UpdateIdentityRequest {
+                                handle: Some(handle.clone()),
+                            },
+                        )
+                        .await?;
+                    println!("Renamed identity {} to @{}", updated.id, updated.handle);
+                }
+                IdentityAction::Delete { identity } => {
+                    client.delete_identity(identity).await?;
+                    println!("Deleted identity {identity}");
                 }
             }
         }
@@ -375,9 +437,19 @@ async fn main() -> Result<()> {
             client.delete_message(message_id).await?;
             println!("Deleted message {message_id}");
         }
-        Commands::Unread { ack } => {
+        Commands::Unread { ack, ack_all } => {
             let client = require_client(&cli)?;
-            if let Some(unread_id) = ack {
+            if *ack_all {
+                let items = client.list_unread().await?;
+                if items.is_empty() {
+                    println!("No unread items.");
+                } else {
+                    for item in &items {
+                        client.ack_unread(&item.id).await?;
+                    }
+                    println!("Acknowledged {} unread item(s).", items.len());
+                }
+            } else if let Some(unread_id) = ack {
                 client.ack_unread(unread_id).await?;
                 println!("Acknowledged {unread_id}");
             } else {

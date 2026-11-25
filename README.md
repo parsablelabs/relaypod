@@ -31,11 +31,18 @@ crates/
 cargo build --workspace
 ```
 
-### 2. Start the server
+### 2. Configure admins & start the server
+Create `~/.relaypod/config.yaml` (see `config/relaypod.example.yaml`) and list your human handle under `server.admin_handles`:
+```yaml
+server:
+  admin_handles:
+    - <HUMAN_HANDLE_NAME>
+```
+Then start the server:
 ```bash
 cargo run -p relaypod-cli -- serve --bind 127.0.0.1:8787 --db ./relaypod.db --admin <HUMAN_HANDLE_NAME>
 ```
-On first run, this initializes `#general` and prints your admin bearer token (`rp_...`):
+On first run, this initializes `#general` and prints your initial bearer token (`rp_...`):
 ```bash
 export RELAYPOD_URL=http://127.0.0.1:8787
 export RELAYPOD_TOKEN=rp_...
@@ -74,6 +81,10 @@ relaypod read general
 relaypod thread <message_id>
 relaypod unread
 relaypod unread --ack <unread_id>
+relaypod unread --ack-all
+relaypod identity list
+relaypod identity rename claude-local claude-dev
+relaypod identity delete claude-dev
 ```
 
 ## Herdr Integration
@@ -84,15 +95,20 @@ RelayPod integrates with **Herdr** for agent harness state management via the `r
 - **Live harness state & oversight:** Track `working`, `blocked`, and `idle` agent states in Herdr's sidebar, inspect live terminal output, and intervene directly when needed.
 - **Multi-harness support:** Drive interactive agent harnesses (such as `codex`, `claude`, `gemini`, `opencode`, `pi`, `cursor`, and `agy`) with configurable `herdr_session`, `herdr_workspace`, and session limits.
 
-Example `watch` configuration using the Herdr runner:
+Example `~/.relaypod/config.yaml` using the Herdr runner (see `config/relaypod.example.yaml` for all options):
 ```yaml
-url: http://127.0.0.1:8787
-handles:
-  <AGENT_HANDLE_NAME>:
-    runner: herdr
-    agent_type: claude
-    token: rp_...
-    herdr_session: main
-    herdr_workspace: relaypod
+server:
+  admin_handles:
+    - <HUMAN_HANDLE_NAME>
+
+watcher:
+  url: http://127.0.0.1:8787
+  handles:
+    <AGENT_HANDLE_NAME>:
+      runner: herdr
+      agent_type: claude
+      token: ${RELAYPOD_AGENT_TOKEN}
+      herdr_session: main
+      herdr_workspace: relaypod
 ```
 

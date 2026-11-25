@@ -1,41 +1,16 @@
-use axum::body::{to_bytes, Body};
-use axum::http::{Request, StatusCode};
-use axum::response::Response;
-use axum::Router;
+mod common;
+
+use axum::http::StatusCode;
+use common::{read_body, request};
 use relaypod_core::{CreateIdentityRequest, Identity, IdentityKind, Store, WsEvent};
 use relaypod_server::{build_router, AppState};
-use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower::ServiceExt;
-
-async fn request(app: &Router, token: &str, method: &str, path: &str, body: Value) -> Response {
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .expect("valid test request"),
-        )
-        .await
-        .expect("router handles test request")
-}
-
-async fn read_body<T: DeserializeOwned>(response: Response, status: StatusCode) -> T {
-    assert_eq!(response.status(), status);
-    let body = to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("read test response");
-    serde_json::from_slice(&body).expect("valid JSON response")
-}
 
 #[tokio::test]
 async fn only_owning_human_can_rename_agent_and_history_persists() {
     let store = Arc::new(Store::open_in_memory().unwrap());
-    let owner = store.bootstrap("marcin").unwrap().unwrap();
+    let owner = store.bootstrap("bob").unwrap().unwrap();
     let other_human = store
         .create_identity(CreateIdentityRequest {
             handle: "alice".into(),
@@ -45,12 +20,12 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
         .unwrap();
     let agent = store
         .create_identity(CreateIdentityRequest {
-            handle: "marcin-codex".into(),
+            handle: "codex-local".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
         })
         .unwrap();
-    let general = store.get_channel_by_name("general").unwrap().unwrap();
+    let general = store.get_channel("general").unwrap().unwrap();
     store
         .post_message(&general.id, &agent.identity, "Initial PR opened", None)
         .unwrap();
@@ -89,7 +64,7 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
             &owner.token,
             "PATCH",
             &format!("/api/identities/{}", owner.identity.id),
-            json!({"handle": "marcin2"})
+            json!({"handle": "bob2"})
         )
         .await
         .status(),
@@ -144,7 +119,7 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
 #[tokio::test]
 async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions() {
     let store = Arc::new(Store::open_in_memory().unwrap());
-    let owner = store.bootstrap("marcin").unwrap().unwrap();
+    let owner = store.bootstrap("bob").unwrap().unwrap();
     let other_human = store
         .create_identity(CreateIdentityRequest {
             handle: "alice".into(),
@@ -166,7 +141,7 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             owner_id: Some(owner.identity.id.clone()),
         })
         .unwrap();
-    let general = store.get_channel_by_name("general").unwrap().unwrap();
+    let general = store.get_channel("general").unwrap().unwrap();
     store
         .post_message(&general.id, &owner.identity, "Hey @mentioned-bot check this", None)
         .unwrap();

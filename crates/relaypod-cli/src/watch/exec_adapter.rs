@@ -9,7 +9,8 @@ use tracing::{error, info, warn};
 use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
 use super::config::AgentType;
 use super::{
-    apply_common_env, build_agent_prompt_with_context, render_exec_template, split_shell_words,
+    apply_common_env, build_agent_prompt_with_context, render_shell_exec_template,
+    split_shell_words,
 };
 
 /// Adapter that executes headless CLI commands directly:
@@ -27,14 +28,12 @@ impl WatcherAdapter for ExecAdapter {
         ctx: DispatchContext<'a>,
     ) -> Pin<Box<dyn Future<Output = DispatchOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let existing_session = ctx.sessions.get(ctx.identity_id, ctx.thread_id).and_then(|s| {
+            let existing_session = ctx
+                .sessions
+                .get(ctx.identity_id, ctx.thread_id)
                 // Ignore session entries written by other adapters (e.g. `herdr:w1:p2`)
-                if s.starts_with("herdr:") {
-                    None
-                } else {
-                    Some(s)
-                }
-            });
+                // or malformed values that could be parsed as CLI flags.
+                .filter(|s| !s.starts_with("herdr:") && is_safe_session_id(s));
 
             let succeeded = match &ctx.target.agent_type {
                 Some(agent_type) => {
@@ -54,7 +53,7 @@ impl WatcherAdapter for ExecAdapter {
 
 async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&str>) -> bool {
     let rendered_cmd =
-        render_exec_template(&ctx.target.exec, ctx.handle, ctx.item, ctx.thread_id);
+        render_shell_exec_template(&ctx.target.exec, ctx.handle, ctx.item, ctx.thread_id);
     info!(
         handle = %ctx.handle,
         unread_id = %ctx.item.id,
@@ -219,27 +218,28 @@ async fn run_managed_agent(
     }
 }
 
+pub(crate) fn is_safe_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+}
+
 pub(crate) fn extract_session_id_from_json_line(
     agent_type: &AgentType,
     line: &str,
 ) -> Option<String> {
     let val: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    match agent_type {
-        AgentType::Codex => {
-            if let Some(id) = val.get("thread_id").and_then(|v| v.as_str()) {
-                return Some(id.to_string());
-            }
-            if let Some(id) = val.get("session_id").and_then(|v| v.as_str()) {
-                return Some(id.to_string());
-            }
-            None
-        }
-        AgentType::Claude => val
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
+    let raw = match agent_type {
+        AgentType::Codex => val
+            .get("thread_id")
+            .or_else(|| val.get("session_id"))
+            .and_then(|v| v.as_str()),
+        AgentType::Claude => val.get("session_id").and_then(|v| v.as_str()),
         AgentType::Other(_) => None,
-    }
+    }?;
+    is_safe_session_id(raw).then(|| raw.to_string())
 }
 
 #[cfg(test)]
@@ -259,6 +259,12 @@ mod tests {
         assert_eq!(
             extract_session_id_from_json_line(&AgentType::Claude, claude_line).as_deref(),
             Some("sess_abc123")
+        );
+
+        let flag_smuggle = r#"{"type":"result","session_id":"--dangerously-skip-permissions"}"#;
+        assert_eq!(
+            extract_session_id_from_json_line(&AgentType::Claude, flag_smuggle),
+            None
         );
     }
 }

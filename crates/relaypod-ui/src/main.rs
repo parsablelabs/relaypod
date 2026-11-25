@@ -210,6 +210,28 @@ impl RelayPodApp {
         })
     }
 
+    fn can_delete_message(&self, msg: &Message) -> bool {
+        if msg.parent_id.is_some() {
+            return false;
+        }
+        self.state.me.as_ref().is_some_and(|me| {
+            if me.kind != IdentityKind::Human {
+                return false;
+            }
+            if me.is_admin || msg.author_id == me.id {
+                return true;
+            }
+            msg.author_kind == IdentityKind::Agent
+                && self
+                    .state
+                    .identities
+                    .iter()
+                    .find(|i| i.id == msg.author_id)
+                    .and_then(|i| i.owner_id.as_deref())
+                    == Some(me.id.as_str())
+        })
+    }
+
     fn render_channel_row(&mut self, ui: &mut egui::Ui, channel: &Channel) {
         let selected = self.state.selected_channel_id.as_deref() == Some(channel.id.as_str());
         let mut row = ui.selectable_label(selected, format!("# {}", channel.name));
@@ -270,16 +292,26 @@ impl RelayPodApp {
                     .show(ui, |ui| {
                         ui.set_width(420.0);
                         ui.label("Server URL");
-                        ui.text_edit_singleline(&mut self.server_url);
+                        let url_resp = ui.text_edit_singleline(&mut self.server_url);
+                        if is_non_loopback_http(&self.server_url) {
+                            ui.colored_label(
+                                Color32::YELLOW,
+                                "Warning: connecting over plaintext http:// to a non-local host",
+                            );
+                        }
                         ui.add_space(8.0);
                         ui.label("Bearer Token (RELAYPOD_TOKEN)");
-                        ui.add(
+                        let token_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.token)
                                 .password(true)
                                 .hint_text("rp_..."),
                         );
+                        let enter_pressed = (url_resp.lost_focus() || token_resp.lost_focus())
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.add_space(12.0);
-                        if ui.button("Connect").clicked() && !self.token.trim().is_empty() {
+                        if (ui.button("Connect").clicked() || enter_pressed)
+                            && !self.token.trim().is_empty()
+                        {
                             self.state.status_error = None;
                             self.runtime.send(ClientCommand::Connect {
                                 base_url: self.server_url.clone(),
@@ -297,27 +329,35 @@ impl RelayPodApp {
 
     fn render_modals(&mut self, ctx: &egui::Context) {
         if self.show_new_channel_modal {
-            egui::Window::new("New Channel")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Channel name (without #)");
-                    ui.text_edit_singleline(&mut self.new_channel_name);
-                    ui.label("Description");
-                    ui.text_edit_singleline(&mut self.new_channel_desc);
-                    ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() && !self.new_channel_name.trim().is_empty()
-                        {
-                            self.runtime.send(ClientCommand::CreateChannel {
-                                name: self.new_channel_name.clone(),
-                                description: self.new_channel_desc.clone(),
-                            });
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.show_new_channel_modal = false;
-                        }
-                    });
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("new_channel")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("New Channel");
+                ui.label("Channel name (without #)");
+                ui.text_edit_singleline(&mut self.new_channel_name);
+                ui.label("Description");
+                ui.text_edit_singleline(&mut self.new_channel_desc);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.new_channel_name.trim().is_empty(),
+                            egui::Button::new("Create"),
+                        )
+                        .clicked()
+                    {
+                        self.runtime.send(ClientCommand::CreateChannel {
+                            name: self.new_channel_name.clone(),
+                            description: self.new_channel_desc.clone(),
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
                 });
+            });
+            if close || modal.should_close() {
+                self.show_new_channel_modal = false;
+            }
         }
 
         if self.show_new_agent_modal {
@@ -330,44 +370,49 @@ impl RelayPodApp {
             } else {
                 "Register Agent"
             };
-            egui::Window::new(title)
-                .collapsible(false)
-                .default_width(460.0)
-                .show(ctx, |ui| {
-                    if is_admin {
-                        ui.horizontal(|ui| {
-                            ui.label("Kind:");
-                            ui.selectable_value(
-                                &mut self.new_agent_kind,
-                                IdentityKind::Agent,
-                                "Agent",
-                            );
-                            ui.selectable_value(
-                                &mut self.new_agent_kind,
-                                IdentityKind::Human,
-                                "Human",
-                            );
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("new_identity")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(title);
+                if is_admin {
+                    ui.horizontal(|ui| {
+                        ui.label("Kind:");
+                        ui.selectable_value(
+                            &mut self.new_agent_kind,
+                            IdentityKind::Agent,
+                            "Agent",
+                        );
+                        ui.selectable_value(
+                            &mut self.new_agent_kind,
+                            IdentityKind::Human,
+                            "Human",
+                        );
+                    });
+                }
+                ui.label("Handle (e.g. claude-local)");
+                ui.text_edit_singleline(&mut self.new_agent_handle);
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.new_agent_handle.trim().is_empty(),
+                            egui::Button::new("Create"),
+                        )
+                        .clicked()
+                    {
+                        self.runtime.send(ClientCommand::CreateIdentity {
+                            handle: self.new_agent_handle.clone(),
+                            kind: self.new_agent_kind,
                         });
                     }
-                    ui.label("Handle (e.g. claude-local)");
-                    ui.text_edit_singleline(&mut self.new_agent_handle);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
 
+                if let Some(created) = &self.last_created_identity {
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() && !self.new_agent_handle.trim().is_empty()
-                        {
-                            self.runtime.send(ClientCommand::CreateIdentity {
-                                handle: self.new_agent_handle.clone(),
-                                kind: self.new_agent_kind,
-                            });
-                        }
-                        if ui.button("Close").clicked() {
-                            self.show_new_agent_modal = false;
-                            self.last_created_identity = None;
-                        }
-                    });
-
-                    if let Some(created) = &self.last_created_identity {
-                        ui.separator();
                         ui.colored_label(
                             Color32::LIGHT_GREEN,
                             format!(
@@ -375,21 +420,34 @@ impl RelayPodApp {
                                 created.identity.handle
                             ),
                         );
-                        let mut tok = created.token.clone();
-                        ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
-
-                        if created.identity.kind == IdentityKind::Agent {
-                            ui.label("MCP config snippet:");
-                            let mut snippet = mcp_config_snippet(&self.server_url, &created.token);
-                            ui.add(
-                                egui::TextEdit::multiline(&mut snippet)
-                                    .code_editor()
-                                    .desired_rows(8)
-                                    .desired_width(f32::INFINITY),
-                            );
+                        if ui.small_button("Copy token").clicked() {
+                            ui.ctx().copy_text(created.token.clone());
                         }
+                    });
+                    let mut tok = created.token.clone();
+                    ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
+
+                    if created.identity.kind == IdentityKind::Agent {
+                        let mut snippet = mcp_config_snippet(&self.server_url, &created.token);
+                        ui.horizontal(|ui| {
+                            ui.label("MCP config snippet:");
+                            if ui.small_button("Copy snippet").clicked() {
+                                ui.ctx().copy_text(snippet.clone());
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut snippet)
+                                .code_editor()
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY),
+                        );
                     }
-                });
+                }
+            });
+            if close || modal.should_close() {
+                self.show_new_agent_modal = false;
+                self.last_created_identity = None;
+            }
         }
 
         if let Some(channel) = &mut self.channel_edit {
@@ -641,6 +699,7 @@ impl eframe::App for RelayPodApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Disconnect").clicked() {
+                        self.last_created_identity = None;
                         self.runtime.send(ClientCommand::Disconnect);
                     }
                     let unread_label = format!("Unread ({})", self.state.unread.len());
@@ -655,8 +714,13 @@ impl eframe::App for RelayPodApp {
                     }
                 });
             });
-            if let Some(err) = &self.state.status_error {
-                ui.colored_label(Color32::LIGHT_RED, err);
+            if let Some(err) = self.state.status_error.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                    if ui.small_button("×").on_hover_text("Dismiss").clicked() {
+                        self.state.status_error = None;
+                    }
+                });
             }
         });
 
@@ -698,14 +762,17 @@ impl eframe::App for RelayPodApp {
                                 self.channels_section
                                     .toggle(is_searching, has_active_matches);
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("+").clicked() {
-                                        self.show_new_channel_modal = true;
-                                    }
-                                },
-                            );
+                            if self.can_manage_channels() {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("+").on_hover_text("New channel").clicked()
+                                        {
+                                            self.show_new_channel_modal = true;
+                                        }
+                                    },
+                                );
+                            }
                         });
 
                         if channels_open {
@@ -747,12 +814,19 @@ impl eframe::App for RelayPodApp {
 
                 ui.horizontal(|ui| {
                     ui.strong("IDENTITIES");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("+ Agent").clicked() {
-                            self.show_new_agent_modal = true;
-                            self.last_created_identity = None;
-                        }
-                    });
+                    if self.can_manage_channels() {
+                        let add_label = if self.is_admin() {
+                            "+ Identity"
+                        } else {
+                            "+ Agent"
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(add_label).clicked() {
+                                self.show_new_agent_modal = true;
+                                self.last_created_identity = None;
+                            }
+                        });
+                    }
                 });
 
                 let sidebar_identities = self.state.identities.clone();
@@ -805,17 +879,24 @@ impl eframe::App for RelayPodApp {
             egui::SidePanel::right("unread_panel")
                 .default_width(360.0)
                 .show(ctx, |ui| {
+                    let items = self.state.unread.clone();
                     ui.horizontal(|ui| {
                         ui.strong("Unread Queue");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Close").clicked() {
                                 self.show_unread_drawer = false;
                             }
+                            if !items.is_empty() && ui.small_button("Ack All").clicked() {
+                                for item in &items {
+                                    self.runtime.send(ClientCommand::AckUnread {
+                                        unread_id: item.id.clone(),
+                                    });
+                                }
+                            }
                         });
                     });
                     ui.separator();
 
-                    let items = self.state.unread.clone();
                     if items.is_empty() {
                         ui.label("All caught up!");
                     }
@@ -999,7 +1080,6 @@ impl eframe::App for RelayPodApp {
         // Center panel: Channel feed + composer
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ch) = self.state.active_channel().cloned() {
-                let can_manage = self.can_manage_channels();
                 let archived = ch.archived;
                 ui.horizontal(|ui| {
                     ui.heading(format!("# {}", ch.name));
@@ -1051,55 +1131,69 @@ impl eframe::App for RelayPodApp {
                     });
 
                 let msgs = self.state.messages.clone();
-                egui::ScrollArea::vertical()
-                    .id_salt("channel_messages_scroll")
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.add_space(4.0);
-                        for msg in msgs {
-                            let workers: Vec<String> = self
-                                .state
-                                .workers_for_thread(&msg.channel_id, &msg.id)
-                                .into_iter()
-                                .map(|w| w.handle.clone())
-                                .collect();
-                            let thread_unread_ids: Vec<String> = self
-                                .state
-                                .unread
-                                .iter()
-                                .filter(|u| {
-                                    u.message_id == msg.id
-                                        || u.parent_id.as_deref() == Some(msg.id.as_str())
-                                })
-                                .map(|u| u.id.clone())
-                                .collect();
-                            let action = render_message_card(
-                                ui,
-                                &msg,
-                                can_manage && !archived,
-                                &workers,
-                                thread_unread_ids.len(),
-                            );
-                            match action {
-                                MessageCardAction::OpenThread => {
-                                    self.show_unread_drawer = false;
-                                    self.runtime.send(ClientCommand::LoadThread {
-                                        message_id: msg.id.clone(),
-                                    });
-                                }
-                                MessageCardAction::AckThread => {
-                                    for unread_id in thread_unread_ids {
-                                        self.runtime.send(ClientCommand::AckUnread { unread_id });
-                                    }
-                                }
-                                MessageCardAction::Delete => {
-                                    self.pending_delete_message = Some(msg.clone());
-                                }
-                                MessageCardAction::None => {}
-                            }
-                            ui.add_space(6.0);
-                        }
+                if msgs.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "No messages in #{} yet. Say hi or @mention an agent below.",
+                                ch.name
+                            ))
+                            .color(ui.visuals().weak_text_color()),
+                        );
                     });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("channel_messages_scroll")
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            for msg in msgs {
+                                let workers: Vec<String> = self
+                                    .state
+                                    .workers_for_thread(&msg.channel_id, &msg.id)
+                                    .into_iter()
+                                    .map(|w| w.handle.clone())
+                                    .collect();
+                                let thread_unread_ids: Vec<String> = self
+                                    .state
+                                    .unread
+                                    .iter()
+                                    .filter(|u| {
+                                        u.message_id == msg.id
+                                            || u.parent_id.as_deref() == Some(msg.id.as_str())
+                                    })
+                                    .map(|u| u.id.clone())
+                                    .collect();
+                                let can_delete = !archived && self.can_delete_message(&msg);
+                                let action = render_message_card(
+                                    ui,
+                                    &msg,
+                                    can_delete,
+                                    &workers,
+                                    thread_unread_ids.len(),
+                                );
+                                match action {
+                                    MessageCardAction::OpenThread => {
+                                        self.show_unread_drawer = false;
+                                        self.runtime.send(ClientCommand::LoadThread {
+                                            message_id: msg.id.clone(),
+                                        });
+                                    }
+                                    MessageCardAction::AckThread => {
+                                        for unread_id in thread_unread_ids {
+                                            self.runtime
+                                                .send(ClientCommand::AckUnread { unread_id });
+                                        }
+                                    }
+                                    MessageCardAction::Delete => {
+                                        self.pending_delete_message = Some(msg.clone());
+                                    }
+                                    MessageCardAction::None => {}
+                                }
+                                ui.add_space(6.0);
+                            }
+                        });
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Select a channel from the sidebar.");
@@ -1109,6 +1203,20 @@ impl eframe::App for RelayPodApp {
 
         self.render_modals(ctx);
     }
+}
+
+fn is_non_loopback_http(url: &str) -> bool {
+    let trimmed = url.trim();
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    !host.is_empty() && !matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -1506,10 +1614,10 @@ fn render_composer(
                 }
             }
         }
-    } else if has_focus {
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-            send_triggered = true;
-        }
+    } else if has_focus
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    {
+        send_triggered = true;
     }
 
     let dark = ui.visuals().dark_mode;
@@ -1588,7 +1696,7 @@ fn render_composer(
         if let Some(ref act) = active {
             let anchor = frame_resp.response.rect.left_top() - egui::vec2(0.0, 6.0);
             let popup_id = ui.make_persistent_id(format!("{id_salt}_mention_popup"));
-            let popup_width = frame_resp.response.rect.width().min(320.0).max(200.0);
+            let popup_width = frame_resp.response.rect.width().clamp(200.0, 320.0);
 
             let area_resp = egui::Area::new(popup_id)
                 .order(egui::Order::Foreground)
@@ -2002,22 +2110,22 @@ mod tests {
             created_at: 0,
         };
         let ids = vec![
-            mk("marcin", IdentityKind::Human),
-            mk("marcin-codex", IdentityKind::Agent),
+            mk("alice", IdentityKind::Human),
+            mk("codex-local", IdentityKind::Agent),
             mk("claude", IdentityKind::Agent),
         ];
 
         assert_eq!(
             last_mentioned_handle_in_text(
-                "Hey @marcin-codex and @claude, check with @marcin",
+                "Hey @codex-local and @claude, check with @alice",
                 &ids,
-                Some("marcin"),
+                Some("alice"),
             )
             .as_deref(),
             Some("claude")
         );
         assert_eq!(
-            last_mentioned_handle_in_text("email@marcin-codex.com @unknown", &ids, Some("marcin")),
+            last_mentioned_handle_in_text("email@codex-local.com @unknown", &ids, Some("alice")),
             None
         );
     }

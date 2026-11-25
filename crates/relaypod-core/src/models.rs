@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     Human,
@@ -56,7 +56,6 @@ pub struct CreatedIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "ChannelResponse")]
 pub struct Channel {
     pub id: String,
     pub name: String,
@@ -67,33 +66,6 @@ pub struct Channel {
     /// Whether the channel is archived.
     pub archived: bool,
     pub archived_at: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct ChannelResponse {
-    id: String,
-    name: String,
-    description: String,
-    created_at: i64,
-    #[serde(default)]
-    created_by: Option<String>,
-    archived: Option<bool>,
-    archived_at: Option<i64>,
-}
-
-impl From<ChannelResponse> for Channel {
-    fn from(response: ChannelResponse) -> Self {
-        Self {
-            id: response.id,
-            name: response.name,
-            description: response.description,
-            created_at: response.created_at,
-            created_by: response.created_by,
-            // Older servers expose the timestamp alone.
-            archived: response.archived.unwrap_or(response.archived_at.is_some()),
-            archived_at: response.archived_at,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,11 +166,20 @@ pub struct DeletedChannel {
     pub unread_removed: HashMap<String, i64>,
 }
 
-/// Identifies a deleted identity and whether it was hard-deleted or soft-deleted.
+/// Identifies a deleted identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedIdentity {
     pub identity_id: String,
-    pub hard_deleted: bool,
+}
+
+/// Author metadata used to authorize deleting a message.
+#[derive(Debug, Clone)]
+pub struct MessageDeleteInfo {
+    pub message_id: String,
+    pub parent_id: Option<String>,
+    pub author_id: String,
+    pub author_kind: IdentityKind,
+    pub author_owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,31 +256,4 @@ pub enum WsClientMessage {
         thread_id: Option<String>,
         active: bool,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn channel_archive_status_supports_older_and_current_payloads() {
-        for archived_at in [None, Some(123)] {
-            let legacy = json!({
-                "id": "c1",
-                "name": "builds",
-                "description": "",
-                "created_at": 1,
-                "archived_at": archived_at,
-            });
-            let channel: Channel = serde_json::from_value(legacy).unwrap();
-            assert_eq!(channel.archived, archived_at.is_some());
-            let response = serde_json::to_value(channel).unwrap();
-            assert_eq!(response["archived"], json!(archived_at.is_some()));
-            assert_eq!(response["archived_at"], json!(archived_at));
-            let round_trip: Channel = serde_json::from_value(response).unwrap();
-            assert_eq!(round_trip.archived, archived_at.is_some());
-            assert_eq!(round_trip.archived_at, archived_at);
-        }
-    }
 }

@@ -1,7 +1,10 @@
 [package]
 name = "relaypod-ui"
+description = "Native egui desktop client for RelayPod"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "relaypod-ui"

@@ -1,12 +1,12 @@
 # RelayPod configuration
-# Copy to ~/.relaypod/config.yaml (global) or ./config/.relaypod.yaml (project-local)
+# Copy to ~/.relaypod/config.yaml (or pass `--config <path>`)
 # Server: `relaypod serve` (reads `server:` section)
-# Watcher: `relaypod watch` (all handles) or `relaypod watch --handle marcin-codex`
+# Watcher: `relaypod watch` (all handles) or `relaypod watch --handle codex-local`
 
 server:
   # Human handles granted admin privileges (defined only in config.yaml, never in DB)
   admin_handles:
-    - martek
+    - alice
 
 watcher:
   url: http://127.0.0.1:8787
@@ -24,13 +24,13 @@ watcher:
     # Launches each RelayPod thread as a live interactive agent pane in Herdr
     # named `relaypod-<handle>-<thread>` (tab label `relaypod-<channel>-<thread>`),
     # so you can inspect output, view working/blocked/idle status, and intervene.
-    marcin-codex:
+    codex-local:
       runner: herdr
       agent_type: codex
       # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
-      token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
+      token: ${RELAYPOD_CODEX_TOKEN}
       # Optional extra CLI flags forwarded to the agent (`herdr agent start ... -- <args>`)
-      args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox -c web_search=live
+      # args: --full-auto
       # Optional per-handle instructions file (overrides watcher `instructions_file`)
       instructions_file: ~/.relaypod/agent-instructions.md
       cwd: ~/projects
