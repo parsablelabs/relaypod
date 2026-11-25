@@ -1096,31 +1096,36 @@ fn filter_channels<'a>(channels: &'a [Channel], query: &str) -> FilteredChannels
 }
 
 fn render_channel_search_box(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
-    ui.horizontal(|ui| {
-        let has_query = !query.is_empty();
-        let clear_space = if has_query { 26.0 } else { 0.0 };
-        let input_width = (ui.available_width() - clear_space).max(60.0);
-        let search_resp = ui.add(
-            egui::TextEdit::singleline(query)
-                .id_salt("sidebar_channel_search")
-                .hint_text("Search channels...")
-                .desired_width(input_width),
-        );
-        if (search_resp.has_focus() || search_resp.lost_focus())
-            && ui.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            query.clear();
-        }
-        if has_query
-            && ui
-                .small_button("×")
-                .on_hover_text("Clear channel search")
-                .clicked()
-        {
-            query.clear();
-        }
-        search_resp
-    })
+    let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(
+        row_size,
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let has_query = !query.is_empty();
+            if has_query
+                && ui
+                    .small_button("×")
+                    .on_hover_text("Clear channel search")
+                    .clicked()
+            {
+                query.clear();
+            }
+            let edit_width = ui.available_width().max(1.0);
+            let search_resp = ui.add_sized(
+                egui::vec2(edit_width, ui.spacing().interact_size.y),
+                egui::TextEdit::singleline(query)
+                    .id_salt("sidebar_channel_search")
+                    .hint_text("Search channels...")
+                    .desired_width(edit_width),
+            );
+            if (search_resp.has_focus() || search_resp.lost_focus())
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                query.clear();
+            }
+            search_resp
+        },
+    )
     .inner
 }
 
@@ -1890,5 +1895,50 @@ mod tests {
             });
         });
         assert!(query.is_empty(), "expected Escape to clear search query");
+    }
+
+    #[test]
+    fn channel_search_box_does_not_expand_sidebar_width() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+
+        let run_frame = |query: &mut String| -> f32 {
+            let mut panel_width = 0.0;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let resp = egui::SidePanel::left("sidebar")
+                    .default_width(220.0)
+                    .show(ctx, |ui| {
+                        render_channel_search_box(ui, query);
+                    });
+                panel_width = resp.response.rect.width();
+            });
+            panel_width
+        };
+
+        let mut query = String::new();
+        let initial_width = run_frame(&mut query);
+        let baseline_width = run_frame(&mut query);
+        assert!(
+            (baseline_width - initial_width).abs() < 0.1,
+            "baseline width drifted: {initial_width} -> {baseline_width}"
+        );
+
+        query = "a".to_string();
+        for frame in 0..10 {
+            let width = run_frame(&mut query);
+            assert!(
+                (width - baseline_width).abs() < 0.1,
+                "sidebar expanded on frame {frame} with query {query:?}: baseline {baseline_width}, got {width}"
+            );
+        }
+
+        query = "very-long-channel-search-query-that-exceeds-sidebar-width".to_string();
+        for frame in 0..5 {
+            let width = run_frame(&mut query);
+            assert!(
+                (width - baseline_width).abs() < 0.1,
+                "sidebar expanded on frame {frame} with long query: baseline {baseline_width}, got {width}"
+            );
+        }
     }
 }
