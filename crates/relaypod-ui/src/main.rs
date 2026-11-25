@@ -63,8 +63,8 @@ struct RelayPodApp {
     channel_edit: Option<Channel>,
 
     channel_search: String,
-    channels_section_open: bool,
-    archived_channels_section_open: bool,
+    channels_section: CollapsibleSection,
+    archived_channels_section: CollapsibleSection,
 }
 
 impl RelayPodApp {
@@ -108,8 +108,8 @@ impl RelayPodApp {
             pending_delete_channel: None,
             channel_edit: None,
             channel_search: String::new(),
-            channels_section_open: true,
-            archived_channels_section_open: false,
+            channels_section: CollapsibleSection::new(true),
+            archived_channels_section: CollapsibleSection::new(false),
         }
     }
 
@@ -487,42 +487,24 @@ impl eframe::App for RelayPodApp {
         egui::SidePanel::left("sidebar")
             .default_width(220.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let has_query = !self.channel_search.is_empty();
-                    let clear_space = if has_query { 26.0 } else { 0.0 };
-                    let input_width = (ui.available_width() - clear_space).max(60.0);
-                    let search_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.channel_search)
-                            .hint_text("Search channels...")
-                            .desired_width(input_width),
-                    );
-                    if search_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.channel_search.clear();
-                    }
-                    if has_query
-                        && ui
-                            .small_button("×")
-                            .on_hover_text("Clear channel search")
-                            .clicked()
-                    {
-                        self.channel_search.clear();
-                    }
-                });
+                render_channel_search_box(ui, &mut self.channel_search);
                 ui.add_space(6.0);
 
                 let channels = self.state.channels.clone();
                 let filtered = filter_channels(&channels, &self.channel_search);
                 let is_searching = !self.channel_search.trim().is_empty();
-                let channels_open = section_is_expanded(
-                    self.channels_section_open,
-                    &self.channel_search,
-                    !filtered.active.is_empty(),
-                );
-                let archived_open = section_is_expanded(
-                    self.archived_channels_section_open,
-                    &self.channel_search,
-                    !filtered.archived.is_empty(),
-                );
+                if !is_searching {
+                    self.channels_section.clear_search_override();
+                    self.archived_channels_section.clear_search_override();
+                }
+                let has_active_matches = !filtered.active.is_empty();
+                let has_archived_matches = !filtered.archived.is_empty();
+                let channels_open = self
+                    .channels_section
+                    .is_expanded(is_searching, has_active_matches);
+                let archived_open = self
+                    .archived_channels_section
+                    .is_expanded(is_searching, has_archived_matches);
 
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_channels_scroll")
@@ -535,7 +517,8 @@ impl eframe::App for RelayPodApp {
                                 channels_open,
                                 None,
                             ) {
-                                self.channels_section_open = !self.channels_section_open;
+                                self.channels_section
+                                    .toggle(is_searching, has_active_matches);
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -553,7 +536,7 @@ impl eframe::App for RelayPodApp {
                             }
                         }
 
-                        if !filtered.archived.is_empty() {
+                        if has_archived_matches {
                             ui.add_space(8.0);
                             if render_collapsible_section_header(
                                 ui,
@@ -561,8 +544,8 @@ impl eframe::App for RelayPodApp {
                                 archived_open,
                                 Some(filtered.archived.len()),
                             ) {
-                                self.archived_channels_section_open =
-                                    !self.archived_channels_section_open;
+                                self.archived_channels_section
+                                    .toggle(is_searching, has_archived_matches);
                             }
                             if archived_open {
                                 for channel in &filtered.archived {
@@ -571,10 +554,7 @@ impl eframe::App for RelayPodApp {
                             }
                         }
 
-                        if is_searching
-                            && filtered.active.is_empty()
-                            && filtered.archived.is_empty()
-                        {
+                        if is_searching && !has_active_matches && !has_archived_matches {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new("No matching channels")
@@ -1049,24 +1029,61 @@ fn filter_identities<'a>(identities: &'a [Identity], query: &str) -> Vec<&'a Ide
     prefix_matches
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollapsibleSection {
+    open: bool,
+    search_override: Option<bool>,
+}
+
+impl CollapsibleSection {
+    fn new(default_open: bool) -> Self {
+        Self {
+            open: default_open,
+            search_override: None,
+        }
+    }
+
+    fn is_expanded(&self, is_searching: bool, has_matches: bool) -> bool {
+        if is_searching {
+            self.search_override.unwrap_or(self.open || has_matches)
+        } else {
+            self.open
+        }
+    }
+
+    fn toggle(&mut self, is_searching: bool, has_matches: bool) {
+        if is_searching {
+            let currently_open = self.is_expanded(true, has_matches);
+            self.search_override = Some(!currently_open);
+        } else {
+            self.open = !self.open;
+        }
+    }
+
+    fn clear_search_override(&mut self) {
+        self.search_override = None;
+    }
+}
+
 #[derive(Debug, Default)]
 struct FilteredChannels<'a> {
     active: Vec<&'a Channel>,
     archived: Vec<&'a Channel>,
 }
 
-fn channel_matches_query(channel: &Channel, query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return true;
-    }
-    channel.name.to_lowercase().contains(&q) || channel.description.to_lowercase().contains(&q)
+fn channel_matches_normalized_query(channel: &Channel, normalized_query: &str) -> bool {
+    channel.name.to_lowercase().contains(normalized_query)
+        || channel
+            .description
+            .to_lowercase()
+            .contains(normalized_query)
 }
 
 fn filter_channels<'a>(channels: &'a [Channel], query: &str) -> FilteredChannels<'a> {
+    let normalized = query.trim().to_lowercase();
     let mut filtered = FilteredChannels::default();
     for channel in channels {
-        if !channel_matches_query(channel, query) {
+        if !normalized.is_empty() && !channel_matches_normalized_query(channel, &normalized) {
             continue;
         }
         if channel.archived {
@@ -1078,8 +1095,33 @@ fn filter_channels<'a>(channels: &'a [Channel], query: &str) -> FilteredChannels
     filtered
 }
 
-fn section_is_expanded(user_open: bool, search_query: &str, has_matches: bool) -> bool {
-    user_open || (!search_query.trim().is_empty() && has_matches)
+fn render_channel_search_box(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
+    ui.horizontal(|ui| {
+        let has_query = !query.is_empty();
+        let clear_space = if has_query { 26.0 } else { 0.0 };
+        let input_width = (ui.available_width() - clear_space).max(60.0);
+        let search_resp = ui.add(
+            egui::TextEdit::singleline(query)
+                .id_salt("sidebar_channel_search")
+                .hint_text("Search channels...")
+                .desired_width(input_width),
+        );
+        if (search_resp.has_focus() || search_resp.lost_focus())
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            query.clear();
+        }
+        if has_query
+            && ui
+                .small_button("×")
+                .on_hover_text("Clear channel search")
+                .clicked()
+        {
+            query.clear();
+        }
+        search_resp
+    })
+    .inner
 }
 
 fn render_collapsible_section_header(
@@ -1791,11 +1833,62 @@ mod tests {
     }
 
     #[test]
-    fn expands_folded_section_only_when_search_has_matches() {
-        assert!(!section_is_expanded(false, "", true));
-        assert!(section_is_expanded(true, "", false));
-        assert!(section_is_expanded(false, "ops", true));
-        assert!(!section_is_expanded(false, "ops", false));
-        assert!(!section_is_expanded(false, "   ", true));
+    fn collapsible_section_stays_foldable_during_search_and_restores_preference() {
+        let mut archived = CollapsibleSection::new(false);
+        assert!(!archived.is_expanded(false, true));
+
+        // Auto-expands during search when matches exist.
+        assert!(archived.is_expanded(true, true));
+
+        // Clicking during search folds immediately without mutating saved preference.
+        archived.toggle(true, true);
+        assert!(!archived.is_expanded(true, true));
+        assert!(!archived.open);
+
+        // Clicking again unfolds during search.
+        archived.toggle(true, true);
+        assert!(archived.is_expanded(true, true));
+        assert!(!archived.open);
+
+        // Clearing search restores pre-search folded state.
+        archived.clear_search_override();
+        assert!(!archived.is_expanded(false, true));
+
+        // Clicking outside search updates saved preference.
+        archived.toggle(false, true);
+        assert!(archived.is_expanded(false, true));
+    }
+
+    #[test]
+    fn escape_clears_focused_channel_search_input() {
+        let ctx = egui::Context::default();
+        let mut query = "legacy".to_string();
+
+        // First pass: render search input and focus it.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resp = render_channel_search_box(ui, &mut query);
+                resp.request_focus();
+            });
+        });
+        assert_eq!(query, "legacy");
+
+        // Second pass: press Escape while focused.
+        let esc_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(esc_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_channel_search_box(ui, &mut query);
+            });
+        });
+        assert!(query.is_empty(), "expected Escape to clear search query");
     }
 }
