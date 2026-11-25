@@ -44,6 +44,9 @@ pub struct Identity {
     pub online: bool,
     #[serde(default)]
     pub busy: bool,
+    /// Dynamically populated by the server from `config.yaml` (`admin_handles`); never persisted in DB.
+    #[serde(default)]
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +62,8 @@ pub struct Channel {
     pub name: String,
     pub description: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub created_by: Option<String>,
     /// Whether the channel is archived.
     pub archived: bool,
     pub archived_at: Option<i64>,
@@ -70,6 +75,8 @@ struct ChannelResponse {
     name: String,
     description: String,
     created_at: i64,
+    #[serde(default)]
+    created_by: Option<String>,
     archived: Option<bool>,
     archived_at: Option<i64>,
 }
@@ -81,6 +88,7 @@ impl From<ChannelResponse> for Channel {
             name: response.name,
             description: response.description,
             created_at: response.created_at,
+            created_by: response.created_by,
             // Older servers expose the timestamp alone.
             archived: response.archived.unwrap_or(response.archived_at.is_some()),
             archived_at: response.archived_at,

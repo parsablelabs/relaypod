@@ -36,9 +36,12 @@ enum Commands {
         /// Path to the SQLite database file
         #[arg(long, default_value = "relaypod.db")]
         db: PathBuf,
-        /// Handle for the initial admin identity if the database is empty
+        /// Handle for the initial human identity if the database is empty
         #[arg(long, default_value = "admin")]
         admin: String,
+        /// Path to YAML config file (defaults to ./config/.relaypod.yaml, ./.relaypod.yaml, or ~/.relaypod/config.yaml)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Run as a stdio MCP server for agent harnesses (Claude, Codex, Antigravity, etc.)
     Mcp,
@@ -165,7 +168,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Serve { bind, db, admin } => {
+        Commands::Serve {
+            bind,
+            db,
+            admin,
+            config,
+        } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -173,19 +181,31 @@ async fn main() -> Result<()> {
                 )
                 .init();
 
+            let admin_handles = match watch::load_optional_config(config.as_deref())? {
+                Some((path, cfg)) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        admins = ?cfg.server.admin_handles,
+                        "Loaded server admin_handles from config"
+                    );
+                    cfg.server.admin_handles
+                }
+                None => Vec::new(),
+            };
+
             let store = Arc::new(Store::open(db)?);
             if let Some(created) = store.bootstrap(admin)? {
                 println!("============================================================");
                 println!("Initialized RelayPod workspace with default #general channel");
-                println!("Admin handle : @{}", created.identity.handle);
-                println!("Admin token  : {}", created.token);
+                println!("Initial handle : @{}", created.identity.handle);
+                println!("Initial token  : {}", created.token);
                 println!("Export this token to use the CLI or UI:");
                 println!("  export RELAYPOD_URL=http://{bind}");
                 println!("  export RELAYPOD_TOKEN={}", created.token);
                 println!("============================================================");
             }
 
-            relaypod_server::serve(*bind, store).await?;
+            relaypod_server::serve(*bind, store, admin_handles).await?;
         }
         Commands::Mcp => {
             let client = require_client(&cli)?;

@@ -44,10 +44,13 @@ async fn humans_manage_channels_and_deletion_cascades() {
         })
         .unwrap();
     let channel = store
-        .create_channel(relaypod_core::CreateChannelRequest {
-            name: "builds".into(),
-            description: "CI activity".into(),
-        })
+        .create_channel(
+            relaypod_core::CreateChannelRequest {
+                name: "builds".into(),
+                description: "CI activity".into(),
+            },
+            Some(human.identity.id.clone()),
+        )
         .unwrap();
     let post = store
         .post_message(&channel.id, &human.identity, "@bot check CI", None)

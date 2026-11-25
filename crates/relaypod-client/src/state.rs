@@ -418,6 +418,7 @@ mod tests {
             unread_count: 0,
             online: false,
             busy: false,
+            is_admin: false,
         }
     }
 
@@ -433,6 +434,7 @@ mod tests {
             archived: false,
             archived_at: None,
             created_at: 0,
+            created_by: None,
         };
 
         let effects = state.apply(ClientEvent::Connected {
@@ -542,6 +544,7 @@ mod tests {
             name: "general".into(),
             description: String::new(),
             created_at: 4,
+            created_by: None,
             archived: false,
             archived_at: None,
         })));

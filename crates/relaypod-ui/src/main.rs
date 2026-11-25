@@ -169,11 +169,25 @@ impl RelayPodApp {
         self.runtime.send(cmd);
     }
 
+    fn is_admin(&self) -> bool {
+        self.state
+            .me
+            .as_ref()
+            .is_some_and(|me| me.kind == IdentityKind::Human && me.is_admin)
+    }
+
     fn can_manage_channels(&self) -> bool {
         self.state
             .me
             .as_ref()
             .is_some_and(|me| me.kind == IdentityKind::Human)
+    }
+
+    fn can_delete_channel(&self, channel: &Channel) -> bool {
+        self.state.me.as_ref().is_some_and(|me| {
+            me.kind == IdentityKind::Human
+                && (me.is_admin || channel.created_by.as_deref() == Some(me.id.as_str()))
+        })
     }
 
     fn can_rename_identity(&self, identity: &Identity) -> bool {
@@ -182,6 +196,18 @@ impl RelayPodApp {
                 me.kind == IdentityKind::Human
                     && identity.owner_id.as_deref() == Some(me.id.as_str())
             })
+    }
+
+    fn can_delete_identity(&self, identity: &Identity) -> bool {
+        self.state.me.as_ref().is_some_and(|me| {
+            if me.kind != IdentityKind::Human {
+                return false;
+            }
+            match identity.kind {
+                IdentityKind::Agent => identity.owner_id.as_deref() == Some(me.id.as_str()),
+                IdentityKind::Human => me.is_admin && identity.id != me.id,
+            }
+        })
     }
 
     fn render_channel_row(&mut self, ui: &mut egui::Ui, channel: &Channel) {
@@ -214,7 +240,7 @@ impl RelayPodApp {
                     });
                     ui.close_menu();
                 }
-                if ui.button("Delete").clicked() {
+                if self.can_delete_channel(channel) && ui.button("Delete").clicked() {
                     self.pending_delete_channel = Some(channel.clone());
                     ui.close_menu();
                 }
@@ -295,15 +321,34 @@ impl RelayPodApp {
         }
 
         if self.show_new_agent_modal {
-            egui::Window::new("Register Identity / Agent")
+            let is_admin = self.is_admin();
+            if !is_admin {
+                self.new_agent_kind = IdentityKind::Agent;
+            }
+            let title = if is_admin {
+                "Register Identity / Agent"
+            } else {
+                "Register Agent"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .default_width(460.0)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Kind:");
-                        ui.selectable_value(&mut self.new_agent_kind, IdentityKind::Agent, "Agent");
-                        ui.selectable_value(&mut self.new_agent_kind, IdentityKind::Human, "Human");
-                    });
+                    if is_admin {
+                        ui.horizontal(|ui| {
+                            ui.label("Kind:");
+                            ui.selectable_value(
+                                &mut self.new_agent_kind,
+                                IdentityKind::Agent,
+                                "Agent",
+                            );
+                            ui.selectable_value(
+                                &mut self.new_agent_kind,
+                                IdentityKind::Human,
+                                "Human",
+                            );
+                        });
+                    }
                     ui.label("Handle (e.g. claude-local)");
                     ui.text_edit_singleline(&mut self.new_agent_handle);
 
@@ -418,7 +463,7 @@ impl RelayPodApp {
                 ui.set_width(360.0);
                 ui.heading(format!("Delete @{}?", identity.handle));
                 ui.label(
-                    "This revokes the agent's token and removes it from the workspace. \
+                    "This revokes the identity's token and removes it from the workspace. \
                      Existing messages and mentions are preserved.",
                 );
                 ui.add_space(12.0);
@@ -724,15 +769,23 @@ impl eframe::App for RelayPodApp {
                             if row.clicked() {
                                 self.channel_composer.push_str(&format!("@{} ", id.handle));
                             }
-                            if self.can_rename_identity(id) {
+                            let can_rename = self.can_rename_identity(id);
+                            let can_delete = self.can_delete_identity(id);
+                            if can_rename || can_delete {
                                 row.context_menu(|ui| {
-                                    if ui.button("Rename agent").clicked() {
+                                    if can_rename && ui.button("Rename agent").clicked() {
                                         self.identity_edit = Some(id.clone());
                                         ui.close_menu();
                                     }
-                                    if ui.button("Delete agent").clicked() {
-                                        self.pending_delete_identity = Some(id.clone());
-                                        ui.close_menu();
+                                    if can_delete {
+                                        let label = match id.kind {
+                                            IdentityKind::Agent => "Delete agent",
+                                            IdentityKind::Human => "Delete human",
+                                        };
+                                        if ui.button(label).clicked() {
+                                            self.pending_delete_identity = Some(id.clone());
+                                            ui.close_menu();
+                                        }
                                     }
                                 });
                             }
@@ -1945,6 +1998,7 @@ mod tests {
             unread_count: 0,
             online: false,
             busy: false,
+            is_admin: false,
             created_at: 0,
         };
         let ids = vec![
@@ -1977,6 +2031,7 @@ mod tests {
             archived,
             archived_at: archived.then_some(1),
             created_at: 0,
+            created_by: None,
         };
         let channels = vec![
             mk("c2", "relaypod", "Backend and UI work", false),

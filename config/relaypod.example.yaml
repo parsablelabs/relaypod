@@ -1,59 +1,66 @@
-# RelayPod watcher configuration
+# RelayPod configuration
 # Copy to ~/.relaypod/config.yaml (global) or ./config/.relaypod.yaml (project-local)
-# Run with: `relaypod watch` (all handles) or `relaypod watch --handle marcin-codex`
+# Server: `relaypod serve` (reads `server:` section)
+# Watcher: `relaypod watch` (all handles) or `relaypod watch --handle marcin-codex`
 
-url: http://127.0.0.1:8787
-# Optional default instructions / team norms file prepended once per new thread session
-# (see config/team-norms.md for a starter engineering team norms template)
-instructions_file: ./config/team-norms.md
-# Optional global max concurrent open sessions across all handles (LRU eviction for Herdr; 0/omit = unlimited)
-global_max_sessions: 5
-# Circuit breaker: max consecutive agent-authored turns in a thread before pausing and pinging the human
-# (defaults to 6; set to 0 to disable)
-max_consecutive_agent_turns: 6
+server:
+  # Human handles granted admin privileges (defined only in config.yaml, never in DB)
+  admin_handles:
+    - martek
 
-handles:
-  # Interactive Herdr runner (`runner: herdr`):
-  # Launches each RelayPod thread as a live interactive agent pane in Herdr
-  # named `relaypod-<handle>-<thread>` (tab label `relaypod-<channel>-<thread>`),
-  # so you can inspect output, view working/blocked/idle status, and intervene.
-  marcin-codex:
-    runner: herdr
-    agent_type: codex
-    # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
-    token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
-    # Optional extra CLI flags forwarded to the agent (`herdr agent start ... -- <args>`)
-    args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox -c web_search=live
-    # Optional per-handle instructions file (overrides top-level `instructions_file`)
-    instructions_file: ~/.relaypod/agent-instructions.md
-    cwd: ~/projects
-    # Optional: target a specific Herdr session or workspace label/ID (workspace defaults to "relaypod")
-    # herdr_session: main
-    # herdr_workspace: relaypod
-    # Optional: per-handle max live Herdr panes (evicts only this handle's oldest idle/done pane)
-    # max_sessions: 3
-    # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
-    auto_ack: false
-    # Drain existing unacked items on startup/reconnect (default: true)
-    drain_on_start: true
-    # Optional delay (seconds) between consecutive runs for this handle (default: 0)
-    cooldown_secs: 0
-    # Optional extra environment variables for this handle's command
-    env:
-      RUST_LOG: info
+watcher:
+  url: http://127.0.0.1:8787
+  # Optional default instructions / team norms file prepended once per new thread session
+  # (see config/team-norms.md for a starter engineering team norms template)
+  instructions_file: ./config/team-norms.md
+  # Optional global max concurrent open sessions across all handles (LRU eviction for Herdr; 0/omit = unlimited)
+  global_max_sessions: 10
+  # Circuit breaker: max consecutive agent-authored turns in a thread before pausing and pinging the human
+  # (defaults to 6; set to 0 to disable)
+  max_consecutive_agent_turns: 6
 
-  # Headless exec runner (`runner: exec`, the default):
-  # Runs `codex exec --json` / `claude -p --output-format json` and resumes
-  # per-thread sessions via `~/.relaypod/sessions.json`.
-  # claude-local:
-  #   runner: exec
-  #   agent_type: claude
-  #   token: ${RELAYPOD_CLAUDE_TOKEN}
-  #   cwd: ~/projects/relaypod
-  #   auto_ack: false
+  handles:
+    # Interactive Herdr runner (`runner: herdr`):
+    # Launches each RelayPod thread as a live interactive agent pane in Herdr
+    # named `relaypod-<handle>-<thread>` (tab label `relaypod-<channel>-<thread>`),
+    # so you can inspect output, view working/blocked/idle status, and intervene.
+    marcin-codex:
+      runner: herdr
+      agent_type: codex
+      # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
+      token: ${RELAYPOD_MARCIN_CODEX_TOKEN}
+      # Optional extra CLI flags forwarded to the agent (`herdr agent start ... -- <args>`)
+      args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox -c web_search=live
+      # Optional per-handle instructions file (overrides watcher `instructions_file`)
+      instructions_file: ~/.relaypod/agent-instructions.md
+      cwd: ~/projects
+      # Optional: target a specific Herdr session or workspace label/ID (workspace defaults to "relaypod")
+      # herdr_session: main
+      # herdr_workspace: relaypod
+      # Optional: per-handle max live Herdr panes (evicts only this handle's oldest idle/done pane)
+      # max_sessions: 5
+      # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
+      auto_ack: false
+      # Drain existing unacked items on startup/reconnect (default: true)
+      drain_on_start: true
+      # Optional delay (seconds) between consecutive runs for this handle (default: 0)
+      cooldown_secs: 0
+      # Optional extra environment variables for this handle's command
+      env:
+        RUST_LOG: info
 
-  # Custom shell command mode (`runner: exec`, omit `agent_type` and provide `exec:`):
-  # custom-bot:
-  #   token: ${RELAYPOD_CUSTOM_TOKEN}
-  #   exec: 'my-script --channel "$RELAYPOD_CHANNEL" --thread "$RELAYPOD_THREAD_ID" --unread "$RELAYPOD_UNREAD_ID"'
-  #   auto_ack: true
+    # Headless exec runner (`runner: exec`, the default):
+    # Runs `codex exec --json` / `claude -p --output-format json` and resumes
+    # per-thread sessions via `~/.relaypod/sessions.json`.
+    # claude-local:
+    #   runner: exec
+    #   agent_type: claude
+    #   token: ${RELAYPOD_CLAUDE_TOKEN}
+    #   cwd: ~/projects/relaypod
+    #   auto_ack: false
+
+    # Custom shell command mode (`runner: exec`, omit `agent_type` and provide `exec:`):
+    # custom-bot:
+    #   token: ${RELAYPOD_CUSTOM_TOKEN}
+    #   exec: 'my-script --channel "$RELAYPOD_CHANNEL" --thread "$RELAYPOD_THREAD_ID" --unread "$RELAYPOD_UNREAD_ID"'
+    #   auto_ack: true

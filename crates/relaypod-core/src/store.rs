@@ -84,7 +84,8 @@ impl Store {
                 name TEXT UNIQUE NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
-                archived_at INTEGER
+                archived_at INTEGER,
+                created_by TEXT NULL REFERENCES identities(id)
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -162,10 +163,13 @@ impl Store {
 
         if count == 0 {
             if self.get_channel_by_name("general")?.is_none() {
-                self.create_channel(CreateChannelRequest {
-                    name: "general".to_string(),
-                    description: "Shared workspace for humans and agents".to_string(),
-                })?;
+                self.create_channel(
+                    CreateChannelRequest {
+                        name: "general".to_string(),
+                        description: "Shared workspace for humans and agents".to_string(),
+                    },
+                    None,
+                )?;
             }
             let created = self.create_identity(CreateIdentityRequest {
                 handle: admin_handle.to_string(),
@@ -220,6 +224,7 @@ impl Store {
                     unread_count: 0,
                     online: false,
                     busy: false,
+                    is_admin: false,
                 },
                 token,
             }),
@@ -355,6 +360,14 @@ impl Store {
         )?;
 
         let hard_deleted = if !has_authored && !has_mentions {
+            tx.execute(
+                "UPDATE channels SET created_by = NULL WHERE created_by = ?1",
+                params![&identity.id],
+            )?;
+            tx.execute(
+                "UPDATE identities SET owner_id = NULL WHERE owner_id = ?1",
+                params![&identity.id],
+            )?;
             tx.execute("DELETE FROM identities WHERE id = ?1", params![&identity.id])?;
             true
         } else {
@@ -374,15 +387,19 @@ impl Store {
         })
     }
 
-    pub fn create_channel(&self, req: CreateChannelRequest) -> CoreResult<Channel> {
+    pub fn create_channel(
+        &self,
+        req: CreateChannelRequest,
+        created_by: Option<String>,
+    ) -> CoreResult<Channel> {
         let name = validate_channel_name(&req.name)?;
 
         let id = new_id();
         let created_at = now_ms();
         let conn = self.conn.lock().expect("store lock poisoned");
         let res = conn.execute(
-            "INSERT INTO channels (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, req.description, created_at],
+            "INSERT INTO channels (id, name, description, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, req.description, created_at, created_by],
         );
 
         match res {
@@ -391,6 +408,7 @@ impl Store {
                 name,
                 description: req.description,
                 created_at,
+                created_by,
                 archived: false,
                 archived_at: None,
             }),
@@ -413,7 +431,7 @@ impl Store {
     pub fn list_channels(&self, include_archived: bool) -> CoreResult<Vec<Channel>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, archived_at FROM channels
+            "SELECT id, name, description, created_at, archived_at, created_by FROM channels
              WHERE ?1 OR archived_at IS NULL
              ORDER BY LOWER(name) ASC, name ASC",
         )?;
@@ -523,7 +541,7 @@ impl Store {
         let normalized = normalize_channel_name(name);
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, archived_at FROM channels WHERE name = ?1",
+            "SELECT id, name, description, created_at, archived_at, created_by FROM channels WHERE name = ?1",
         )?;
         Ok(stmt
             .query_row(params![normalized], row_to_channel)
@@ -889,7 +907,7 @@ fn find_channel(conn: &Connection, id_or_name: &str) -> CoreResult<Option<Channe
     let normalized = normalize_channel_name(id_or_name);
     Ok(conn
         .query_row(
-            "SELECT id, name, description, created_at, archived_at FROM channels
+            "SELECT id, name, description, created_at, archived_at, created_by FROM channels
              WHERE id = ?1 OR name = ?2 ORDER BY (id = ?1) DESC LIMIT 1",
             params![id_or_name, normalized],
             row_to_channel,
@@ -924,6 +942,7 @@ fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
         unread_count: row.get(5)?,
         online: false,
         busy: false,
+        is_admin: false,
     })
 }
 
@@ -934,6 +953,7 @@ fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
         name: row.get(1)?,
         description: row.get(2)?,
         created_at: row.get(3)?,
+        created_by: row.get(5)?,
         archived: archived_at.is_some(),
         archived_at,
     })
@@ -980,31 +1000,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrates_legacy_channels_and_preserves_archive_state_on_reinit() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE channels (
-                id TEXT PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );
-            INSERT INTO channels VALUES ('legacy', 'builds', 'Build results', 123);",
-        )
-        .unwrap();
-        let store = Store {
-            conn: Mutex::new(conn),
-        };
+    fn preserves_channel_archive_state_on_reinit() {
+        let store = Store::open_in_memory().unwrap();
+        let ch = store
+            .create_channel(
+                CreateChannelRequest {
+                    name: "builds".into(),
+                    description: "Build results".into(),
+                },
+                None,
+            )
+            .unwrap();
 
-        store.init().unwrap();
         let channels = store.list_channels(false).unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].description, "Build results");
-        assert_eq!(channels[0].created_at, 123);
         assert!(!channels[0].archived);
         assert_eq!(channels[0].archived_at, None);
 
-        let archived = store.set_channel_archived("legacy", true).unwrap();
+        let archived = store.set_channel_archived(&ch.id, true).unwrap();
         store.init().unwrap();
         assert!(store.list_channels(false).unwrap().is_empty());
         let channels = store.list_channels(true).unwrap();

@@ -14,7 +14,7 @@ use relaypod_core::{
     PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage, WsEvent,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,8 @@ struct PresenceEntry {
 pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<WsEvent>,
+    /// Lowercased human handles granted admin privileges via `config.yaml` (`admin_handles`).
+    admin_handles: HashSet<String>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
     /// Active working/typing indicators keyed by `(identity_id, channel_id, thread_id) -> handle`.
     activity: Mutex<HashMap<(String, String, Option<String>), String>>,
@@ -41,14 +43,39 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Arc<Store>) -> Arc<Self> {
+        Self::with_admin_handles(store, Vec::<String>::new())
+    }
+
+    pub fn with_admin_handles<I, S>(store: Arc<Store>, admin_handles: I) -> Arc<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let (events, _) = broadcast::channel(512);
+        let admin_handles = admin_handles
+            .into_iter()
+            .map(|h| h.into().trim().trim_start_matches('@').to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
         Arc::new(Self {
             store,
             events,
+            admin_handles,
             presence: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
             board_writes: Mutex::new(()),
         })
+    }
+
+    pub fn is_admin(&self, identity: &Identity) -> bool {
+        identity.kind == IdentityKind::Human
+            && self.admin_handles.contains(&identity.handle.to_lowercase())
+    }
+
+    fn hydrate_identity(&self, identity: &mut Identity) {
+        identity.online = self.is_online(&identity.id);
+        identity.busy = self.is_busy(&identity.id);
+        identity.is_admin = self.is_admin(identity);
     }
 
     pub fn emit(&self, event: WsEvent) {
@@ -375,8 +402,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(addr: SocketAddr, store: Arc<Store>) -> anyhow::Result<()> {
-    let state = AppState::new(store);
+pub async fn serve(
+    addr: SocketAddr,
+    store: Arc<Store>,
+    admin_handles: Vec<String>,
+) -> anyhow::Result<()> {
+    let state = AppState::with_admin_handles(store, admin_handles);
     let sweeper_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -401,8 +432,7 @@ async fn get_me(
     State(state): State<Arc<AppState>>,
     AuthIdentity(mut identity): AuthIdentity,
 ) -> Json<Identity> {
-    identity.online = state.is_online(&identity.id);
-    identity.busy = state.is_busy(&identity.id);
+    state.hydrate_identity(&mut identity);
     Json(identity)
 }
 
@@ -412,8 +442,7 @@ async fn list_identities(
 ) -> Result<Json<Vec<Identity>>, ApiError> {
     let mut items = state.store.list_identities()?;
     for item in &mut items {
-        item.online = state.is_online(&item.id);
-        item.busy = state.is_busy(&item.id);
+        state.hydrate_identity(item);
     }
     Ok(Json(items))
 }
@@ -423,12 +452,20 @@ async fn create_identity(
     AuthIdentity(caller): AuthIdentity,
     Json(mut req): Json<CreateIdentityRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::CreatedIdentity>), ApiError> {
+    require_human(&caller)?;
     if req.kind == IdentityKind::Human {
-        require_human(&caller)?;
-    } else if req.owner_id.is_none() {
+        if !state.is_admin(&caller) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "only admin humans can add human identities",
+            ));
+        }
+        req.owner_id = None;
+    } else {
         req.owner_id = Some(caller.id);
     }
-    let created = state.store.create_identity(req)?;
+    let mut created = state.store.create_identity(req)?;
+    state.hydrate_identity(&mut created.identity);
     state.emit(WsEvent::IdentityCreated(created.identity.clone()));
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -465,8 +502,7 @@ async fn update_identity(
 
     let mut updated = state.store.update_identity(&target.id, request)?;
     state.rename_activity_handle(&updated.id, &updated.handle);
-    updated.online = state.is_online(&updated.id);
-    updated.busy = state.is_busy(&updated.id);
+    state.hydrate_identity(&mut updated);
     state.emit(WsEvent::IdentityUpdated(updated.clone()));
     Ok(Json(updated))
 }
@@ -492,17 +528,29 @@ async fn delete_identity(
             )
         })?;
 
-    if target.kind != IdentityKind::Agent {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "only agent identities can be deleted",
-        ));
-    }
-    if target.owner_id.as_deref() != Some(caller.id.as_str()) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "only the human who registered this agent can delete it",
-        ));
+    match target.kind {
+        IdentityKind::Human => {
+            if !state.is_admin(&caller) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "only admin humans can remove human identities",
+                ));
+            }
+            if target.id == caller.id {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "cannot delete your own identity",
+                ));
+            }
+        }
+        IdentityKind::Agent => {
+            if target.owner_id.as_deref() != Some(caller.id.as_str()) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "only the human who registered this agent can delete it",
+                ));
+            }
+        }
     }
 
     let deleted = state.store.delete_identity(&target.id)?;
@@ -533,14 +581,15 @@ async fn list_channels(
 
 async fn create_channel(
     State(state): State<Arc<AppState>>,
-    AuthIdentity(_): AuthIdentity,
+    AuthIdentity(caller): AuthIdentity,
     Json(req): Json<CreateChannelRequest>,
 ) -> Result<(StatusCode, Json<relaypod_core::Channel>), ApiError> {
+    require_human(&caller)?;
     let _write = state
         .board_writes
         .lock()
         .expect("board write lock poisoned");
-    let channel = state.store.create_channel(req)?;
+    let channel = state.store.create_channel(req, Some(caller.id))?;
     state.emit(WsEvent::ChannelCreated(channel.clone()));
     Ok((StatusCode::CREATED, Json(channel)))
 }
@@ -571,7 +620,22 @@ async fn delete_channel(
         .board_writes
         .lock()
         .expect("board write lock poisoned");
-    let deleted = state.store.delete_channel(&channel_id)?;
+    let channel = state
+        .store
+        .get_channel(&channel_id)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("channel '{channel_id}' not found"),
+            )
+        })?;
+    if !state.is_admin(&caller) && channel.created_by.as_deref() != Some(caller.id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the human who created this channel or an admin can delete it",
+        ));
+    }
+    let deleted = state.store.delete_channel(&channel.id)?;
     state.emit(WsEvent::ChannelDeleted {
         channel_id: deleted.channel_id,
         unread_removed: deleted.unread_removed,

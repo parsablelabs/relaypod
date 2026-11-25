@@ -58,6 +58,18 @@ impl AgentType {
 
 pub const DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS: usize = 6;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelayPodConfig {
+    pub server: ServerConfig,
+    pub watcher: WatchConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerConfig {
+    /// Human handles granted admin privileges by the server (defined only in config.yaml, never in DB).
+    pub admin_handles: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchConfig {
     pub url: Option<String>,
@@ -124,24 +136,50 @@ impl Default for HandleConfig {
     }
 }
 
-pub fn load_config_file(path: &Path) -> Result<WatchConfig> {
+pub fn load_config_file(path: &Path) -> Result<RelayPodConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
     parse_yaml_config(&raw)
+        .with_context(|| format!("failed to parse config file {}", path.display()))
 }
 
-/// Lightweight, dependency-free YAML parser for `.relaypod.yaml`.
-/// Supports top-level `url`, `instructions_file`, `handles:` map, per-handle settings,
-/// nested `env:` map, single/double quoted strings, `#` comments, and `${ENV_VAR}` expansion.
-pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
-    let mut cfg = WatchConfig::default();
+/// Lightweight, dependency-free YAML parser for `config.yaml` / `.relaypod.yaml`.
+/// Supports top-level `server:` (`admin_handles:`) and `watcher:` (`url`, `instructions_file`,
+/// `global_max_sessions`, `max_consecutive_agent_turns`, `handles:` map, per-handle settings,
+/// nested `env:` map), single/double quoted strings, `#` comments, and `${ENV_VAR}` expansion.
+pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
+    let mut cfg = RelayPodConfig::default();
 
     #[derive(Debug, PartialEq, Eq)]
     enum Section {
         Root,
-        Handles,
-        Handle(String, usize),
-        HandleEnv(String, usize),
+        Server {
+            indent: usize,
+        },
+        ServerAdminHandles {
+            server_indent: usize,
+            key_indent: usize,
+        },
+        Watcher {
+            indent: usize,
+        },
+        WatcherHandles {
+            watcher_indent: usize,
+            handles_indent: usize,
+        },
+        Handle {
+            watcher_indent: usize,
+            handles_indent: usize,
+            handle_indent: usize,
+            name: String,
+        },
+        HandleEnv {
+            watcher_indent: usize,
+            handles_indent: usize,
+            handle_indent: usize,
+            env_indent: usize,
+            name: String,
+        },
     }
 
     let mut section = Section::Root;
@@ -153,32 +191,77 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
             continue;
         }
 
-        let indent = stripped.bytes().take_while(|&b| b == b' ').count();
+        let indent: usize = stripped
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .map(|b| if b == b'\t' { 4 } else { 1 })
+            .sum();
         let trimmed = stripped.trim();
 
-        // Unwind sections based on indentation
-        match &section {
-            Section::HandleEnv(handle, env_indent) if indent <= *env_indent => {
-                if indent == 0 {
-                    section = Section::Root;
-                } else {
-                    section = Section::Handle(handle.clone(), env_indent.saturating_sub(2));
+        // Unwind nested sections based on indentation
+        loop {
+            let next = match &section {
+                Section::HandleEnv {
+                    watcher_indent,
+                    handles_indent,
+                    handle_indent,
+                    env_indent,
+                    name,
+                } if indent <= *env_indent => Some(Section::Handle {
+                    watcher_indent: *watcher_indent,
+                    handles_indent: *handles_indent,
+                    handle_indent: *handle_indent,
+                    name: name.clone(),
+                }),
+                Section::Handle {
+                    watcher_indent,
+                    handles_indent,
+                    handle_indent,
+                    ..
+                } if indent <= *handle_indent => Some(Section::WatcherHandles {
+                    watcher_indent: *watcher_indent,
+                    handles_indent: *handles_indent,
+                }),
+                Section::WatcherHandles {
+                    watcher_indent,
+                    handles_indent,
+                } if indent <= *handles_indent => Some(Section::Watcher {
+                    indent: *watcher_indent,
+                }),
+                Section::Watcher { indent: w_indent } if indent <= *w_indent => Some(Section::Root),
+                Section::ServerAdminHandles {
+                    server_indent,
+                    key_indent,
+                } if !(trimmed.starts_with('-') && indent >= *key_indent)
+                    && indent <= *key_indent =>
+                {
+                    Some(Section::Server {
+                        indent: *server_indent,
+                    })
                 }
+                Section::Server { indent: s_indent } if indent <= *s_indent => Some(Section::Root),
+                _ => None,
+            };
+            match next {
+                Some(popped) => section = popped,
+                None => break,
             }
-            _ => {}
         }
-        match &section {
-            Section::Handle(_, handle_indent) if indent <= *handle_indent => {
-                if indent == 0 {
-                    section = Section::Root;
-                } else {
-                    section = Section::Handles;
-                }
+
+        if matches!(section, Section::ServerAdminHandles { .. }) {
+            let item = trimmed.strip_prefix('-').ok_or_else(|| {
+                anyhow!("invalid YAML at line {line_no}: expected `- <handle>` under `admin_handles:`")
+            })?;
+            let handle = normalize_admin_handle(&expand_env_vars(&unquote_yaml(item)));
+            if handle.is_empty() {
+                return Err(anyhow!(
+                    "line {line_no}: empty handle entry under `admin_handles:`"
+                ));
             }
-            Section::Handles if indent == 0 => {
-                section = Section::Root;
+            if !cfg.server.admin_handles.contains(&handle) {
+                cfg.server.admin_handles.push(handle);
             }
-            _ => {}
+            continue;
         }
 
         let (key, raw_val) = split_key_value(trimmed)
@@ -188,47 +271,140 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
 
         match &section {
             Section::Root => match key.as_str() {
-                "url" => {
-                    cfg.url = Some(expand_env_vars(&unquote_yaml(val)));
-                }
-                "instructions_file" => {
-                    cfg.instructions_file = Some(expand_env_vars(&unquote_yaml(val)));
-                }
-                "global_max_sessions" => {
-                    let parsed = val.parse::<usize>().map_err(|_| {
-                        anyhow!("line {line_no}: invalid integer `{val}` for global_max_sessions")
-                    })?;
-                    cfg.global_max_sessions = if parsed == 0 { None } else { Some(parsed) };
-                }
-                "max_consecutive_agent_turns" => {
-                    let parsed = val.parse::<usize>().map_err(|_| {
-                        anyhow!(
-                            "line {line_no}: invalid integer `{val}` for max_consecutive_agent_turns"
-                        )
-                    })?;
-                    cfg.max_consecutive_agent_turns =
-                        if parsed == 0 { None } else { Some(parsed) };
-                }
-                "handles" => {
+                "server" => {
                     if !val.is_empty() {
                         return Err(anyhow!(
-                            "line {line_no}: `handles:` must be followed by indented handle entries"
+                            "line {line_no}: `server:` must be followed by indented keys"
                         ));
                     }
-                    section = Section::Handles;
+                    section = Section::Server { indent };
+                }
+                "watcher" => {
+                    if !val.is_empty() {
+                        return Err(anyhow!(
+                            "line {line_no}: `watcher:` must be followed by indented keys"
+                        ));
+                    }
+                    section = Section::Watcher { indent };
                 }
                 other => {
-                    return Err(anyhow!("line {line_no}: unknown top-level key `{other}`"));
+                    return Err(anyhow!(
+                        "line {line_no}: unknown top-level key `{other}` (expected `server` or `watcher`)"
+                    ));
                 }
             },
-            Section::Handles => {
-                let handle_name = key.trim_start_matches('@').to_string();
-                cfg.handles.entry(handle_name.clone()).or_default();
-                section = Section::Handle(handle_name, indent);
+            Section::Server {
+                indent: server_indent,
+            } => {
+                let server_indent = *server_indent;
+                match key.as_str() {
+                    "admin_handles" => {
+                        if val.is_empty() {
+                            section = Section::ServerAdminHandles {
+                                server_indent,
+                                key_indent: indent,
+                            };
+                        } else if let Some(inner) =
+                            val.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                        {
+                            for part in inner.split(',') {
+                                let part = part.trim();
+                                if part.is_empty() {
+                                    continue;
+                                }
+                                let handle =
+                                    normalize_admin_handle(&expand_env_vars(&unquote_yaml(part)));
+                                if !handle.is_empty() && !cfg.server.admin_handles.contains(&handle)
+                                {
+                                    cfg.server.admin_handles.push(handle);
+                                }
+                            }
+                        } else {
+                            return Err(anyhow!(
+                                "line {line_no}: `admin_handles:` must be a YAML list (`- handle` items or `[a, b]`)"
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "line {line_no}: unknown key `{other}` under `server:`"
+                        ));
+                    }
+                }
             }
-            Section::Handle(handle_name, _) => {
-                let handle_name = handle_name.clone();
+            Section::ServerAdminHandles { .. } => unreachable!("handled above"),
+            Section::Watcher {
+                indent: watcher_indent,
+            } => {
+                let watcher_indent = *watcher_indent;
+                match key.as_str() {
+                    "url" => {
+                        cfg.watcher.url = Some(expand_env_vars(&unquote_yaml(val)));
+                    }
+                    "instructions_file" => {
+                        cfg.watcher.instructions_file = Some(expand_env_vars(&unquote_yaml(val)));
+                    }
+                    "global_max_sessions" => {
+                        let parsed = val.parse::<usize>().map_err(|_| {
+                            anyhow!("line {line_no}: invalid integer `{val}` for global_max_sessions")
+                        })?;
+                        cfg.watcher.global_max_sessions =
+                            if parsed == 0 { None } else { Some(parsed) };
+                    }
+                    "max_consecutive_agent_turns" => {
+                        let parsed = val.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "line {line_no}: invalid integer `{val}` for max_consecutive_agent_turns"
+                            )
+                        })?;
+                        cfg.watcher.max_consecutive_agent_turns =
+                            if parsed == 0 { None } else { Some(parsed) };
+                    }
+                    "handles" => {
+                        if !val.is_empty() {
+                            return Err(anyhow!(
+                                "line {line_no}: `handles:` must be followed by indented handle entries"
+                            ));
+                        }
+                        section = Section::WatcherHandles {
+                            watcher_indent,
+                            handles_indent: indent,
+                        };
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "line {line_no}: unknown key `{other}` under `watcher:`"
+                        ));
+                    }
+                }
+            }
+            Section::WatcherHandles {
+                watcher_indent,
+                handles_indent,
+            } => {
+                let watcher_indent = *watcher_indent;
+                let handles_indent = *handles_indent;
+                let handle_name = key.trim_start_matches('@').to_string();
+                cfg.watcher.handles.entry(handle_name.clone()).or_default();
+                section = Section::Handle {
+                    watcher_indent,
+                    handles_indent,
+                    handle_indent: indent,
+                    name: handle_name,
+                };
+            }
+            Section::Handle {
+                watcher_indent,
+                handles_indent,
+                handle_indent,
+                name,
+            } => {
+                let watcher_indent = *watcher_indent;
+                let handles_indent = *handles_indent;
+                let handle_indent = *handle_indent;
+                let handle_name = name.clone();
                 let entry = cfg
+                    .watcher
                     .handles
                     .get_mut(&handle_name)
                     .expect("handle entry exists");
@@ -293,7 +469,13 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                                 "line {line_no}: `env:` must be followed by indented KEY: VALUE lines"
                             ));
                         }
-                        section = Section::HandleEnv(handle_name, indent);
+                        section = Section::HandleEnv {
+                            watcher_indent,
+                            handles_indent,
+                            handle_indent,
+                            env_indent: indent,
+                            name: handle_name,
+                        };
                     }
                     other => {
                         return Err(anyhow!(
@@ -302,10 +484,11 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                     }
                 }
             }
-            Section::HandleEnv(handle_name, _) => {
+            Section::HandleEnv { name, .. } => {
                 let entry = cfg
+                    .watcher
                     .handles
-                    .get_mut(handle_name)
+                    .get_mut(name)
                     .expect("handle entry exists");
                 entry
                     .env
@@ -315,6 +498,10 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
     }
 
     Ok(cfg)
+}
+
+fn normalize_admin_handle(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').to_lowercase()
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
@@ -428,31 +615,36 @@ mod tests {
     #[test]
     fn parses_multi_handle_yaml_config() {
         let yaml = r#"
-# Top-level server URL
-url: http://127.0.0.1:8787
+server:
+        admin_handles:
+        - martek
+        - "@Alice"
 
-handles:
-  marcin-codex:
-    token: rp_test_123
-    exec: 'codex exec "Check #{{channel}} from @{{author}}: $RELAYPOD_BODY"'
-    cwd: /tmp/repo
-    auto_ack: true
-    drain_on_start: false
-    cooldown_secs: 5
-    env:
-      RUST_LOG: debug
-      CUSTOM_URL: "http://example.com:8080/path # not a comment"
+watcher:
+        url: http://127.0.0.1:8787
+        handles:
+          marcin-codex:
+            token: rp_test_123
+            exec: 'codex exec "Check #{{channel}} from @{{author}}: $RELAYPOD_BODY"'
+            cwd: /tmp/repo
+            auto_ack: true
+            drain_on_start: false
+            cooldown_secs: 5
+            env:
+              RUST_LOG: debug
+              CUSTOM_URL: "http://example.com:8080/path # not a comment"
 
-  claude-local:
-    token: rp_test_456
-    exec: "claude -p \"Handle unread $RELAYPOD_UNREAD_ID\""
+          claude-local:
+            token: rp_test_456
+            exec: "claude -p \"Handle unread $RELAYPOD_UNREAD_ID\""
 "#;
 
         let cfg = parse_yaml_config(yaml).expect("valid yaml");
-        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:8787"));
-        assert_eq!(cfg.handles.len(), 2);
+        assert_eq!(cfg.server.admin_handles, vec!["martek", "alice"]);
+        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.watcher.handles.len(), 2);
 
-        let codex = &cfg.handles["marcin-codex"];
+        let codex = &cfg.watcher.handles["marcin-codex"];
         assert_eq!(codex.runner, RunnerKind::Exec);
         assert_eq!(codex.token.as_deref(), Some("rp_test_123"));
         assert_eq!(
@@ -469,7 +661,7 @@ handles:
             Some("http://example.com:8080/path # not a comment")
         );
 
-        let claude = &cfg.handles["claude-local"];
+        let claude = &cfg.watcher.handles["claude-local"];
         assert_eq!(claude.token.as_deref(), Some("rp_test_456"));
         assert!(!claude.auto_ack);
         assert!(claude.drain_on_start);
@@ -483,55 +675,62 @@ handles:
     fn expands_env_vars_in_values() {
         std::env::set_var("RELAYPOD_TEST_YAML_TOK", "rp_from_env");
         let yaml =
-            "handles:\n  bot:\n    token: ${RELAYPOD_TEST_YAML_TOK}\n    exec: echo hi\n";
+            "watcher:\n  handles:\n    bot:\n      token: ${RELAYPOD_TEST_YAML_TOK}\n      exec: echo hi\n";
         let cfg = parse_yaml_config(yaml).unwrap();
-        assert_eq!(cfg.handles["bot"].token.as_deref(), Some("rp_from_env"));
+        assert_eq!(
+            cfg.watcher.handles["bot"].token.as_deref(),
+            Some("rp_from_env")
+        );
     }
 
     #[test]
     fn parses_herdr_runner_and_agent_types() {
         let yaml = r#"
-url: http://127.0.0.1:8787
-global_max_sessions: 4
-handles:
-  marcin-codex:
-    runner: herdr
-    agent_type: codex
-    token: rp_123
-    args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox
-    cwd: ~/projects
-    herdr_session: main
-    herdr_workspace: w1
-    max_sessions: 6
-  claude-local:
-    runner: exec
-    agent_type: claude
-    token: rp_456
-  gemini-herdr:
-    runner: herdr
-    agent_type: gemini
-    token: rp_789
+server:
+  admin_handles: [martek, bob]
+watcher:
+  url: http://127.0.0.1:8787
+  global_max_sessions: 4
+  handles:
+    marcin-codex:
+      runner: herdr
+      agent_type: codex
+      token: rp_123
+      args: -m gpt-6.2-sol -c model_reasoning_effort=medium --dangerously-bypass-approvals-and-sandbox
+      cwd: ~/projects
+      herdr_session: main
+      herdr_workspace: w1
+      max_sessions: 6
+    claude-local:
+      runner: exec
+      agent_type: claude
+      token: rp_456
+    gemini-herdr:
+      runner: herdr
+      agent_type: gemini
+      token: rp_789
 "#;
         let cfg = parse_yaml_config(yaml).unwrap();
-        assert_eq!(cfg.global_max_sessions, Some(4));
+        assert_eq!(cfg.server.admin_handles, vec!["martek", "bob"]);
+        assert_eq!(cfg.watcher.global_max_sessions, Some(4));
         assert_eq!(
-            cfg.max_consecutive_agent_turns,
+            cfg.watcher.max_consecutive_agent_turns,
             Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS)
         );
 
-        let codex = &cfg.handles["marcin-codex"];
+        let codex = &cfg.watcher.handles["marcin-codex"];
         assert_eq!(codex.runner, RunnerKind::Herdr);
         assert_eq!(codex.agent_type, Some(AgentType::Codex));
         assert_eq!(codex.herdr_session.as_deref(), Some("main"));
         assert_eq!(codex.herdr_workspace.as_deref(), Some("w1"));
         assert_eq!(codex.max_sessions, Some(6));
 
-        let claude = &cfg.handles["claude-local"];
+        let claude = &cfg.watcher.handles["claude-local"];
         assert_eq!(claude.runner, RunnerKind::Exec);
         assert_eq!(claude.agent_type, Some(AgentType::Claude));
         assert_eq!(claude.max_sessions, None);
 
-        let gemini = &cfg.handles["gemini-herdr"];
+        let gemini = &cfg.watcher.handles["gemini-herdr"];
         assert_eq!(gemini.runner, RunnerKind::Herdr);
         assert_eq!(gemini.agent_type, Some(AgentType::Other("gemini".into())));
     }
@@ -539,15 +738,24 @@ handles:
     #[test]
     fn parses_max_consecutive_agent_turns() {
         let custom = parse_yaml_config(
-            "max_consecutive_agent_turns: 10\nhandles:\n  bot:\n    exec: echo hi\n",
+            "watcher:\n  max_consecutive_agent_turns: 10\n  handles:\n    bot:\n      exec: echo hi\n",
         )
         .unwrap();
-        assert_eq!(custom.max_consecutive_agent_turns, Some(10));
+        assert_eq!(custom.watcher.max_consecutive_agent_turns, Some(10));
 
         let disabled = parse_yaml_config(
-            "max_consecutive_agent_turns: 0\nhandles:\n  bot:\n    exec: echo hi\n",
+            "watcher:\n  max_consecutive_agent_turns: 0\n  handles:\n    bot:\n      exec: echo hi\n",
         )
         .unwrap();
-        assert_eq!(disabled.max_consecutive_agent_turns, None);
+        assert_eq!(disabled.watcher.max_consecutive_agent_turns, None);
+    }
+
+    #[test]
+    fn parses_tab_indented_config() {
+        let yaml = "server:\n\tadmin_handles:\n\t- martek\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\thandles:\n\t  bot:\n\t    token: rp_123\n\t    exec: echo hi\n";
+        let cfg = parse_yaml_config(yaml).expect("tab-indented config should parse");
+        assert_eq!(cfg.server.admin_handles, vec!["martek"]);
+        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.watcher.handles["bot"].token.as_deref(), Some("rp_123"));
     }
 }

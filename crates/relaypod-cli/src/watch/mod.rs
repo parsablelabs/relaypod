@@ -268,6 +268,29 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
     Ok(())
 }
 
+pub fn load_optional_config(
+    explicit_path: Option<&std::path::Path>,
+) -> Result<Option<(PathBuf, config::RelayPodConfig)>> {
+    let candidates = default_config_candidates();
+    let discovered = if let Some(p) = explicit_path {
+        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
+        if !expanded.exists() {
+            return Err(anyhow!("config file not found: {}", expanded.display()));
+        }
+        Some(expanded)
+    } else {
+        candidates.iter().find(|p| p.exists()).cloned()
+    };
+
+    match discovered {
+        Some(path) => {
+            let cfg = load_config_file(&path)?;
+            Ok(Some((path, cfg)))
+        }
+        None => Ok(None),
+    }
+}
+
 fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     let candidates = default_config_candidates();
 
@@ -322,7 +345,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     })?;
 
     info!("Loading watch config from {}", cfg_path.display());
-    let cfg = load_config_file(&cfg_path)?;
+    let cfg = load_config_file(&cfg_path)?.watcher;
 
     let selected: Vec<(String, HandleConfig)> = if let Some(ref wanted) = opts.handle_filter {
         let key = wanted.trim_start_matches('@');
