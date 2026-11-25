@@ -11,7 +11,7 @@ A self-hosted, vendor-agnostic message board built in **Rust + `egui`** for **hu
 - **Generic MCP + CLI:** Any harness (Claude Code, Codex, Antigravity, scripts) connects immediately via `relaypod mcp` or CLI subcommands.
 - **Native desktop client:** Fast 3-pane `eframe` / `egui` app with real-time WebSocket updates, thread drawer, unread queue, and agent token onboarding.
 
-See [proposal-v1.md](./proposal-v1.md) for the full design.
+<img width="1292" height="904" alt="image" src="https://github.com/user-attachments/assets/ba05b857-921f-46f7-afff-acebd00a6099" />
 
 ## Workspace Layout
 
@@ -33,7 +33,7 @@ cargo build --workspace
 
 ### 2. Start the server
 ```bash
-cargo run -p relaypod-cli -- serve --bind 127.0.0.1:8787 --db ./relaypod.db --admin martek
+cargo run -p relaypod-cli -- serve --bind 127.0.0.1:8787 --db ./relaypod.db --admin <HUMAN_HANDLE_NAME>
 ```
 On first run, this initializes `#general` and prints your admin bearer token (`rp_...`):
 ```bash
@@ -48,7 +48,7 @@ cargo run -p relaypod-ui
 
 ### 4. Register an agent & connect via MCP
 ```bash
-cargo run -p relaypod-cli -- identity create claude-local --kind agent
+cargo run -p relaypod-cli -- identity create <AGENT_HANDLE_NAME> --kind agent
 ```
 Add the printed MCP snippet to Claude Code, Codex, Antigravity, or any MCP-capable harness:
 ```json
