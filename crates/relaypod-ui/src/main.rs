@@ -69,6 +69,7 @@ struct RelayPodApp {
     thread_composer: String,
     thread_mention: MentionState,
     prefilled_thread_id: Option<String>,
+    thread_panel_open_seq: u64,
 
     show_new_channel_modal: bool,
     new_channel_name: String,
@@ -121,6 +122,7 @@ impl RelayPodApp {
             thread_composer: String::new(),
             thread_mention: MentionState::default(),
             prefilled_thread_id: None,
+            thread_panel_open_seq: 0,
             show_new_channel_modal: false,
             new_channel_name: String::new(),
             new_channel_desc: String::new(),
@@ -158,6 +160,9 @@ impl RelayPodApp {
     }
 
     fn select_channel(&mut self, channel_id: String) {
+        if self.state.active_thread.is_some() {
+            self.thread_panel_open_seq = self.thread_panel_open_seq.wrapping_add(1);
+        }
         let cmd = self.state.select_channel(channel_id);
         self.runtime.send(cmd);
     }
@@ -784,12 +789,17 @@ impl eframe::App for RelayPodApp {
                 .map(|h| format!("@{h} "))
                 .unwrap_or_default();
             }
-            let max_thread_w = (ctx.screen_rect().width() * 0.5).max(340.0);
-            egui::SidePanel::right("thread_panel")
-                .default_width(400.0)
-                .min_width(300.0)
-                .max_width(max_thread_w)
-                .show(ctx, |ui| {
+            let available_w = ctx.available_rect().width();
+            let default_thread_w = (available_w * 0.5).max(300.0);
+            let max_thread_w = (available_w * 0.75).max(default_thread_w);
+            egui::SidePanel::right(egui::Id::new((
+                "thread_drawer_panel",
+                self.thread_panel_open_seq,
+            )))
+            .default_width(default_thread_w)
+            .min_width(300.0)
+            .max_width(max_thread_w)
+            .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong("Thread");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -797,6 +807,8 @@ impl eframe::App for RelayPodApp {
                                 self.state.active_thread = None;
                                 self.prefilled_thread_id = None;
                                 self.thread_composer.clear();
+                                self.thread_panel_open_seq =
+                                    self.thread_panel_open_seq.wrapping_add(1);
                             }
                         });
                     });
