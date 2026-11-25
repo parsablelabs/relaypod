@@ -46,6 +46,7 @@ struct RelayPodApp {
     channel_mention: MentionState,
     thread_composer: String,
     thread_mention: MentionState,
+    prefilled_thread_id: Option<String>,
 
     show_new_channel_modal: bool,
     new_channel_name: String,
@@ -90,6 +91,7 @@ impl RelayPodApp {
             channel_mention: MentionState::default(),
             thread_composer: String::new(),
             thread_mention: MentionState::default(),
+            prefilled_thread_id: None,
             show_new_channel_modal: false,
             new_channel_name: String::new(),
             new_channel_desc: String::new(),
@@ -144,6 +146,10 @@ impl RelayPodApp {
 
         if self.can_manage_channels() {
             row.context_menu(|ui| {
+                if ui.button("Edit channel").clicked() {
+                    self.channel_edit = Some(channel.clone());
+                    ui.close_menu();
+                }
                 let archive = !channel.archived;
                 if ui
                     .button(if archive { "Archive" } else { "Unarchive" })
@@ -588,6 +594,17 @@ impl eframe::App for RelayPodApp {
                 });
         } else if let Some(thread) = self.state.active_thread.clone() {
             let my_id = self.state.me.as_ref().map(|m| m.id.clone());
+            let my_handle = self.state.me.as_ref().map(|m| m.handle.clone());
+            if self.prefilled_thread_id.as_deref() != Some(thread.parent.id.as_str()) {
+                self.prefilled_thread_id = Some(thread.parent.id.clone());
+                self.thread_composer = last_mentioned_handle_in_thread(
+                    &thread,
+                    &self.state.identities,
+                    my_handle.as_deref(),
+                )
+                .map(|h| format!("@{h} "))
+                .unwrap_or_default();
+            }
             let max_thread_w = (ctx.screen_rect().width() * 0.5).max(340.0);
             egui::SidePanel::right("thread_panel")
                 .default_width(400.0)
@@ -597,8 +614,10 @@ impl eframe::App for RelayPodApp {
                     ui.horizontal(|ui| {
                         ui.strong("Thread");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("×").clicked() {
+                            if ui.small_button("Close").clicked() {
                                 self.state.active_thread = None;
+                                self.prefilled_thread_id = None;
+                                self.thread_composer.clear();
                             }
                         });
                     });
@@ -631,6 +650,21 @@ impl eframe::App for RelayPodApp {
                                 &identities,
                             ) {
                                 let body = std::mem::take(&mut self.thread_composer);
+                                let next_prefill = last_mentioned_handle_in_text(
+                                    &body,
+                                    &identities,
+                                    my_handle.as_deref(),
+                                )
+                                .or_else(|| {
+                                    last_mentioned_handle_in_thread(
+                                        &thread,
+                                        &identities,
+                                        my_handle.as_deref(),
+                                    )
+                                });
+                                if let Some(h) = next_prefill {
+                                    self.thread_composer = format!("@{h} ");
+                                }
                                 self.runtime.send(ClientCommand::PostMessage {
                                     channel_id: thread.parent.channel_id.clone(),
                                     body,
@@ -702,9 +736,6 @@ impl eframe::App for RelayPodApp {
                                 .color(ui.visuals().weak_text_color()),
                         );
                     }
-                    if can_manage && ui.small_button("Edit channel").clicked() {
-                        self.channel_edit = Some(ch.clone());
-                    }
                 });
                 ui.separator();
 
@@ -755,14 +786,34 @@ impl eframe::App for RelayPodApp {
                                 .into_iter()
                                 .map(|w| w.handle.clone())
                                 .collect();
-                            let action =
-                                render_message_card(ui, &msg, can_manage && !archived, &workers);
+                            let thread_unread_ids: Vec<String> = self
+                                .state
+                                .unread
+                                .iter()
+                                .filter(|u| {
+                                    u.message_id == msg.id
+                                        || u.parent_id.as_deref() == Some(msg.id.as_str())
+                                })
+                                .map(|u| u.id.clone())
+                                .collect();
+                            let action = render_message_card(
+                                ui,
+                                &msg,
+                                can_manage && !archived,
+                                &workers,
+                                thread_unread_ids.len(),
+                            );
                             match action {
                                 MessageCardAction::OpenThread => {
                                     self.show_unread_drawer = false;
                                     self.runtime.send(ClientCommand::LoadThread {
                                         message_id: msg.id.clone(),
                                     });
+                                }
+                                MessageCardAction::AckThread => {
+                                    for unread_id in thread_unread_ids {
+                                        self.runtime.send(ClientCommand::AckUnread { unread_id });
+                                    }
                                 }
                                 MessageCardAction::Delete => {
                                     self.pending_delete_message = Some(msg.clone());
@@ -827,6 +878,72 @@ fn find_active_mention(text: &str, cursor_char: usize) -> Option<ActiveMention> 
             i -= 1;
         } else {
             return None;
+        }
+    }
+    None
+}
+
+fn last_mentioned_handle_in_text(
+    text: &str,
+    identities: &[Identity],
+    exclude_handle: Option<&str>,
+) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut last: Option<String> = None;
+
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let prev_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'-');
+            if prev_ok {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || bytes[end] == b'-')
+                {
+                    end += 1;
+                }
+                if end > start {
+                    let candidate = &text[start..end];
+                    let is_self = exclude_handle
+                        .is_some_and(|me| me.eq_ignore_ascii_case(candidate));
+                    if !is_self {
+                        if let Some(id) = identities
+                            .iter()
+                            .find(|id| id.handle.eq_ignore_ascii_case(candidate))
+                        {
+                            last = Some(id.handle.clone());
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    last
+}
+
+fn last_mentioned_handle_in_thread(
+    thread: &relaypod_core::ThreadView,
+    identities: &[Identity],
+    exclude_handle: Option<&str>,
+) -> Option<String> {
+    for msg in thread
+        .replies
+        .iter()
+        .rev()
+        .chain(std::iter::once(&thread.parent))
+    {
+        if let Some(handle) = last_mentioned_handle_in_text(&msg.body, identities, exclude_handle) {
+            return Some(handle);
         }
     }
     None
@@ -1252,6 +1369,7 @@ fn render_working_banner(ui: &mut egui::Ui, handles: &[String]) {
 enum MessageCardAction {
     None,
     OpenThread,
+    AckThread,
     Delete,
 }
 
@@ -1260,9 +1378,10 @@ fn render_message_card(
     msg: &Message,
     can_delete: bool,
     working_handles: &[String],
+    unread_count: usize,
 ) -> MessageCardAction {
     let mut action = MessageCardAction::None;
-    egui::Frame::group(ui.style())
+    let frame_resp = egui::Frame::group(ui.style())
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -1271,21 +1390,6 @@ fn render_message_card(
                 draw_kind_badge(ui, msg.author_kind);
                 ui.strong(format!("@{}", msg.author_handle));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_delete {
-                        let del_btn = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("×")
-                                        .size(13.0)
-                                        .color(ui.visuals().weak_text_color()),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("Delete message & thread");
-                        if del_btn.clicked() {
-                            action = MessageCardAction::Delete;
-                        }
-                    }
                     let label = if msg.reply_count > 0 {
                         format!("{} replies", msg.reply_count)
                     } else {
@@ -1297,12 +1401,76 @@ fn render_message_card(
                 });
             });
             ui.add_space(4.0);
-            markdown::render_markdown(ui, &msg.body);
+            if unread_count > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    let ack_label = if unread_count > 1 {
+                        format!("Ack ({unread_count})")
+                    } else {
+                        "Ack".to_string()
+                    };
+                    if ui
+                        .small_button(ack_label)
+                        .on_hover_text("Acknowledge all unread items in this thread")
+                        .clicked()
+                    {
+                        action = MessageCardAction::AckThread;
+                    }
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.set_width(ui.available_width());
+                        markdown::render_markdown(ui, &msg.body);
+                    });
+                });
+            } else {
+                markdown::render_markdown(ui, &msg.body);
+            }
             if !working_handles.is_empty() {
                 ui.add_space(6.0);
                 render_working_banner(ui, working_handles);
             }
         });
+
+    let popup_id = ui.make_persistent_id(("msg_card_ctx", &msg.id));
+    let pos_id = popup_id.with("pos");
+    if ui.rect_contains_pointer(frame_resp.response.rect)
+        && ui.input(|i| i.pointer.secondary_clicked())
+    {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            ui.data_mut(|d| d.insert_temp(pos_id, pos));
+            ui.memory_mut(|m| m.open_popup(popup_id));
+        }
+    }
+
+    if ui.memory(|m| m.is_popup_open(popup_id)) {
+        let pos = ui
+            .data(|d| d.get_temp::<egui::Pos2>(pos_id))
+            .unwrap_or(frame_resp.response.rect.left_top());
+        let area_resp = egui::Area::new(popup_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(120.0);
+                    if ui.button("Open thread").clicked() {
+                        action = MessageCardAction::OpenThread;
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                    if can_delete && ui.button("Delete").clicked() {
+                        action = MessageCardAction::Delete;
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                });
+            });
+
+        if ui.input(|i| i.key_pressed(egui::Key::Escape))
+            || (ui.input(|i| i.pointer.any_pressed())
+                && !area_resp.response.contains_pointer()
+                && !ui.input(|i| i.pointer.secondary_clicked()))
+        {
+            ui.memory_mut(|m| m.close_popup());
+        }
+    }
+
     action
 }
 
@@ -1395,5 +1563,38 @@ mod tests {
         );
         assert_eq!(find_active_mention("email@example.com", 10), None);
         assert_eq!(find_active_mention("hello @claude ", 14), None);
+    }
+
+    #[test]
+    fn finds_last_mentioned_handle_excluding_self() {
+        let mk = |handle: &str, kind: IdentityKind| Identity {
+            id: handle.into(),
+            handle: handle.into(),
+            display_name: handle.into(),
+            kind,
+            owner_id: None,
+            unread_count: 0,
+            online: false,
+            created_at: 0,
+        };
+        let ids = vec![
+            mk("marcin", IdentityKind::Human),
+            mk("marcin-codex", IdentityKind::Agent),
+            mk("claude", IdentityKind::Agent),
+        ];
+
+        assert_eq!(
+            last_mentioned_handle_in_text(
+                "Hey @marcin-codex and @claude, check with @marcin",
+                &ids,
+                Some("marcin"),
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            last_mentioned_handle_in_text("email@marcin-codex.com @unknown", &ids, Some("marcin")),
+            None
+        );
     }
 }

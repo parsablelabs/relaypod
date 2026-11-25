@@ -8,7 +8,9 @@ use tracing::{error, info, warn};
 
 use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
 use super::config::AgentType;
-use super::{apply_common_env, build_agent_prompt, render_exec_template, split_shell_words};
+use super::{
+    apply_common_env, build_agent_prompt_with_context, render_exec_template, split_shell_words,
+};
 
 /// Adapter that executes headless CLI commands directly:
 /// - Managed `codex exec` / `claude -p` with automatic JSON session ID capture & resume
@@ -100,7 +102,7 @@ async fn run_managed_agent(
     existing_session: Option<&str>,
 ) -> bool {
     let is_resume = existing_session.is_some();
-    let prompt = build_agent_prompt(ctx.target, ctx.handle, ctx.item, ctx.thread_id, is_resume);
+    let prompt = build_agent_prompt_with_context(ctx, is_resume).await;
     let extra_args = ctx
         .target
         .args

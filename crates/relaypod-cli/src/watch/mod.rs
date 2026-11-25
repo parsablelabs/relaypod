@@ -71,6 +71,7 @@ pub struct ResolvedTarget {
     pub cwd: Option<String>,
     pub herdr_session: Option<String>,
     pub herdr_workspace: Option<String>,
+    pub global_max_sessions: Option<usize>,
     pub max_sessions: Option<usize>,
     pub auto_ack: bool,
     pub drain_on_start: bool,
@@ -191,6 +192,34 @@ impl SessionStore {
             .map(|(_, tid, sid)| (tid, sid))
             .collect()
     }
+
+    /// Returns `(handle, thread_id, session_id)` across all handles, ordered least-recently-used first.
+    pub fn list_all_lru(&self) -> Vec<(String, String, String)> {
+        let entries: Vec<(String, String, String, String)> = {
+            let guard = self.map.lock().expect("session store lock poisoned");
+            guard
+                .iter()
+                .filter_map(|(k, v)| {
+                    k.split_once(':')
+                        .map(|(h, tid)| (k.clone(), h.to_string(), tid.to_string(), v.clone()))
+                })
+                .collect()
+        };
+        let ts = self.last_used.lock().expect("last_used lock poisoned");
+        let mut scored: Vec<(u128, String, String, String)> = entries
+            .into_iter()
+            .map(|(k, h, tid, sid)| (ts.get(&k).copied().unwrap_or(0), h, tid, sid))
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        scored
+            .into_iter()
+            .map(|(_, h, tid, sid)| (h, tid, sid))
+            .collect()
+    }
 }
 
 fn build_adapter(runner: RunnerKind) -> Arc<dyn WatcherAdapter> {
@@ -269,6 +298,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 cwd: opts.cwd_override.as_deref().map(expand_tilde),
                 herdr_session: None,
                 herdr_workspace: None,
+                global_max_sessions: None,
                 max_sessions: None,
                 auto_ack: opts.auto_ack_override.unwrap_or(false),
                 drain_on_start: !opts.no_drain,
@@ -384,7 +414,8 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 .map(expand_tilde),
             herdr_session: h.herdr_session,
             herdr_workspace: h.herdr_workspace,
-            max_sessions: h.max_sessions.or(cfg.max_sessions),
+            global_max_sessions: cfg.global_max_sessions,
+            max_sessions: h.max_sessions,
             auto_ack: opts.auto_ack_override.unwrap_or(h.auto_ack),
             drain_on_start: if opts.no_drain {
                 false
@@ -539,6 +570,7 @@ async fn dispatch_unread_item(
     });
 
     let ctx = DispatchContext {
+        client,
         target,
         handle,
         item,
@@ -622,12 +654,67 @@ pub(crate) fn apply_common_env(
     }
 }
 
+pub(crate) async fn build_agent_prompt_with_context(
+    ctx: &DispatchContext<'_>,
+    is_resume: bool,
+) -> String {
+    let prior_thread = if !is_resume
+        && ctx.target.prompt.is_none()
+        && ctx.item.parent_id.is_some()
+    {
+        match ctx.client.get_thread(ctx.thread_id).await {
+            Ok(thread) => format_prior_thread_context(&thread, &ctx.item.message_id),
+            Err(err) => {
+                warn!(
+                    handle = %ctx.handle,
+                    thread_id = %ctx.thread_id,
+                    error = %err,
+                    "Failed to fetch prior thread context for new session; continuing with single message"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    build_agent_prompt(
+        ctx.target,
+        ctx.handle,
+        ctx.item,
+        ctx.thread_id,
+        is_resume,
+        prior_thread.as_deref(),
+    )
+}
+
+pub(crate) fn format_prior_thread_context(
+    thread: &relaypod_core::ThreadView,
+    current_message_id: &str,
+) -> Option<String> {
+    if thread.parent.id == current_message_id {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "@{} (thread root): {}",
+        thread.parent.author_handle, thread.parent.body
+    )];
+    for reply in &thread.replies {
+        if reply.id == current_message_id {
+            break;
+        }
+        lines.push(format!("@{}: {}", reply.author_handle, reply.body));
+    }
+    Some(lines.join("\n\n"))
+}
+
 pub(crate) fn build_agent_prompt(
     target: &ResolvedTarget,
     handle: &str,
     item: &UnreadItem,
     thread_id: &str,
     is_resume: bool,
+    prior_thread_context: Option<&str>,
 ) -> String {
     let base = if let Some(ref custom) = target.prompt {
         render_exec_template(custom, handle, item, thread_id)
@@ -635,6 +722,11 @@ pub(crate) fn build_agent_prompt(
         format!(
             "Follow-up reply in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
             item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
+        )
+    } else if let Some(history) = prior_thread_context {
+        format!(
+            "Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
+            item.channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else {
         format!(
@@ -748,5 +840,37 @@ mod tests {
         store.remove("codex", "t2");
         assert!(store.get("codex", "t2").is_none());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn formats_prior_thread_context_up_to_current_message() {
+        let mk_msg = |id: &str, author: &str, body: &str, parent: Option<&str>| {
+            relaypod_core::Message {
+                id: id.into(),
+                channel_id: "c1".into(),
+                parent_id: parent.map(ToString::to_string),
+                author_id: author.into(),
+                author_handle: author.into(),
+                author_kind: relaypod_core::IdentityKind::Human,
+                body: body.into(),
+                created_at: 0,
+                reply_count: 0,
+            }
+        };
+        let thread = relaypod_core::ThreadView {
+            parent: mk_msg("m1", "marcin", "Let's fix issue #4", None),
+            replies: vec![
+                mk_msg("m2", "marcin-codex", "Working on it", Some("m1")),
+                mk_msg("m3", "marcin", "@claude can you review?", Some("m1")),
+            ],
+        };
+
+        let ctx = format_prior_thread_context(&thread, "m3").expect("should have prior history");
+        assert!(ctx.contains("@marcin (thread root): Let's fix issue #4"));
+        assert!(ctx.contains("@marcin-codex: Working on it"));
+        assert!(!ctx.contains("@claude can you review?"));
+
+        // Top-level message itself has no prior context
+        assert_eq!(format_prior_thread_context(&thread, "m1"), None);
     }
 }

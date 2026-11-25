@@ -5,8 +5,8 @@
 url: http://127.0.0.1:8787
 # Optional default instructions file prepended on the first turn of each new thread
 # instructions_file: ~/.relaypod/agent-instructions.md
-# Optional default max concurrent open sessions per handle (LRU eviction for Herdr; 0/omit = unlimited)
-# max_sessions: 5
+# Optional global max concurrent open sessions across all handles (LRU eviction for Herdr; 0/omit = unlimited)
+global_max_sessions: 5
 
 handles:
   # Interactive Herdr runner (`runner: herdr`):
@@ -26,8 +26,8 @@ handles:
     # Optional: target a specific Herdr session or workspace label/ID (workspace defaults to "relaypod")
     # herdr_session: main
     # herdr_workspace: relaypod
-    # Optional: max live Herdr panes for this handle; oldest idle/done pane is closed (LRU)
-    max_sessions: 5
+    # Optional: per-handle max live Herdr panes (evicts only this handle's oldest idle/done pane)
+    # max_sessions: 3
     # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
     auto_ack: false
     # Drain existing unacked items on startup/reconnect (default: true)

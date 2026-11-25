@@ -60,7 +60,7 @@ impl AgentType {
 pub struct WatchConfig {
     pub url: Option<String>,
     pub instructions_file: Option<String>,
-    pub max_sessions: Option<usize>,
+    pub global_max_sessions: Option<usize>,
     pub handles: BTreeMap<String, HandleConfig>,
 }
 
@@ -177,11 +177,11 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                 "instructions_file" => {
                     cfg.instructions_file = Some(expand_env_vars(&unquote_yaml(val)));
                 }
-                "max_sessions" => {
+                "global_max_sessions" => {
                     let parsed = val.parse::<usize>().map_err(|_| {
-                        anyhow!("line {line_no}: invalid integer `{val}` for max_sessions")
+                        anyhow!("line {line_no}: invalid integer `{val}` for global_max_sessions")
                     })?;
-                    cfg.max_sessions = if parsed == 0 { None } else { Some(parsed) };
+                    cfg.global_max_sessions = if parsed == 0 { None } else { Some(parsed) };
                 }
                 "handles" => {
                     if !val.is_empty() {
@@ -466,7 +466,7 @@ handles:
     fn parses_herdr_runner_and_agent_types() {
         let yaml = r#"
 url: http://127.0.0.1:8787
-max_sessions: 4
+global_max_sessions: 4
 handles:
   marcin-codex:
     runner: herdr
@@ -487,7 +487,7 @@ handles:
     token: rp_789
 "#;
         let cfg = parse_yaml_config(yaml).unwrap();
-        assert_eq!(cfg.max_sessions, Some(4));
+        assert_eq!(cfg.global_max_sessions, Some(4));
 
         let codex = &cfg.handles["marcin-codex"];
         assert_eq!(codex.runner, RunnerKind::Herdr);

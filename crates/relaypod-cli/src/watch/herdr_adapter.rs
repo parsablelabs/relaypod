@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
-use super::{build_agent_prompt, common_env_pairs, split_shell_words};
+use super::{build_agent_prompt_with_context, common_env_pairs, split_shell_words};
 
 const SESSION_PREFIX: &str = "herdr:";
 const DEFAULT_HERDR_WORKSPACE: &str = "relaypod";
@@ -113,7 +113,7 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         (new_pane, false)
     };
 
-    let prompt = build_agent_prompt(ctx.target, ctx.handle, ctx.item, ctx.thread_id, is_resume);
+    let prompt = build_agent_prompt_with_context(ctx, is_resume).await;
 
     info!(
         handle = %ctx.handle,
@@ -152,44 +152,79 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
     }
 }
 
-/// Enforces `max_sessions` before spawning a new Herdr pane by closing the least-recently-used
-/// `idle`/`done` pane(s) belonging to this handle. Active (`working`) or `blocked` panes are never evicted.
+/// Enforces per-handle `max_sessions` and top-level `global_max_sessions` before spawning a new
+/// Herdr pane by closing the least-recently-used `idle`/`done` pane(s).
+/// Active (`working`) or `blocked` panes are never evicted.
 async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Option<&str>) {
-    let Some(max_sessions) = ctx.target.max_sessions else {
-        return;
-    };
-    if max_sessions == 0 {
-        return;
+    if let Some(handle_cap) = ctx.target.max_sessions.filter(|&n| n > 0) {
+        let handle_candidates: Vec<(String, String, String)> = ctx
+            .sessions
+            .list_for_handle_lru(ctx.handle)
+            .into_iter()
+            .filter_map(|(tid, sid)| {
+                if tid == ctx.thread_id {
+                    return None;
+                }
+                sid.strip_prefix(SESSION_PREFIX)
+                    .map(|pane| (ctx.handle.to_string(), tid, pane.to_string()))
+            })
+            .collect();
+        evict_candidates_to_cap(
+            ctx,
+            herdr_session,
+            handle_candidates,
+            handle_cap,
+            "max_sessions",
+        )
+        .await;
     }
 
-    let candidates: Vec<(String, String)> = ctx
-        .sessions
-        .list_for_handle_lru(ctx.handle)
-        .into_iter()
-        .filter_map(|(tid, sid)| {
-            if tid == ctx.thread_id {
-                return None;
-            }
-            sid.strip_prefix(SESSION_PREFIX)
-                .map(|pane| (tid, pane.to_string()))
-        })
-        .collect();
+    if let Some(global_cap) = ctx.target.global_max_sessions.filter(|&n| n > 0) {
+        let global_candidates: Vec<(String, String, String)> = ctx
+            .sessions
+            .list_all_lru()
+            .into_iter()
+            .filter_map(|(h, tid, sid)| {
+                if h == ctx.handle && tid == ctx.thread_id {
+                    return None;
+                }
+                sid.strip_prefix(SESSION_PREFIX)
+                    .map(|pane| (h, tid, pane.to_string()))
+            })
+            .collect();
+        evict_candidates_to_cap(
+            ctx,
+            herdr_session,
+            global_candidates,
+            global_cap,
+            "global_max_sessions",
+        )
+        .await;
+    }
+}
 
+async fn evict_candidates_to_cap(
+    ctx: &DispatchContext<'_>,
+    herdr_session: Option<&str>,
+    candidates: Vec<(String, String, String)>,
+    cap: usize,
+    cap_label: &str,
+) {
     // Check which panes are actually still alive in Herdr; prune stale entries immediately.
-    let mut live: Vec<(String, String, String)> = Vec::new();
-    for (tid, pane_id) in candidates {
+    let mut live: Vec<(String, String, String, String)> = Vec::new();
+    for (owner_handle, tid, pane_id) in candidates {
         match get_herdr_agent_status(herdr_session, &pane_id).await {
-            Ok(status) => live.push((tid, pane_id, status)),
+            Ok(status) => live.push((owner_handle, tid, pane_id, status)),
             Err(_) => {
-                ctx.sessions.remove(ctx.handle, &tid);
+                ctx.sessions.remove(&owner_handle, &tid);
             }
         }
     }
 
     // Reserve 1 slot for the new pane we are about to spawn.
     let mut live_count = live.len();
-    for (tid, pane_id, status) in live {
-        if live_count < max_sessions {
+    for (owner_handle, tid, pane_id, status) in live {
+        if live_count < cap {
             break;
         }
         if status != "idle" && status != "done" {
@@ -198,15 +233,17 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
 
         info!(
             handle = %ctx.handle,
+            evicted_handle = %owner_handle,
             evicted_thread_id = %tid,
             pane_id = %pane_id,
             status = %status,
-            max_sessions = max_sessions,
-            "Evicting LRU Herdr pane to stay within max_sessions"
+            cap_label = cap_label,
+            cap = cap,
+            "Evicting LRU Herdr pane to stay within session cap"
         );
         match run_herdr_json(herdr_session, &["pane", "close", &pane_id]).await {
             Ok(_) => {
-                ctx.sessions.remove(ctx.handle, &tid);
+                ctx.sessions.remove(&owner_handle, &tid);
                 live_count = live_count.saturating_sub(1);
             }
             Err(err) => {
@@ -220,11 +257,12 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
         }
     }
 
-    if live_count >= max_sessions {
+    if live_count >= cap {
         warn!(
             handle = %ctx.handle,
             live_count = live_count,
-            max_sessions = max_sessions,
+            cap_label = cap_label,
+            cap = cap,
             "All existing Herdr panes are working/blocked; spawning new pane without evicting active work"
         );
     }

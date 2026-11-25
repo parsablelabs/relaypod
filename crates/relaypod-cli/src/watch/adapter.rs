@@ -1,12 +1,14 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use relaypod_client::RelayPodClient;
 use relaypod_core::UnreadItem;
 
 use super::{ResolvedTarget, SessionStore};
 
 /// Context passed to a [`WatcherAdapter`] for a single unread item.
 pub struct DispatchContext<'a> {
+    pub client: &'a RelayPodClient,
     pub target: &'a ResolvedTarget,
     pub handle: &'a str,
     pub item: &'a UnreadItem,
