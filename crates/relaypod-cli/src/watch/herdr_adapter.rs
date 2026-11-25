@@ -115,6 +115,13 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
 
     let prompt = build_agent_prompt_with_context(ctx, is_resume).await;
 
+    // TODO: come back to this, maybe there is a better way
+    // Give a freshly started TUI (e.g. `agy`, `claude`, `codex`) a brief moment to finish
+    // binding its input loop before sending the very first prompt.
+    if !is_resume {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+
     info!(
         handle = %ctx.handle,
         thread_id = %ctx.thread_id,
@@ -124,9 +131,12 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         "Submitting prompt to Herdr agent"
     );
 
-    let prompt_resp = run_herdr_json(
+    let prompt_resp = submit_herdr_prompt_with_retry(
         herdr_session,
-        &["agent", "prompt", &pane_id, &prompt, "--wait"],
+        ctx.handle,
+        &pane_id,
+        &prompt,
+        !is_resume,
     )
     .await?;
 
@@ -150,6 +160,52 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
     } else {
         Ok(DispatchOutcome::ok())
     }
+}
+
+async fn submit_herdr_prompt_with_retry(
+    herdr_session: Option<&str>,
+    handle: &str,
+    pane_id: &str,
+    prompt: &str,
+    is_fresh_pane: bool,
+) -> Result<Value> {
+    let max_attempts = 3;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=max_attempts {
+        match run_herdr_json(
+            herdr_session,
+            &["agent", "prompt", pane_id, prompt, "--wait"],
+        )
+        .await
+        {
+            Ok(val) => return Ok(val),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let stalled = msg.contains("agent_prompt_stalled");
+                if stalled && attempt < max_attempts {
+                    warn!(
+                        handle = %handle,
+                        pane_id = %pane_id,
+                        attempt = attempt,
+                        "Herdr agent prompt stalled (TUI may still be initializing or showing a banner); retrying"
+                    );
+                    if is_fresh_pane && attempt == 1 {
+                        // Dismiss any startup announcement banner (e.g. `esc to dismiss`) before retrying.
+                        let _ =
+                            run_herdr_json(herdr_session, &["agent", "send-keys", pane_id, "esc"])
+                                .await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to submit prompt to Herdr pane {pane_id}")))
 }
 
 /// Enforces per-handle `max_sessions` and top-level `global_max_sessions` before spawning a new
