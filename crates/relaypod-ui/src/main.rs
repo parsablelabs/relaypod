@@ -8,6 +8,7 @@ use relaypod_client::{
 };
 use relaypod_core::{
     Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
+    UpdateIdentityRequest,
 };
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
@@ -75,13 +76,13 @@ struct RelayPodApp {
 
     show_new_agent_modal: bool,
     new_agent_handle: String,
-    new_agent_display: String,
     new_agent_kind: IdentityKind,
     last_created_identity: Option<CreatedIdentity>,
 
     pending_delete_message: Option<Message>,
     pending_delete_channel: Option<Channel>,
     channel_edit: Option<Channel>,
+    identity_edit: Option<Identity>,
 
     channel_search: String,
     channels_section: CollapsibleSection,
@@ -124,12 +125,12 @@ impl RelayPodApp {
             new_channel_desc: String::new(),
             show_new_agent_modal: false,
             new_agent_handle: String::new(),
-            new_agent_display: String::new(),
             new_agent_kind: IdentityKind::Agent,
             last_created_identity: None,
             pending_delete_message: None,
             pending_delete_channel: None,
             channel_edit: None,
+            identity_edit: None,
             channel_search: String::new(),
             channels_section: CollapsibleSection::new(true),
             archived_channels_section: CollapsibleSection::new(false),
@@ -150,7 +151,6 @@ impl RelayPodApp {
             if let Some(created) = effects.identity_just_created {
                 self.last_created_identity = Some(created);
                 self.new_agent_handle.clear();
-                self.new_agent_display.clear();
             }
         }
     }
@@ -165,6 +165,14 @@ impl RelayPodApp {
             .me
             .as_ref()
             .is_some_and(|me| me.kind == IdentityKind::Human)
+    }
+
+    fn can_rename_identity(&self, identity: &Identity) -> bool {
+        identity.kind == IdentityKind::Agent
+            && self.state.me.as_ref().is_some_and(|me| {
+                me.kind == IdentityKind::Human
+                    && identity.owner_id.as_deref() == Some(me.id.as_str())
+            })
     }
 
     fn render_channel_row(&mut self, ui: &mut egui::Ui, channel: &Channel) {
@@ -286,20 +294,12 @@ impl RelayPodApp {
                     });
                     ui.label("Handle (e.g. claude-local)");
                     ui.text_edit_singleline(&mut self.new_agent_handle);
-                    ui.label("Display name (optional)");
-                    ui.text_edit_singleline(&mut self.new_agent_display);
 
                     ui.horizontal(|ui| {
                         if ui.button("Create").clicked() && !self.new_agent_handle.trim().is_empty()
                         {
-                            let display_name = if self.new_agent_display.trim().is_empty() {
-                                None
-                            } else {
-                                Some(self.new_agent_display.clone())
-                            };
                             self.runtime.send(ClientCommand::CreateIdentity {
                                 handle: self.new_agent_handle.clone(),
-                                display_name,
                                 kind: self.new_agent_kind,
                             });
                         }
@@ -364,6 +364,38 @@ impl RelayPodApp {
             }
             if save || cancel || modal.should_close() {
                 self.channel_edit = None;
+            }
+        }
+
+        if let Some(identity) = &mut self.identity_edit {
+            let mut save = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("rename_agent")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Rename agent");
+                ui.label("Handle");
+                ui.text_edit_singleline(&mut identity.handle);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui
+                        .add_enabled(
+                            !identity.handle.trim().is_empty(),
+                            egui::Button::new("Save"),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if save {
+                self.runtime.send(ClientCommand::UpdateIdentity {
+                    identity_id: identity.id.clone(),
+                    request: UpdateIdentityRequest {
+                        handle: Some(identity.handle.clone()),
+                    },
+                });
+            }
+            if save || cancel || modal.should_close() {
+                self.identity_edit = None;
             }
         }
 
@@ -615,8 +647,9 @@ impl eframe::App for RelayPodApp {
                     });
                 });
 
+                let sidebar_identities = self.state.identities.clone();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for id in &self.state.identities {
+                    for id in &sidebar_identities {
                         let label = if id.unread_count > 0 {
                             format!("@{} ({})", id.handle, id.unread_count)
                         } else {
@@ -624,8 +657,17 @@ impl eframe::App for RelayPodApp {
                         };
                         ui.horizontal(|ui| {
                             draw_kind_badge(ui, id.kind);
-                            if ui.selectable_label(false, label).clicked() {
+                            let row = ui.selectable_label(false, label);
+                            if row.clicked() {
                                 self.channel_composer.push_str(&format!("@{} ", id.handle));
+                            }
+                            if self.can_rename_identity(id) {
+                                row.context_menu(|ui| {
+                                    if ui.button("Rename agent").clicked() {
+                                        self.identity_edit = Some(id.clone());
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1055,10 +1097,9 @@ fn filter_identities<'a>(identities: &'a [Identity], query: &str) -> Vec<&'a Ide
 
     for id in identities {
         let h = id.handle.to_lowercase();
-        let d = id.display_name.to_lowercase();
         if q.is_empty() || h.starts_with(&q) {
             prefix_matches.push(id);
-        } else if h.contains(&q) || d.contains(&q) {
+        } else if h.contains(&q) {
             contains_matches.push(id);
         }
     }
@@ -1459,17 +1500,6 @@ fn render_composer(
                                                 ui.horizontal(|ui| {
                                                     draw_kind_badge(ui, id.kind);
                                                     ui.strong(format!("@{}", id.handle));
-                                                    if !id.display_name.is_empty()
-                                                        && id.display_name != id.handle
-                                                    {
-                                                        ui.label(
-                                                            egui::RichText::new(&id.display_name)
-                                                                .size(12.0)
-                                                                .color(
-                                                                    ui.visuals().weak_text_color(),
-                                                                ),
-                                                        );
-                                                    }
                                                 });
                                             })
                                             .response
@@ -1820,7 +1850,6 @@ mod tests {
         let mk = |handle: &str, kind: IdentityKind| Identity {
             id: handle.into(),
             handle: handle.into(),
-            display_name: handle.into(),
             kind,
             owner_id: None,
             unread_count: 0,

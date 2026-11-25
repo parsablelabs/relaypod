@@ -118,8 +118,6 @@ enum IdentityAction {
         handle: String,
         #[arg(long, default_value = "agent")]
         kind: String,
-        #[arg(long)]
-        display_name: Option<String>,
     },
 }
 
@@ -235,24 +233,16 @@ async fn main() -> Result<()> {
                             IdentityKind::Human => "human",
                             IdentityKind::Agent => "agent",
                         };
-                        println!(
-                            "@{} [{}] ({}) unread={}",
-                            id.handle, badge, id.display_name, id.unread_count
-                        );
+                        println!("@{} [{}] unread={}", id.handle, badge, id.unread_count);
                     }
                 }
-                IdentityAction::Create {
-                    handle,
-                    kind,
-                    display_name,
-                } => {
+                IdentityAction::Create { handle, kind } => {
                     let parsed_kind = kind
                         .parse::<IdentityKind>()
                         .map_err(|e| anyhow!(e))?;
                     let created = client
                         .create_identity(&CreateIdentityRequest {
                             handle: handle.clone(),
-                            display_name: display_name.clone(),
                             kind: parsed_kind,
                             owner_id: None,
                         })

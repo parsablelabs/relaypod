@@ -35,7 +35,6 @@ impl FromStr for IdentityKind {
 pub struct Identity {
     pub id: String,
     pub handle: String,
-    pub display_name: String,
     pub kind: IdentityKind,
     pub owner_id: Option<String>,
     pub created_at: i64,
@@ -155,9 +154,14 @@ pub struct UnreadItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateIdentityRequest {
     pub handle: String,
-    pub display_name: Option<String>,
     pub kind: IdentityKind,
     pub owner_id: Option<String>,
+}
+
+/// Fields to update on an identity. Omitted fields retain their current values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateIdentityRequest {
+    pub handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +235,8 @@ pub enum WsEvent {
     },
     #[serde(rename = "identity.created")]
     IdentityCreated(Identity),
+    #[serde(rename = "identity.updated")]
+    IdentityUpdated(Identity),
     #[serde(rename = "presence.changed")]
     PresenceChanged { identity_id: String, online: bool },
     #[serde(rename = "activity.changed")]

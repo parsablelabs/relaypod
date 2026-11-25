@@ -4,7 +4,7 @@ use crate::auth::{
 use crate::models::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedChannel,
     DeletedMessage, Identity, IdentityKind, Message, PostMessageResult, ThreadView, UnreadItem,
-    UnreadReason, UpdateChannelRequest,
+    UnreadReason, UpdateChannelRequest, UpdateIdentityRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
@@ -72,7 +72,6 @@ impl Store {
             CREATE TABLE IF NOT EXISTS identities (
                 id TEXT PRIMARY KEY,
                 handle TEXT UNIQUE NOT NULL,
-                display_name TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 owner_id TEXT NULL REFERENCES identities(id),
                 token_hash TEXT NOT NULL,
@@ -128,6 +127,14 @@ impl Store {
                 [],
             )?;
         }
+        let has_display_name: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('identities') WHERE name = 'display_name')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_display_name {
+            tx.execute("ALTER TABLE identities DROP COLUMN display_name", [])?;
+        }
         tx.commit()?;
 
         Ok(())
@@ -150,7 +157,6 @@ impl Store {
             }
             let created = self.create_identity(CreateIdentityRequest {
                 handle: admin_handle.to_string(),
-                display_name: Some(admin_handle.to_string()),
                 kind: IdentityKind::Human,
                 owner_id: None,
             })?;
@@ -172,11 +178,6 @@ impl Store {
             ));
         }
 
-        let display_name = req
-            .display_name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| handle.clone());
-
         let id = new_id();
         let token = generate_token();
         let token_hash = hash_token(&token);
@@ -184,12 +185,11 @@ impl Store {
 
         let conn = self.conn.lock().expect("store lock poisoned");
         let res = conn.execute(
-            "INSERT INTO identities (id, handle, display_name, kind, owner_id, token_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO identities (id, handle, kind, owner_id, token_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 handle,
-                display_name,
                 req.kind.to_string(),
                 req.owner_id,
                 token_hash,
@@ -202,7 +202,6 @@ impl Store {
                 identity: Identity {
                     id,
                     handle,
-                    display_name,
                     kind: req.kind,
                     owner_id: req.owner_id,
                     created_at,
@@ -227,7 +226,7 @@ impl Store {
         let token_hash = hash_token(token);
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT i.id, i.handle, i.display_name, i.kind, i.owner_id, i.created_at,
+            "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
                     (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
              FROM identities i
              WHERE i.token_hash = ?1",
@@ -241,7 +240,7 @@ impl Store {
     pub fn list_identities(&self) -> CoreResult<Vec<Identity>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT i.id, i.handle, i.display_name, i.kind, i.owner_id, i.created_at,
+            "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
                     (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
              FROM identities i
              ORDER BY i.kind ASC, i.handle ASC",
@@ -252,6 +251,57 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    pub fn get_identity(&self, id_or_handle: &str) -> CoreResult<Option<Identity>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        find_identity(&conn, id_or_handle)
+    }
+
+    pub fn update_identity(
+        &self,
+        id_or_handle: &str,
+        request: UpdateIdentityRequest,
+    ) -> CoreResult<Identity> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut identity = find_identity(&tx, id_or_handle)?
+            .ok_or_else(|| CoreError::NotFound(format!("identity '{id_or_handle}'")))?;
+
+        if let Some(raw_handle) = request.handle {
+            let handle = normalize_handle(&raw_handle);
+            if handle.is_empty()
+                || !handle
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(CoreError::InvalidInput(
+                    "handle must be non-empty and contain only letters, digits, '-' or '_'".into(),
+                ));
+            }
+            identity.handle = handle;
+        }
+
+        let res = tx.execute(
+            "UPDATE identities SET handle = ?2 WHERE id = ?1",
+            params![identity.id, identity.handle],
+        );
+        match res {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    || err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(CoreError::Conflict(format!(
+                    "identity '@{}' already exists",
+                    identity.handle
+                )));
+            }
+            result => {
+                result?;
+            }
+        }
+        tx.commit()?;
+        Ok(identity)
     }
 
     pub fn create_channel(&self, req: CreateChannelRequest) -> CoreResult<Channel> {
@@ -749,6 +799,22 @@ fn validate_channel_name(raw: &str) -> CoreResult<String> {
     Ok(name)
 }
 
+fn find_identity(conn: &Connection, id_or_handle: &str) -> CoreResult<Option<Identity>> {
+    let normalized = normalize_handle(id_or_handle);
+    Ok(conn
+        .query_row(
+            "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
+                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
+             FROM identities i
+             WHERE i.id = ?1 OR i.handle = ?2
+             ORDER BY (i.id = ?1) DESC
+             LIMIT 1",
+            params![id_or_handle, normalized],
+            row_to_identity,
+        )
+        .optional()?)
+}
+
 fn find_channel(conn: &Connection, id_or_name: &str) -> CoreResult<Option<Channel>> {
     let normalized = normalize_channel_name(id_or_name);
     Ok(conn
@@ -777,16 +843,15 @@ fn ensure_channel_writable(channel: &Channel) -> CoreResult<()> {
 }
 
 fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
-    let kind_str: String = row.get(3)?;
+    let kind_str: String = row.get(2)?;
     let kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
     Ok(Identity {
         id: row.get(0)?,
         handle: row.get(1)?,
-        display_name: row.get(2)?,
         kind,
-        owner_id: row.get(4)?,
-        created_at: row.get(5)?,
-        unread_count: row.get(6)?,
+        owner_id: row.get(3)?,
+        created_at: row.get(4)?,
+        unread_count: row.get(5)?,
         online: false,
         busy: false,
     })
@@ -927,7 +992,6 @@ mod tests {
         let bot = store
             .create_identity(CreateIdentityRequest {
                 handle: "bot".into(),
-                display_name: None,
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
             })
@@ -975,7 +1039,6 @@ mod tests {
         let agent = store
             .create_identity(CreateIdentityRequest {
                 handle: "claude-local".into(),
-                display_name: Some("Claude Local".into()),
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
             })

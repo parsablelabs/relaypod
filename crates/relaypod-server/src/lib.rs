@@ -219,6 +219,15 @@ impl AppState {
         guard.keys().any(|(id, _, _)| id == identity_id)
     }
 
+    fn rename_activity_handle(&self, identity_id: &str, new_handle: &str) {
+        let mut guard = self.activity.lock().expect("activity lock poisoned");
+        for ((id, _, _), handle) in guard.iter_mut() {
+            if id == identity_id {
+                *handle = new_handle.to_string();
+            }
+        }
+    }
+
     fn snapshot_active_events(&self) -> Vec<WsEvent> {
         let guard = self.activity.lock().expect("activity lock poisoned");
         guard
@@ -344,6 +353,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/api/me", get(get_me))
         .route("/api/identities", get(list_identities).post(create_identity))
+        .route("/api/identities/{id}", patch(update_identity))
         .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/{id}",
@@ -418,6 +428,44 @@ async fn create_identity(
     let created = state.store.create_identity(req)?;
     state.emit(WsEvent::IdentityCreated(created.identity.clone()));
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn update_identity(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(caller): AuthIdentity,
+    Path(identity_id): Path<String>,
+    Json(request): Json<relaypod_core::UpdateIdentityRequest>,
+) -> Result<Json<Identity>, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
+
+    let target = state
+        .store
+        .get_identity(&identity_id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("identity '{identity_id}' not found")))?;
+
+    if target.kind != IdentityKind::Agent {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only agent identities can be renamed",
+        ));
+    }
+    if target.owner_id.as_deref() != Some(caller.id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the human who registered this agent can rename it",
+        ));
+    }
+
+    let mut updated = state.store.update_identity(&target.id, request)?;
+    state.rename_activity_handle(&updated.id, &updated.handle);
+    updated.online = state.is_online(&updated.id);
+    updated.busy = state.is_busy(&updated.id);
+    state.emit(WsEvent::IdentityUpdated(updated.clone()));
+    Ok(Json(updated))
 }
 
 #[derive(Debug, Deserialize)]

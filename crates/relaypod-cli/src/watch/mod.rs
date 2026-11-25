@@ -159,8 +159,8 @@ impl SessionStore {
         ts.insert(key, now_millis());
     }
 
-    pub fn remove(&self, handle: &str, thread_id: &str) {
-        let key = Self::key(handle, thread_id);
+    pub fn remove(&self, identity_id: &str, thread_id: &str) {
+        let key = Self::key(identity_id, thread_id);
         {
             let mut guard = self.map.lock().expect("session store lock poisoned");
             if guard.remove(&key).is_some() {
@@ -454,23 +454,30 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
         "Authenticated watcher"
     );
 
+    let live_handle = Arc::new(Mutex::new(me.handle.clone()));
     let (tx, mut rx) = mpsc::unbounded_channel::<UnreadItem>();
     let (ws_out_tx, ws_out_rx) = mpsc::unbounded_channel::<WsClientMessage>();
 
     // Sequential worker so one handle never runs overlapping dispatches at the same time
     let worker_client = client.clone();
     let worker_target = target.clone();
-    let worker_handle = me.handle.clone();
+    let worker_identity_id = me.id.clone();
+    let worker_handle = Arc::clone(&live_handle);
     let worker_sessions = sessions.clone();
     let worker_adapter = Arc::clone(&adapter);
     let worker_ws_tx = ws_out_tx.clone();
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
+            let current_handle = worker_handle
+                .lock()
+                .expect("live_handle lock poisoned")
+                .clone();
             dispatch_unread_item(
                 worker_adapter.as_ref(),
                 &worker_client,
                 &worker_target,
-                &worker_handle,
+                &worker_identity_id,
+                &current_handle,
                 &item,
                 &worker_sessions,
                 &worker_ws_tx,
@@ -485,13 +492,13 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let seen_unread = Arc::new(Mutex::new(HashSet::<String>::new()));
     let ws_url = client.ws_url();
 
-    let status_handle = me.handle.clone();
+    let status_handle = Arc::clone(&live_handle);
     let status_client = client.clone();
     let status_tx = tx.clone();
     let status_seen = Arc::clone(&seen_unread);
     let drain_on_start = target.drain_on_start;
 
-    let event_handle = me.handle.clone();
+    let event_handle = Arc::clone(&live_handle);
     let event_me_id = me.id.clone();
     let event_tx = tx.clone();
     let event_seen = Arc::clone(&seen_unread);
@@ -501,13 +508,16 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
         DEFAULT_PING_INTERVAL,
         ws_out_rx,
         move |live| {
+            let h = status_handle
+                .lock()
+                .expect("live_handle lock poisoned")
+                .clone();
             if live {
-                info!(handle = %status_handle, "WebSocket connected (live pings active) — waiting for unread events");
+                info!(handle = %h, "WebSocket connected (live pings active) — waiting for unread events");
                 if drain_on_start {
                     let c = status_client.clone();
                     let tx = status_tx.clone();
                     let seen = Arc::clone(&status_seen);
-                    let h = status_handle.clone();
                     tokio::spawn(async move {
                         match c.list_unread().await {
                             Ok(items) => {
@@ -525,28 +535,42 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                     });
                 }
             } else {
-                warn!(handle = %status_handle, "WebSocket disconnected — reconnecting...");
+                warn!(handle = %h, "WebSocket disconnected — reconnecting...");
             }
         },
-        move |ev| {
-            if let WsEvent::UnreadCreated(item) = ev {
-                if item.identity_id == event_me_id {
-                    let is_new = event_seen
-                        .lock()
-                        .expect("seen_unread lock poisoned")
-                        .insert(item.id.clone());
-                    if is_new {
-                        info!(
-                            handle = %event_handle,
-                            unread_id = %item.id,
-                            channel = %item.channel_name,
-                            author = %item.author_handle,
-                            "New unread item received"
-                        );
-                        let _ = event_tx.send(item);
-                    }
+        move |ev| match ev {
+            WsEvent::IdentityUpdated(updated) if updated.id == event_me_id => {
+                let mut guard = event_handle.lock().expect("live_handle lock poisoned");
+                if *guard != updated.handle {
+                    info!(
+                        old_handle = %*guard,
+                        new_handle = %updated.handle,
+                        "Watcher identity renamed"
+                    );
+                    *guard = updated.handle;
                 }
             }
+            WsEvent::UnreadCreated(item) if item.identity_id == event_me_id => {
+                let is_new = event_seen
+                    .lock()
+                    .expect("seen_unread lock poisoned")
+                    .insert(item.id.clone());
+                if is_new {
+                    let h = event_handle
+                        .lock()
+                        .expect("live_handle lock poisoned")
+                        .clone();
+                    info!(
+                        handle = %h,
+                        unread_id = %item.id,
+                        channel = %item.channel_name,
+                        author = %item.author_handle,
+                        "New unread item received"
+                    );
+                    let _ = event_tx.send(item);
+                }
+            }
+            _ => {}
         },
     )
     .await;
@@ -603,6 +627,7 @@ async fn dispatch_unread_item(
     adapter: &dyn WatcherAdapter,
     client: &RelayPodClient,
     target: &ResolvedTarget,
+    identity_id: &str,
     handle: &str,
     item: &UnreadItem,
     sessions: &SessionStore,
@@ -681,6 +706,7 @@ async fn dispatch_unread_item(
     let ctx = DispatchContext {
         client,
         target,
+        identity_id,
         handle,
         item,
         thread_id: &thread_id,

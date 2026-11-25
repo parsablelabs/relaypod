@@ -10,6 +10,7 @@ use super::{ResolvedTarget, SessionStore};
 pub struct DispatchContext<'a> {
     pub client: &'a RelayPodClient,
     pub target: &'a ResolvedTarget,
+    pub identity_id: &'a str,
     pub handle: &'a str,
     pub item: &'a UnreadItem,
     pub thread_id: &'a str,

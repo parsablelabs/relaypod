@@ -1,0 +1,142 @@
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use axum::Router;
+use relaypod_core::{CreateIdentityRequest, Identity, IdentityKind, Store, WsEvent};
+use relaypod_server::{build_router, AppState};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+async fn request(app: &Router, token: &str, method: &str, path: &str, body: Value) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("valid test request"),
+        )
+        .await
+        .expect("router handles test request")
+}
+
+async fn read_body<T: DeserializeOwned>(response: Response, status: StatusCode) -> T {
+    assert_eq!(response.status(), status);
+    let body = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("read test response");
+    serde_json::from_slice(&body).expect("valid JSON response")
+}
+
+#[tokio::test]
+async fn only_owning_human_can_rename_agent_and_history_persists() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let owner = store.bootstrap("marcin").unwrap().unwrap();
+    let other_human = store
+        .create_identity(CreateIdentityRequest {
+            handle: "alice".into(),
+            kind: IdentityKind::Human,
+            owner_id: None,
+        })
+        .unwrap();
+    let agent = store
+        .create_identity(CreateIdentityRequest {
+            handle: "marcin-codex".into(),
+            kind: IdentityKind::Agent,
+            owner_id: Some(owner.identity.id.clone()),
+        })
+        .unwrap();
+    let general = store.get_channel_by_name("general").unwrap().unwrap();
+    store
+        .post_message(&general.id, &agent.identity, "Initial PR opened", None)
+        .unwrap();
+
+    let state = AppState::new(Arc::clone(&store));
+    let mut events = state.events.subscribe();
+    let app = build_router(state);
+    let agent_path = format!("/api/identities/{}", agent.identity.id);
+
+    // Agent itself cannot rename
+    assert_eq!(
+        request(&app, &agent.token, "PATCH", &agent_path, json!({"handle": "codex"}))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Different human cannot rename another human's agent
+    assert_eq!(
+        request(
+            &app,
+            &other_human.token,
+            "PATCH",
+            &agent_path,
+            json!({"handle": "codex"})
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Human identity itself cannot be renamed via this endpoint
+    assert_eq!(
+        request(
+            &app,
+            &owner.token,
+            "PATCH",
+            &format!("/api/identities/{}", owner.identity.id),
+            json!({"handle": "marcin2"})
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Duplicate handle is rejected with 409
+    assert_eq!(
+        request(&app, &owner.token, "PATCH", &agent_path, json!({"handle": "@alice"}))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    // Owning human renames their agent
+    let renamed: Identity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "PATCH",
+            &agent_path,
+            json!({"handle": "@codex"}),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(renamed.id, agent.identity.id);
+    assert_eq!(renamed.handle, "codex");
+
+    // WebSocket broadcast emitted
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        WsEvent::IdentityUpdated(id) if id.id == agent.identity.id && id.handle == "codex"
+    ));
+
+    // Existing bearer token still authenticates as the renamed identity
+    let me: Identity = read_body(
+        request(&app, &agent.token, "GET", "/api/me", Value::Null).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(me.id, agent.identity.id);
+    assert_eq!(me.handle, "codex");
+
+    // Past messages reflect the updated handle automatically
+    let msgs = store.list_channel_messages(&general.id, 10).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].author_handle, "codex");
+}

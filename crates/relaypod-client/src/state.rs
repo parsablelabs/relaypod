@@ -305,6 +305,59 @@ impl WorkspaceState {
                     self.identities.push(id);
                 }
             }
+            WsEvent::IdentityUpdated(updated) => {
+                let old_handle = self
+                    .identities
+                    .iter()
+                    .find(|i| i.id == updated.id)
+                    .map(|i| i.handle.clone());
+
+                if let Some(existing) = self.identities.iter_mut().find(|i| i.id == updated.id) {
+                    *existing = updated.clone();
+                } else {
+                    self.identities.push(updated.clone());
+                }
+                self.identities.sort_by(|a, b| {
+                    a.kind
+                        .to_string()
+                        .cmp(&b.kind.to_string())
+                        .then_with(|| a.handle.to_lowercase().cmp(&b.handle.to_lowercase()))
+                        .then_with(|| a.handle.cmp(&b.handle))
+                });
+
+                if let Some(me) = &mut self.me {
+                    if me.id == updated.id {
+                        *me = updated.clone();
+                    }
+                }
+                for msg in &mut self.messages {
+                    if msg.author_id == updated.id {
+                        msg.author_handle.clone_from(&updated.handle);
+                    }
+                }
+                if let Some(thread) = &mut self.active_thread {
+                    if thread.parent.author_id == updated.id {
+                        thread.parent.author_handle.clone_from(&updated.handle);
+                    }
+                    for reply in &mut thread.replies {
+                        if reply.author_id == updated.id {
+                            reply.author_handle.clone_from(&updated.handle);
+                        }
+                    }
+                }
+                if let Some(ref prev) = old_handle {
+                    for item in &mut self.unread {
+                        if &item.author_handle == prev {
+                            item.author_handle.clone_from(&updated.handle);
+                        }
+                    }
+                }
+                for worker in &mut self.active_workers {
+                    if worker.identity_id == updated.id {
+                        worker.handle.clone_from(&updated.handle);
+                    }
+                }
+            }
             WsEvent::PresenceChanged {
                 identity_id,
                 online,
@@ -355,7 +408,6 @@ mod tests {
         Identity {
             id: id.into(),
             handle: handle.into(),
-            display_name: handle.into(),
             kind,
             owner_id: None,
             created_at: 0,

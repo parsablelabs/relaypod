@@ -39,7 +39,6 @@ async fn humans_manage_channels_and_deletion_cascades() {
     let agent = store
         .create_identity(CreateIdentityRequest {
             handle: "bot".into(),
-            display_name: None,
             kind: IdentityKind::Agent,
             owner_id: Some(human.identity.id.clone()),
         })

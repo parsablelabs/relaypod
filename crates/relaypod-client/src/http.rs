@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use relaypod_core::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, Message,
-    PostMessageRequest, ThreadView, UnreadItem, UpdateChannelRequest,
+    PostMessageRequest, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest,
 };
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -93,6 +93,25 @@ impl RelayPodClient {
         let resp = self
             .http
             .post(format!("{}/api/identities", self.base_url))
+            .bearer_auth(&self.token)
+            .json(req)
+            .send()
+            .await?;
+        Self::parse_json(resp).await
+    }
+
+    pub async fn update_identity(
+        &self,
+        identity: &str,
+        req: &UpdateIdentityRequest,
+    ) -> Result<Identity> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/identities", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid RelayPod server URL"))?
+            .push(identity);
+        let resp = self
+            .http
+            .patch(url)
             .bearer_auth(&self.token)
             .json(req)
             .send()

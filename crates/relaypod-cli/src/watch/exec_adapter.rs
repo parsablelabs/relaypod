@@ -27,7 +27,7 @@ impl WatcherAdapter for ExecAdapter {
         ctx: DispatchContext<'a>,
     ) -> Pin<Box<dyn Future<Output = DispatchOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let existing_session = ctx.sessions.get(ctx.handle, ctx.thread_id).and_then(|s| {
+            let existing_session = ctx.sessions.get(ctx.identity_id, ctx.thread_id).and_then(|s| {
                 // Ignore session entries written by other adapters (e.g. `herdr:w1:p2`)
                 if s.starts_with("herdr:") {
                     None
@@ -187,7 +187,7 @@ async fn run_managed_agent(
                         session_id = %sid,
                         "Captured agent session ID for thread"
                     );
-                    ctx.sessions.set(ctx.handle, ctx.thread_id, sid.clone());
+                    ctx.sessions.set(ctx.identity_id, ctx.thread_id, sid.clone());
                     captured_session = Some(sid);
                 }
             }

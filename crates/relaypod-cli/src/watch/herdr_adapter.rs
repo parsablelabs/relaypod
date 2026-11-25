@@ -59,13 +59,13 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
 
     let existing_pane = ctx
         .sessions
-        .get(ctx.handle, ctx.thread_id)
+        .get(ctx.identity_id, ctx.thread_id)
         .and_then(|s| s.strip_prefix(SESSION_PREFIX).map(ToString::to_string));
 
     let (pane_id, is_resume) = if let Some(pane) = existing_pane {
         match get_herdr_agent_status(herdr_session, &pane).await {
             Ok(status) => {
-                ctx.sessions.touch(ctx.handle, ctx.thread_id);
+                ctx.sessions.touch(ctx.identity_id, ctx.thread_id);
                 info!(
                     handle = %ctx.handle,
                     thread_id = %ctx.thread_id,
@@ -91,11 +91,11 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
                     error = %err,
                     "Previous Herdr agent pane is no longer available; starting a fresh pane"
                 );
-                ctx.sessions.remove(ctx.handle, ctx.thread_id);
+                ctx.sessions.remove(ctx.identity_id, ctx.thread_id);
                 evict_lru_panes_if_needed(ctx, herdr_session).await;
                 let new_pane = spawn_herdr_agent_pane(ctx, herdr_session, kind).await?;
                 ctx.sessions.set(
-                    ctx.handle,
+                    ctx.identity_id,
                     ctx.thread_id,
                     format!("{SESSION_PREFIX}{new_pane}"),
                 );
@@ -106,7 +106,7 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         evict_lru_panes_if_needed(ctx, herdr_session).await;
         let new_pane = spawn_herdr_agent_pane(ctx, herdr_session, kind).await?;
         ctx.sessions.set(
-            ctx.handle,
+            ctx.identity_id,
             ctx.thread_id,
             format!("{SESSION_PREFIX}{new_pane}"),
         );
@@ -215,14 +215,14 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
     if let Some(handle_cap) = ctx.target.max_sessions.filter(|&n| n > 0) {
         let handle_candidates: Vec<(String, String, String)> = ctx
             .sessions
-            .list_for_handle_lru(ctx.handle)
+            .list_for_handle_lru(ctx.identity_id)
             .into_iter()
             .filter_map(|(tid, sid)| {
                 if tid == ctx.thread_id {
                     return None;
                 }
                 sid.strip_prefix(SESSION_PREFIX)
-                    .map(|pane| (ctx.handle.to_string(), tid, pane.to_string()))
+                    .map(|pane| (ctx.identity_id.to_string(), tid, pane.to_string()))
             })
             .collect();
         evict_candidates_to_cap(
@@ -240,12 +240,12 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
             .sessions
             .list_all_lru()
             .into_iter()
-            .filter_map(|(h, tid, sid)| {
-                if h == ctx.handle && tid == ctx.thread_id {
+            .filter_map(|(owner, tid, sid)| {
+                if owner == ctx.identity_id && tid == ctx.thread_id {
                     return None;
                 }
                 sid.strip_prefix(SESSION_PREFIX)
-                    .map(|pane| (h, tid, pane.to_string()))
+                    .map(|pane| (owner, tid, pane.to_string()))
             })
             .collect();
         evict_candidates_to_cap(

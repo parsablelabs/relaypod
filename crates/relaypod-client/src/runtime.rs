@@ -2,7 +2,7 @@ use crate::http::RelayPodClient;
 use crate::ws::{run_live_ws_loop, DEFAULT_PING_INTERVAL};
 use relaypod_core::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, IdentityKind,
-    Message, ThreadView, UnreadItem, UpdateChannelRequest, WsEvent,
+    Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest, WsEvent,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -42,8 +42,11 @@ pub enum ClientCommand {
     },
     CreateIdentity {
         handle: String,
-        display_name: Option<String>,
         kind: IdentityKind,
+    },
+    UpdateIdentity {
+        identity_id: String,
+        request: UpdateIdentityRequest,
     },
     RefreshUnread,
     AckUnread {
@@ -213,8 +216,15 @@ where
                         request,
                     } => {
                         if let Some(c) = &client {
-                            if let Err(e) = c.update_channel(&channel_id, &request).await {
-                                emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                            match c.update_channel(&channel_id, &request).await {
+                                Ok(ch) => emit(
+                                    &event_tx,
+                                    &notify,
+                                    ClientEvent::Ws(WsEvent::ChannelUpdated(ch)),
+                                ),
+                                Err(e) => {
+                                    emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                                }
                             }
                         }
                     }
@@ -225,15 +235,10 @@ where
                             }
                         }
                     }
-                    ClientCommand::CreateIdentity {
-                        handle,
-                        display_name,
-                        kind,
-                    } => {
+                    ClientCommand::CreateIdentity { handle, kind } => {
                         if let Some(c) = &client {
                             let req = CreateIdentityRequest {
                                 handle,
-                                display_name,
                                 kind,
                                 owner_id: None,
                             };
@@ -243,6 +248,23 @@ where
                                 }
                                 Err(e) => {
                                     emit(&event_tx, &notify, ClientEvent::Error(e.to_string()))
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::UpdateIdentity {
+                        identity_id,
+                        request,
+                    } => {
+                        if let Some(c) = &client {
+                            match c.update_identity(&identity_id, &request).await {
+                                Ok(updated) => emit(
+                                    &event_tx,
+                                    &notify,
+                                    ClientEvent::Ws(WsEvent::IdentityUpdated(updated)),
+                                ),
+                                Err(e) => {
+                                    emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
                                 }
                             }
                         }
