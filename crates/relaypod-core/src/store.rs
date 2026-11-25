@@ -208,6 +208,7 @@ impl Store {
                     created_at,
                     unread_count: 0,
                     online: false,
+                    busy: false,
                 },
                 token,
             }),
@@ -787,6 +788,7 @@ fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
         created_at: row.get(5)?,
         unread_count: row.get(6)?,
         online: false,
+        busy: false,
     })
 }
 

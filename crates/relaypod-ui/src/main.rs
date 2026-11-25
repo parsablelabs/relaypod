@@ -1779,6 +1779,7 @@ mod tests {
             owner_id: None,
             unread_count: 0,
             online: false,
+            busy: false,
             created_at: 0,
         };
         let ids = vec![

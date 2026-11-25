@@ -214,6 +214,11 @@ impl AppState {
         }
     }
 
+    fn is_busy(&self, identity_id: &str) -> bool {
+        let guard = self.activity.lock().expect("activity lock poisoned");
+        guard.keys().any(|(id, _, _)| id == identity_id)
+    }
+
     fn snapshot_active_events(&self) -> Vec<WsEvent> {
         let guard = self.activity.lock().expect("activity lock poisoned");
         guard
@@ -384,6 +389,7 @@ async fn get_me(
     AuthIdentity(mut identity): AuthIdentity,
 ) -> Json<Identity> {
     identity.online = state.is_online(&identity.id);
+    identity.busy = state.is_busy(&identity.id);
     Json(identity)
 }
 
@@ -394,6 +400,7 @@ async fn list_identities(
     let mut items = state.store.list_identities()?;
     for item in &mut items {
         item.online = state.is_online(&item.id);
+        item.busy = state.is_busy(&item.id);
     }
     Ok(Json(items))
 }

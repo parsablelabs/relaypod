@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
-use self::config::{load_config_file, AgentType, HandleConfig, RunnerKind};
+use self::config::{
+    load_config_file, AgentType, HandleConfig, RunnerKind, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
+};
 use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
 
@@ -73,6 +75,7 @@ pub struct ResolvedTarget {
     pub herdr_workspace: Option<String>,
     pub global_max_sessions: Option<usize>,
     pub max_sessions: Option<usize>,
+    pub max_consecutive_agent_turns: Option<usize>,
     pub auto_ack: bool,
     pub drain_on_start: bool,
     pub cooldown_secs: u64,
@@ -300,6 +303,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 herdr_workspace: None,
                 global_max_sessions: None,
                 max_sessions: None,
+                max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
                 auto_ack: opts.auto_ack_override.unwrap_or(false),
                 drain_on_start: !opts.no_drain,
                 cooldown_secs: 0,
@@ -416,6 +420,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
             herdr_workspace: h.herdr_workspace,
             global_max_sessions: cfg.global_max_sessions,
             max_sessions: h.max_sessions,
+            max_consecutive_agent_turns: cfg.max_consecutive_agent_turns,
             auto_ack: opts.auto_ack_override.unwrap_or(h.auto_ack),
             drain_on_start: if opts.no_drain {
                 false
@@ -549,6 +554,51 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     Ok(())
 }
 
+const CIRCUIT_BREAKER_MARKER: &str = "Paused automatic agent collaboration";
+
+/// Analyze a thread up to and including `current_message_id`:
+/// - `consecutive_agent_turns`: count of trailing consecutive agent-authored messages
+///   (resetting whenever a human posts in the thread).
+/// - `last_human`: handle of the most recent human author in the thread (if any).
+/// - `already_paused`: whether the latest message in the thread is already a circuit-breaker notice.
+pub(crate) fn analyze_agent_turns(
+    thread: &relaypod_core::ThreadView,
+    current_message_id: &str,
+) -> (usize, Option<String>, bool) {
+    let mut msgs: Vec<&relaypod_core::Message> = Vec::with_capacity(1 + thread.replies.len());
+    msgs.push(&thread.parent);
+    msgs.extend(thread.replies.iter());
+
+    let already_paused = msgs
+        .last()
+        .map(|m| m.body.contains(CIRCUIT_BREAKER_MARKER))
+        .unwrap_or(false);
+
+    let cutoff = msgs
+        .iter()
+        .position(|m| m.id == current_message_id)
+        .map(|idx| idx + 1)
+        .unwrap_or(msgs.len());
+    let relevant = &msgs[..cutoff];
+
+    let mut consecutive_agent_turns = 0usize;
+    for msg in relevant.iter().rev() {
+        if msg.author_kind == relaypod_core::IdentityKind::Agent {
+            consecutive_agent_turns += 1;
+        } else {
+            break;
+        }
+    }
+
+    let last_human = relevant
+        .iter()
+        .rev()
+        .find(|m| m.author_kind == relaypod_core::IdentityKind::Human)
+        .map(|m| m.author_handle.clone());
+
+    (consecutive_agent_turns, last_human, already_paused)
+}
+
 async fn dispatch_unread_item(
     adapter: &dyn WatcherAdapter,
     client: &RelayPodClient,
@@ -562,6 +612,65 @@ async fn dispatch_unread_item(
         .parent_id
         .clone()
         .unwrap_or_else(|| item.message_id.clone());
+
+    if let Some(limit) = target.max_consecutive_agent_turns {
+        if item.parent_id.is_some() {
+            match client.get_thread(&thread_id).await {
+                Ok(thread) => {
+                    let (turns, last_human, already_paused) =
+                        analyze_agent_turns(&thread, &item.message_id);
+                    if turns >= limit {
+                        warn!(
+                            handle = %handle,
+                            thread_id = %thread_id,
+                            unread_id = %item.id,
+                            consecutive_agent_turns = turns,
+                            limit = limit,
+                            "Circuit breaker tripped: pausing automatic agent dispatch in thread"
+                        );
+                        if !already_paused {
+                            let notice = match last_human {
+                                Some(ref human) => format!(
+                                    "@{human} {CIRCUIT_BREAKER_MARKER} after {turns} consecutive agent turns in this thread (limit: {limit}). Mention an agent to continue."
+                                ),
+                                None => format!(
+                                    "{CIRCUIT_BREAKER_MARKER} after {turns} consecutive agent turns in this thread (limit: {limit}). Mention an agent to continue."
+                                ),
+                            };
+                            if let Err(err) = client
+                                .post_message(&item.channel_id, notice, Some(thread_id.clone()))
+                                .await
+                            {
+                                warn!(
+                                    handle = %handle,
+                                    thread_id = %thread_id,
+                                    error = %err,
+                                    "Failed to post circuit-breaker pause notice"
+                                );
+                            }
+                        }
+                        if let Err(err) = client.ack_unread(&item.id).await {
+                            warn!(
+                                handle = %handle,
+                                unread_id = %item.id,
+                                error = %err,
+                                "Failed to ack unread item after circuit breaker tripped"
+                            );
+                        }
+                        return;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        handle = %handle,
+                        thread_id = %thread_id,
+                        error = %err,
+                        "Failed to inspect thread for circuit breaker; proceeding with dispatch"
+                    );
+                }
+            }
+        }
+    }
 
     let _ = ws_out_tx.send(WsClientMessage::Activity {
         channel_id: item.channel_id.clone(),
@@ -720,18 +829,18 @@ pub(crate) fn build_agent_prompt(
         render_exec_template(custom, handle, item, thread_id)
     } else if is_resume {
         format!(
-            "Follow-up reply in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
-            item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
+            "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Remember: other agents only wake up when explicitly @mentioned.",
+            handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else if let Some(history) = prior_thread_context {
         format!(
-            "Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
-            item.channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
+            "You are @{}. Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+            handle, item.channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else {
         format!(
-            "New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`.",
-            item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
+            "You are @{}. New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+            handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
         )
     };
 
@@ -872,5 +981,60 @@ mod tests {
 
         // Top-level message itself has no prior context
         assert_eq!(format_prior_thread_context(&thread, "m1"), None);
+    }
+
+    #[test]
+    fn analyzes_consecutive_agent_turns_and_human_resets() {
+        let mk_msg =
+            |id: &str, author: &str, kind: relaypod_core::IdentityKind, body: &str| {
+                relaypod_core::Message {
+                    id: id.into(),
+                    channel_id: "c1".into(),
+                    parent_id: if id == "m1" { None } else { Some("m1".into()) },
+                    author_id: author.into(),
+                    author_handle: author.into(),
+                    author_kind: kind,
+                    body: body.into(),
+                    created_at: 0,
+                    reply_count: 0,
+                }
+            };
+        let thread = relaypod_core::ThreadView {
+            parent: mk_msg("m1", "marcin", relaypod_core::IdentityKind::Human, "go"),
+            replies: vec![
+                mk_msg("m2", "agy", relaypod_core::IdentityKind::Agent, "opened PR"),
+                mk_msg("m3", "codex", relaypod_core::IdentityKind::Agent, "nit 1"),
+                mk_msg("m4", "agy", relaypod_core::IdentityKind::Agent, "fixed 1"),
+                mk_msg("m5", "marcin", relaypod_core::IdentityKind::Human, "keep going"),
+                mk_msg("m6", "codex", relaypod_core::IdentityKind::Agent, "nit 2"),
+                mk_msg("m7", "agy", relaypod_core::IdentityKind::Agent, "fixed 2"),
+            ],
+        };
+
+        // At m4: 3 consecutive agent turns since m1
+        assert_eq!(
+            analyze_agent_turns(&thread, "m4"),
+            (3, Some("marcin".into()), false)
+        );
+        // At m5 (human): resets to 0
+        assert_eq!(
+            analyze_agent_turns(&thread, "m5"),
+            (0, Some("marcin".into()), false)
+        );
+        // At m7: 2 consecutive agent turns since m5
+        assert_eq!(
+            analyze_agent_turns(&thread, "m7"),
+            (2, Some("marcin".into()), false)
+        );
+
+        let mut paused_thread = thread;
+        paused_thread.replies.push(mk_msg(
+            "m8",
+            "codex",
+            relaypod_core::IdentityKind::Agent,
+            "@marcin Paused automatic agent collaboration after 6 consecutive agent turns",
+        ));
+        let (_, _, already_paused) = analyze_agent_turns(&paused_thread, "m7");
+        assert!(already_paused);
     }
 }

@@ -43,6 +43,8 @@ pub struct Identity {
     pub unread_count: i64,
     #[serde(default)]
     pub online: bool,
+    #[serde(default)]
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

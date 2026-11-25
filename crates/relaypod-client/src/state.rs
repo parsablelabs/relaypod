@@ -349,6 +349,7 @@ mod tests {
             created_at: 0,
             unread_count: 0,
             online: false,
+            busy: false,
         }
     }
 

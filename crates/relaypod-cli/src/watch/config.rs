@@ -56,12 +56,29 @@ impl AgentType {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub const DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS: usize = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchConfig {
     pub url: Option<String>,
     pub instructions_file: Option<String>,
     pub global_max_sessions: Option<usize>,
+    /// Maximum consecutive agent-authored messages in a thread before pausing
+    /// automatic agent dispatch (defaults to 6; set to 0 in YAML to disable).
+    pub max_consecutive_agent_turns: Option<usize>,
     pub handles: BTreeMap<String, HandleConfig>,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            instructions_file: None,
+            global_max_sessions: None,
+            max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
+            handles: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +199,15 @@ pub fn parse_yaml_config(input: &str) -> Result<WatchConfig> {
                         anyhow!("line {line_no}: invalid integer `{val}` for global_max_sessions")
                     })?;
                     cfg.global_max_sessions = if parsed == 0 { None } else { Some(parsed) };
+                }
+                "max_consecutive_agent_turns" => {
+                    let parsed = val.parse::<usize>().map_err(|_| {
+                        anyhow!(
+                            "line {line_no}: invalid integer `{val}` for max_consecutive_agent_turns"
+                        )
+                    })?;
+                    cfg.max_consecutive_agent_turns =
+                        if parsed == 0 { None } else { Some(parsed) };
                 }
                 "handles" => {
                     if !val.is_empty() {
@@ -488,6 +514,10 @@ handles:
 "#;
         let cfg = parse_yaml_config(yaml).unwrap();
         assert_eq!(cfg.global_max_sessions, Some(4));
+        assert_eq!(
+            cfg.max_consecutive_agent_turns,
+            Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS)
+        );
 
         let codex = &cfg.handles["marcin-codex"];
         assert_eq!(codex.runner, RunnerKind::Herdr);
@@ -504,5 +534,20 @@ handles:
         let gemini = &cfg.handles["gemini-herdr"];
         assert_eq!(gemini.runner, RunnerKind::Herdr);
         assert_eq!(gemini.agent_type, Some(AgentType::Other("gemini".into())));
+    }
+
+    #[test]
+    fn parses_max_consecutive_agent_turns() {
+        let custom = parse_yaml_config(
+            "max_consecutive_agent_turns: 10\nhandles:\n  bot:\n    exec: echo hi\n",
+        )
+        .unwrap();
+        assert_eq!(custom.max_consecutive_agent_turns, Some(10));
+
+        let disabled = parse_yaml_config(
+            "max_consecutive_agent_turns: 0\nhandles:\n  bot:\n    exec: echo hi\n",
+        )
+        .unwrap();
+        assert_eq!(disabled.max_consecutive_agent_turns, None);
     }
 }

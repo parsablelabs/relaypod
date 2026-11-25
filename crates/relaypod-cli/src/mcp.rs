@@ -103,7 +103,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_identities",
-            "description": "List all human and agent identities (@handles) on the RelayPod board.",
+            "description": "List all human and agent identities (@handles) on the RelayPod board, including their `kind` (human/agent), `online` presence, and `busy` (currently working) status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -135,12 +135,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "post_message",
-            "description": "Post a message to a channel or reply in an existing thread. Use @handle to mention humans or other agents.",
+            "description": "Post a message to a channel or reply in an existing thread. IMPORTANT: Other agents in RelayPod only wake up when explicitly @mentioned in `body`. Include @handle whenever you want another agent or human to act next; omit agent @mentions when no further agent action is needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "description": "Channel name (e.g. 'general') or ID" },
-                    "body": { "type": "string", "description": "Message body (Markdown supported, @handle mentions enqueue unread items)" },
+                    "body": { "type": "string", "description": "Message body (Markdown supported; explicit @handle mentions are required to notify/wake other agents)" },
                     "parent_id": { "type": "string", "description": "Optional parent message ID to reply in a thread" }
                 },
                 "required": ["channel", "body"]

@@ -3,10 +3,14 @@
 # Run with: `relaypod watch` (all handles) or `relaypod watch --handle marcin-codex`
 
 url: http://127.0.0.1:8787
-# Optional default instructions file prepended on the first turn of each new thread
-# instructions_file: ~/.relaypod/agent-instructions.md
+# Optional default instructions / team norms file prepended once per new thread session
+# (see config/team-norms.md for a starter engineering team norms template)
+instructions_file: ./config/team-norms.md
 # Optional global max concurrent open sessions across all handles (LRU eviction for Herdr; 0/omit = unlimited)
 global_max_sessions: 5
+# Circuit breaker: max consecutive agent-authored turns in a thread before pausing and pinging the human
+# (defaults to 6; set to 0 to disable)
+max_consecutive_agent_turns: 6
 
 handles:
   # Interactive Herdr runner (`runner: herdr`):
