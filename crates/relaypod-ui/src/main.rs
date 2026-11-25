@@ -10,11 +10,31 @@ use relaypod_core::{
     Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
 };
 
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
+
+fn load_app_icon() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok()
+}
+
+fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = load_app_icon()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    Some(ctx.load_texture("relaypod_logo", image, egui::TextureOptions::LINEAR))
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1180.0, 760.0])
+        .with_title("RelayPod");
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_title("RelayPod"),
+        viewport,
         ..Default::default()
     };
 
@@ -36,6 +56,7 @@ struct MentionState {
 struct RelayPodApp {
     runtime: ClientRuntime,
     state: WorkspaceState,
+    logo_texture: Option<egui::TextureHandle>,
 
     // View-only form inputs & modal flags
     server_url: String,
@@ -70,6 +91,7 @@ struct RelayPodApp {
 impl RelayPodApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
+        let logo_texture = load_logo_texture(&cc.egui_ctx);
 
         let egui_ctx = cc.egui_ctx.clone();
         let runtime = spawn_runtime(move || egui_ctx.request_repaint());
@@ -88,6 +110,7 @@ impl RelayPodApp {
         Self {
             runtime,
             state: WorkspaceState::default(),
+            logo_texture,
             server_url,
             token,
             show_unread_drawer: false,
@@ -182,7 +205,15 @@ impl RelayPodApp {
     fn render_connect_screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
+                ui.add_space(96.0);
+                if let Some(ref tex) = self.logo_texture {
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(64.0, 64.0))
+                            .corner_radius(CornerRadius::same(14)),
+                    );
+                    ui.add_space(10.0);
+                }
                 ui.heading("RelayPod");
                 ui.label("Shared message board for humans & AI agents");
                 ui.add_space(20.0);
@@ -450,6 +481,13 @@ impl eframe::App for RelayPodApp {
         // Top bar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if let Some(ref tex) = self.logo_texture {
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                            .corner_radius(CornerRadius::same(4)),
+                    );
+                }
                 ui.strong("RelayPod");
                 if let Some(me) = &self.state.me {
                     ui.label(format!("@{}", me.handle));
@@ -1092,6 +1130,14 @@ fn filter_channels<'a>(channels: &'a [Channel], query: &str) -> FilteredChannels
             filtered.active.push(channel);
         }
     }
+    let by_name = |a: &&Channel, b: &&Channel| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    };
+    filtered.active.sort_by(by_name);
+    filtered.archived.sort_by(by_name);
     filtered
 }
 
@@ -1814,14 +1860,25 @@ mod tests {
             created_at: 0,
         };
         let channels = vec![
-            mk("c1", "general", "Shared workspace", false),
             mk("c2", "relaypod", "Backend and UI work", false),
+            mk("c4", "Alpha", "Top alphabetically", false),
+            mk("c1", "general", "Shared workspace", false),
+            mk("c5", "zeta-old", "Oldest archive", true),
             mk("c3", "legacy-ops", "Old incident triage", true),
         ];
 
         let all = filter_channels(&channels, "   ");
-        assert_eq!(all.active.len(), 2);
-        assert_eq!(all.archived.len(), 1);
+        assert_eq!(
+            all.active.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Alpha", "general", "relaypod"]
+        );
+        assert_eq!(
+            all.archived
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy-ops", "zeta-old"]
+        );
 
         let by_name = filter_channels(&channels, "RELAY");
         assert_eq!(by_name.active.len(), 1);

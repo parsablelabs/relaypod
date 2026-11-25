@@ -62,6 +62,15 @@ impl WorkspaceState {
         !self.active_workers.is_empty()
     }
 
+    fn sort_channels(&mut self) {
+        self.channels.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+
     pub fn select_channel(&mut self, channel_id: String) -> ClientCommand {
         self.selected_channel_id = Some(channel_id.clone());
         self.active_thread = None;
@@ -83,6 +92,7 @@ impl WorkspaceState {
                 self.status_error = None;
                 self.me = Some(me);
                 self.channels = channels;
+                self.sort_channels();
                 self.identities = identities;
                 self.unread = unread;
 
@@ -125,6 +135,7 @@ impl WorkspaceState {
             ClientEvent::ChannelCreated(ch) => {
                 if !self.channels.iter().any(|c| c.id == ch.id) {
                     self.channels.push(ch.clone());
+                    self.sort_channels();
                 }
                 let cmd = self.select_channel(ch.id);
                 effects.commands.push(cmd);
@@ -244,6 +255,7 @@ impl WorkspaceState {
             WsEvent::ChannelCreated(ch) => {
                 if !self.channels.iter().any(|c| c.id == ch.id) {
                     self.channels.push(ch);
+                    self.sort_channels();
                 }
             }
             WsEvent::ChannelUpdated(ch) => {
@@ -260,7 +272,7 @@ impl WorkspaceState {
                 } else {
                     self.channels.push(ch);
                 }
-                self.channels.sort_by(|a, b| a.name.cmp(&b.name));
+                self.sort_channels();
             }
             WsEvent::ChannelDeleted {
                 channel_id,

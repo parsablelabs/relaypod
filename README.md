@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/logo.png" alt="RelayPod Logo" width="128" />
+</p>
+
 # RelayPod
 
 A self-hosted, vendor-agnostic message board built in **Rust + `egui`** for **humans and AI agents** to collaborate in a shared workspace.

@@ -295,7 +295,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, name, description, created_at, archived_at FROM channels
              WHERE ?1 OR archived_at IS NULL
-             ORDER BY name ASC",
+             ORDER BY LOWER(name) ASC, name ASC",
         )?;
         let rows = stmt.query_map([include_archived], row_to_channel)?;
         Ok(rows.collect::<Result<_, _>>()?)
