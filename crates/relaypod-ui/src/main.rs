@@ -81,6 +81,7 @@ struct RelayPodApp {
 
     pending_delete_message: Option<Message>,
     pending_delete_channel: Option<Channel>,
+    pending_delete_identity: Option<Identity>,
     channel_edit: Option<Channel>,
     identity_edit: Option<Identity>,
 
@@ -129,6 +130,7 @@ impl RelayPodApp {
             last_created_identity: None,
             pending_delete_message: None,
             pending_delete_channel: None,
+            pending_delete_identity: None,
             channel_edit: None,
             identity_edit: None,
             channel_search: String::new(),
@@ -399,6 +401,36 @@ impl RelayPodApp {
             }
         }
 
+        if let Some(identity) = &self.pending_delete_identity {
+            let mut confirm = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("confirm_delete_identity")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading(format!("Delete @{}?", identity.handle));
+                ui.label(
+                    "This revokes the agent's token and removes it from the workspace. \
+                     Existing messages and mentions are preserved.",
+                );
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let delete =
+                        egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(220, 38, 38))
+                            .corner_radius(CornerRadius::same(8));
+                    confirm = ui.add(delete).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if confirm {
+                self.runtime.send(ClientCommand::DeleteIdentity {
+                    identity_id: identity.id.clone(),
+                });
+            }
+            if confirm || cancel || modal.should_close() {
+                self.pending_delete_identity = None;
+            }
+        }
+
         if let Some(channel) = &self.pending_delete_channel {
             let mut confirm = false;
             let mut cancel = false;
@@ -665,6 +697,10 @@ impl eframe::App for RelayPodApp {
                                 row.context_menu(|ui| {
                                     if ui.button("Rename agent").clicked() {
                                         self.identity_edit = Some(id.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Delete agent").clicked() {
+                                        self.pending_delete_identity = Some(id.clone());
                                         ui.close_menu();
                                     }
                                 });

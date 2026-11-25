@@ -119,6 +119,14 @@ impl RelayPodClient {
         Self::parse_json(resp).await
     }
 
+    pub async fn delete_identity(&self, identity: &str) -> Result<()> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/identities", self.base_url))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid RelayPod server URL"))?
+            .push(identity);
+        self.delete(url).await
+    }
+
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {
         self.fetch_channels("/api/channels").await
     }

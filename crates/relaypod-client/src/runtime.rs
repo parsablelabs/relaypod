@@ -48,6 +48,9 @@ pub enum ClientCommand {
         identity_id: String,
         request: UpdateIdentityRequest,
     },
+    DeleteIdentity {
+        identity_id: String,
+    },
     RefreshUnread,
     AckUnread {
         unread_id: String,
@@ -262,6 +265,20 @@ where
                                     &event_tx,
                                     &notify,
                                     ClientEvent::Ws(WsEvent::IdentityUpdated(updated)),
+                                ),
+                                Err(e) => {
+                                    emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteIdentity { identity_id } => {
+                        if let Some(c) = &client {
+                            match c.delete_identity(&identity_id).await {
+                                Ok(()) => emit(
+                                    &event_tx,
+                                    &notify,
+                                    ClientEvent::Ws(WsEvent::IdentityDeleted { identity_id }),
                                 ),
                                 Err(e) => {
                                     emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));

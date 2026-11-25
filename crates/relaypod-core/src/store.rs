@@ -3,8 +3,8 @@ use crate::auth::{
 };
 use crate::models::{
     Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedChannel,
-    DeletedMessage, Identity, IdentityKind, Message, PostMessageResult, ThreadView, UnreadItem,
-    UnreadReason, UpdateChannelRequest, UpdateIdentityRequest,
+    DeletedIdentity, DeletedMessage, Identity, IdentityKind, Message, PostMessageResult,
+    ThreadView, UnreadItem, UnreadReason, UpdateChannelRequest, UpdateIdentityRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
@@ -75,7 +75,8 @@ impl Store {
                 kind TEXT NOT NULL,
                 owner_id TEXT NULL REFERENCES identities(id),
                 token_hash TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                deleted_at INTEGER NULL
             );
 
             CREATE TABLE IF NOT EXISTS channels (
@@ -134,6 +135,17 @@ impl Store {
         )?;
         if has_display_name {
             tx.execute("ALTER TABLE identities DROP COLUMN display_name", [])?;
+        }
+        let has_deleted_at: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('identities') WHERE name = 'deleted_at')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_deleted_at {
+            tx.execute(
+                "ALTER TABLE identities ADD COLUMN deleted_at INTEGER NULL",
+                [],
+            )?;
         }
         tx.commit()?;
 
@@ -229,7 +241,7 @@ impl Store {
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
                     (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
              FROM identities i
-             WHERE i.token_hash = ?1",
+             WHERE i.token_hash = ?1 AND i.deleted_at IS NULL",
         )?;
         let identity = stmt
             .query_row(params![token_hash], row_to_identity)
@@ -243,6 +255,7 @@ impl Store {
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
                     (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
              FROM identities i
+             WHERE i.deleted_at IS NULL
              ORDER BY i.kind ASC, i.handle ASC",
         )?;
         let rows = stmt.query_map([], row_to_identity)?;
@@ -302,6 +315,63 @@ impl Store {
         }
         tx.commit()?;
         Ok(identity)
+    }
+
+    /// Deletes an identity:
+    /// - Hard-deletes if it has no authored messages and no existing messages mentioning its handle.
+    /// - Soft-deletes (revokes token, clears unread queue, hides from active listings) otherwise,
+    ///   preserving message history and mention references.
+    pub fn delete_identity(&self, id_or_handle: &str) -> CoreResult<DeletedIdentity> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity = find_identity(&tx, id_or_handle)?
+            .ok_or_else(|| CoreError::NotFound(format!("identity '{id_or_handle}'")))?;
+
+        let has_authored: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE author_id = ?1)",
+            params![&identity.id],
+            |r| r.get(0),
+        )?;
+
+        let has_mentions = if has_authored {
+            true
+        } else {
+            let mut stmt = tx.prepare("SELECT body FROM messages")?;
+            let bodies = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut mentioned = false;
+            for body in bodies {
+                let body = body?;
+                if extract_mentions(&body).iter().any(|h| h == &identity.handle) {
+                    mentioned = true;
+                    break;
+                }
+            }
+            mentioned
+        };
+
+        tx.execute(
+            "DELETE FROM unread_items WHERE identity_id = ?1",
+            params![&identity.id],
+        )?;
+
+        let hard_deleted = if !has_authored && !has_mentions {
+            tx.execute("DELETE FROM identities WHERE id = ?1", params![&identity.id])?;
+            true
+        } else {
+            let deleted_at = now_ms();
+            let revoked_hash = format!("revoked:{}:{deleted_at}", identity.id);
+            tx.execute(
+                "UPDATE identities SET deleted_at = ?2, token_hash = ?3 WHERE id = ?1",
+                params![&identity.id, deleted_at, revoked_hash],
+            )?;
+            false
+        };
+
+        tx.commit()?;
+        Ok(DeletedIdentity {
+            identity_id: identity.id,
+            hard_deleted,
+        })
     }
 
     pub fn create_channel(&self, req: CreateChannelRequest) -> CoreResult<Channel> {
@@ -522,7 +592,7 @@ impl Store {
         for handle in extract_mentions(trimmed) {
             let target_id: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM identities WHERE handle = ?1",
+                    "SELECT id FROM identities WHERE handle = ?1 AND deleted_at IS NULL",
                     params![handle],
                     |r| r.get(0),
                 )
@@ -806,7 +876,7 @@ fn find_identity(conn: &Connection, id_or_handle: &str) -> CoreResult<Option<Ide
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
                     (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
              FROM identities i
-             WHERE i.id = ?1 OR i.handle = ?2
+             WHERE (i.id = ?1 OR i.handle = ?2) AND i.deleted_at IS NULL
              ORDER BY (i.id = ?1) DESC
              LIMIT 1",
             params![id_or_handle, normalized],

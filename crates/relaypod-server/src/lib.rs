@@ -353,7 +353,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/api/me", get(get_me))
         .route("/api/identities", get(list_identities).post(create_identity))
-        .route("/api/identities/{id}", patch(update_identity))
+        .route(
+            "/api/identities/{id}",
+            patch(update_identity).delete(delete_identity),
+        )
         .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/{id}",
@@ -466,6 +469,52 @@ async fn update_identity(
     updated.busy = state.is_busy(&updated.id);
     state.emit(WsEvent::IdentityUpdated(updated.clone()));
     Ok(Json(updated))
+}
+
+async fn delete_identity(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(caller): AuthIdentity,
+    Path(identity_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
+
+    let target = state
+        .store
+        .get_identity(&identity_id)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("identity '{identity_id}' not found"),
+            )
+        })?;
+
+    if target.kind != IdentityKind::Agent {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only agent identities can be deleted",
+        ));
+    }
+    if target.owner_id.as_deref() != Some(caller.id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only the human who registered this agent can delete it",
+        ));
+    }
+
+    let deleted = state.store.delete_identity(&target.id)?;
+    state.clear_activity_for_identity(&deleted.identity_id);
+    {
+        let mut guard = state.presence.lock().expect("presence lock poisoned");
+        guard.remove(&deleted.identity_id);
+    }
+    state.emit(WsEvent::IdentityDeleted {
+        identity_id: deleted.identity_id,
+    });
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]

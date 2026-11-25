@@ -358,6 +358,10 @@ impl WorkspaceState {
                     }
                 }
             }
+            WsEvent::IdentityDeleted { identity_id } => {
+                self.identities.retain(|i| i.id != identity_id);
+                self.active_workers.retain(|w| w.identity_id != identity_id);
+            }
             WsEvent::PresenceChanged {
                 identity_id,
                 online,

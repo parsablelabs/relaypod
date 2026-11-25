@@ -186,6 +186,13 @@ pub struct DeletedChannel {
     pub unread_removed: HashMap<String, i64>,
 }
 
+/// Identifies a deleted identity and whether it was hard-deleted or soft-deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedIdentity {
+    pub identity_id: String,
+    pub hard_deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostMessageRequest {
     pub body: String,
@@ -237,6 +244,8 @@ pub enum WsEvent {
     IdentityCreated(Identity),
     #[serde(rename = "identity.updated")]
     IdentityUpdated(Identity),
+    #[serde(rename = "identity.deleted")]
+    IdentityDeleted { identity_id: String },
     #[serde(rename = "presence.changed")]
     PresenceChanged { identity_id: String, online: bool },
     #[serde(rename = "activity.changed")]
