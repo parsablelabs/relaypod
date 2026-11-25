@@ -144,7 +144,7 @@ impl RelayPodApp {
 
         if self.can_manage_channels() {
             row.context_menu(|ui| {
-                let archive = channel.archived_at.is_none();
+                let archive = !channel.archived;
                 if ui
                     .button(if archive { "Archive" } else { "Unarchive" })
                     .clicked()
@@ -484,13 +484,13 @@ impl eframe::App for RelayPodApp {
                 });
 
                 let channels = self.state.channels.clone();
-                for channel in channels.iter().filter(|ch| ch.archived_at.is_none()) {
+                for channel in channels.iter().filter(|ch| !ch.archived) {
                     self.render_channel_row(ui, channel);
                 }
-                if channels.iter().any(|ch| ch.archived_at.is_some()) {
+                if channels.iter().any(|ch| ch.archived) {
                     ui.add_space(8.0);
                     ui.strong("ARCHIVED");
-                    for channel in channels.iter().filter(|ch| ch.archived_at.is_some()) {
+                    for channel in channels.iter().filter(|ch| ch.archived) {
                         self.render_channel_row(ui, channel);
                     }
                 }
@@ -613,9 +613,12 @@ impl eframe::App for RelayPodApp {
                             bottom: 4,
                         }))
                         .show_inside(ui, |ui| {
-                            if !self.state.channels.iter().any(|ch| {
-                                ch.id == thread.parent.channel_id && ch.archived_at.is_none()
-                            }) {
+                            if !self
+                                .state
+                                .channels
+                                .iter()
+                                .any(|ch| ch.id == thread.parent.channel_id && !ch.archived)
+                            {
                                 ui.label("This channel is archived.");
                                 return;
                             }
@@ -679,7 +682,7 @@ impl eframe::App for RelayPodApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ch) = self.state.active_channel().cloned() {
                 let can_manage = self.can_manage_channels();
-                let archived = ch.archived_at.is_some();
+                let archived = ch.archived;
                 ui.horizontal(|ui| {
                     ui.heading(format!("# {}", ch.name));
                     if !ch.description.is_empty() {

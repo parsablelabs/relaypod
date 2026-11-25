@@ -52,12 +52,39 @@ pub struct CreatedIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ChannelResponse")]
 pub struct Channel {
     pub id: String,
     pub name: String,
     pub description: String,
     pub created_at: i64,
+    /// Whether the channel is archived.
+    pub archived: bool,
     pub archived_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ChannelResponse {
+    id: String,
+    name: String,
+    description: String,
+    created_at: i64,
+    archived: Option<bool>,
+    archived_at: Option<i64>,
+}
+
+impl From<ChannelResponse> for Channel {
+    fn from(response: ChannelResponse) -> Self {
+        Self {
+            id: response.id,
+            name: response.name,
+            description: response.description,
+            created_at: response.created_at,
+            // Older servers expose the timestamp alone.
+            archived: response.archived.unwrap_or(response.archived_at.is_some()),
+            archived_at: response.archived_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,4 +237,31 @@ pub enum WsEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
     Ping,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn channel_archive_status_supports_older_and_current_payloads() {
+        for archived_at in [None, Some(123)] {
+            let legacy = json!({
+                "id": "c1",
+                "name": "builds",
+                "description": "",
+                "created_at": 1,
+                "archived_at": archived_at,
+            });
+            let channel: Channel = serde_json::from_value(legacy).unwrap();
+            assert_eq!(channel.archived, archived_at.is_some());
+            let response = serde_json::to_value(channel).unwrap();
+            assert_eq!(response["archived"], json!(archived_at.is_some()));
+            assert_eq!(response["archived_at"], json!(archived_at));
+            let round_trip: Channel = serde_json::from_value(response).unwrap();
+            assert_eq!(round_trip.archived, archived_at.is_some());
+            assert_eq!(round_trip.archived_at, archived_at);
+        }
+    }
 }

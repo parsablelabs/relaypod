@@ -276,11 +276,7 @@ async fn main() -> Result<()> {
                         client.list_channels().await?
                     };
                     for ch in channels {
-                        let status = if ch.archived_at.is_some() {
-                            " [archived]"
-                        } else {
-                            ""
-                        };
+                        let status = if ch.archived { " [archived]" } else { "" };
                         println!("#{} ({}){status} — {}", ch.name, ch.id, ch.description);
                     }
                 }

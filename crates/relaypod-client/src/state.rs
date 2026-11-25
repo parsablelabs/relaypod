@@ -60,7 +60,7 @@ impl WorkspaceState {
                 self.unread = unread;
 
                 if self.selected_channel_id.is_none() {
-                    if let Some(first) = self.channels.iter().find(|ch| ch.archived_at.is_none()) {
+                    if let Some(first) = self.channels.iter().find(|ch| !ch.archived) {
                         let cmd = self.select_channel(first.id.clone());
                         effects.commands.push(cmd);
                     }
@@ -249,7 +249,7 @@ impl WorkspaceState {
                 if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
                     self.selected_channel_id = None;
                     self.messages.clear();
-                    if let Some(first) = self.channels.iter().find(|ch| ch.archived_at.is_none()) {
+                    if let Some(first) = self.channels.iter().find(|ch| !ch.archived) {
                         effects.commands.push(self.select_channel(first.id.clone()));
                     }
                 }
@@ -303,6 +303,7 @@ mod tests {
             id: "c1".into(),
             name: "general".into(),
             description: String::new(),
+            archived: false,
             archived_at: None,
             created_at: 0,
         };
@@ -383,6 +384,7 @@ mod tests {
 
         let mut archived_channel = state.channels[0].clone();
         archived_channel.name = "builds".into();
+        archived_channel.archived = true;
         archived_channel.archived_at = Some(3);
         let agent_unread = UnreadItem {
             id: "un2".into(),
@@ -404,7 +406,7 @@ mod tests {
         }));
         state.apply(ClientEvent::Ws(WsEvent::ChannelUpdated(archived_channel)));
         assert_eq!(state.unread[0].channel_name, "builds");
-        assert!(state.active_channel().unwrap().archived_at.is_some());
+        assert!(state.active_channel().unwrap().archived);
         assert!(state.active_thread.is_some());
         assert_eq!(state.messages.len(), 1);
 
@@ -413,6 +415,7 @@ mod tests {
             name: "general".into(),
             description: String::new(),
             created_at: 4,
+            archived: false,
             archived_at: None,
         })));
         let effects = state.apply(ClientEvent::Ws(WsEvent::ChannelDeleted {

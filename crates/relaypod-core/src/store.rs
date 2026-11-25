@@ -63,7 +63,7 @@ impl Store {
     }
 
     fn init(&self) -> CoreResult<()> {
-        let conn = self.conn.lock().expect("store lock poisoned");
+        let mut conn = self.conn.lock().expect("store lock poisoned");
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -115,16 +115,20 @@ impl Store {
             "#,
         )?;
 
-        // Idempotent migration for existing databases created before `channels.archived_at`
-        let has_archived_at = {
-            let mut stmt = conn.prepare("PRAGMA table_info(channels)")?;
-            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let found = cols.filter_map(|c| c.ok()).any(|name| name == "archived_at");
-            found
-        };
+        // Lock the schema check and alteration together in case another process opens the database.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_archived_at: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('channels') WHERE name = 'archived_at')",
+            [],
+            |row| row.get(0),
+        )?;
         if !has_archived_at {
-            conn.execute("ALTER TABLE channels ADD COLUMN archived_at INTEGER NULL", [])?;
+            tx.execute(
+                "ALTER TABLE channels ADD COLUMN archived_at INTEGER NULL",
+                [],
+            )?;
         }
+        tx.commit()?;
 
         Ok(())
     }
@@ -266,6 +270,7 @@ impl Store {
                 name,
                 description: req.description,
                 created_at,
+                archived: false,
                 archived_at: None,
             }),
             Err(rusqlite::Error::SqliteFailure(err, _))
@@ -279,17 +284,20 @@ impl Store {
         }
     }
 
-    pub fn list_channels(&self) -> CoreResult<Vec<Channel>> {
+    /// Lists channels by name, including archived channels only when requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the channel list cannot be read.
+    pub fn list_channels(&self, include_archived: bool) -> CoreResult<Vec<Channel>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, archived_at FROM channels ORDER BY name ASC",
+            "SELECT id, name, description, created_at, archived_at FROM channels
+             WHERE ?1 OR archived_at IS NULL
+             ORDER BY name ASC",
         )?;
-        let rows = stmt.query_map([], row_to_channel)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        let rows = stmt.query_map([include_archived], row_to_channel)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn get_channel(&self, id_or_name: &str) -> CoreResult<Option<Channel>> {
@@ -320,6 +328,7 @@ impl Store {
             Some(false) => channel.archived_at = None,
             None => {}
         }
+        channel.archived = channel.archived_at.is_some();
 
         let result = tx.execute(
             "UPDATE channels SET name = ?2, description = ?3, archived_at = ?4 WHERE id = ?1",
@@ -345,6 +354,21 @@ impl Store {
         }
         tx.commit()?;
         Ok(channel)
+    }
+
+    /// Updates archive status while preserving channel details and messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the channel does not exist or the database update fails.
+    pub fn set_channel_archived(&self, id_or_name: &str, archived: bool) -> CoreResult<Channel> {
+        self.update_channel(
+            id_or_name,
+            UpdateChannelRequest {
+                archived: Some(archived),
+                ..Default::default()
+            },
+        )
     }
 
     /// Permanently removes a channel and its messages and unread items in one transaction.
@@ -742,7 +766,7 @@ fn require_channel(conn: &Connection, id_or_name: &str) -> CoreResult<Channel> {
 }
 
 fn ensure_channel_writable(channel: &Channel) -> CoreResult<()> {
-    if channel.archived_at.is_some() {
+    if channel.archived {
         return Err(CoreError::Conflict(format!(
             "channel '#{}' is archived",
             channel.name
@@ -767,12 +791,14 @@ fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
 }
 
 fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
+    let archived_at: Option<i64> = row.get(4)?;
     Ok(Channel {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
         created_at: row.get(3)?,
-        archived_at: row.get(4)?,
+        archived: archived_at.is_some(),
+        archived_at,
     })
 }
 
@@ -815,6 +841,120 @@ fn row_to_unread(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnreadItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_legacy_channels_and_preserves_archive_state_on_reinit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO channels VALUES ('legacy', 'builds', 'Build results', 123);",
+        )
+        .unwrap();
+        let store = Store {
+            conn: Mutex::new(conn),
+        };
+
+        store.init().unwrap();
+        let channels = store.list_channels(false).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].description, "Build results");
+        assert_eq!(channels[0].created_at, 123);
+        assert!(!channels[0].archived);
+        assert_eq!(channels[0].archived_at, None);
+
+        let archived = store.set_channel_archived("legacy", true).unwrap();
+        store.init().unwrap();
+        assert!(store.list_channels(false).unwrap().is_empty());
+        let channels = store.list_channels(true).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0].archived);
+        assert_eq!(channels[0].archived_at, archived.archived_at);
+    }
+
+    #[test]
+    fn updates_channel_details_and_archive_state() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = store.bootstrap("admin").unwrap().unwrap();
+        let channel = store.get_channel("general").unwrap().unwrap();
+        let message = store
+            .post_message(&channel.id, &admin.identity, "Build passed", None)
+            .unwrap()
+            .message;
+
+        let updated = store
+            .update_channel(
+                &channel.id,
+                UpdateChannelRequest {
+                    name: Some(" #CI ".into()),
+                    description: Some("Build results".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.id, channel.id);
+        assert_eq!(updated.name, "ci");
+        assert_eq!(updated.description, "Build results");
+        assert!(store.get_channel("general").unwrap().is_none());
+
+        let archived = store.set_channel_archived("ci", true).unwrap();
+        assert!(archived.archived);
+        let archive_time = archived.archived_at.expect("archive time was recorded");
+        let retried = store.set_channel_archived("ci", true).unwrap();
+        assert_eq!(retried.archived_at, Some(archive_time));
+        assert_eq!(store.get_thread(&message.id).unwrap().parent.id, message.id);
+
+        let restored = store.set_channel_archived("ci", false).unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.archived_at, None);
+        let active = store.list_channels(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, channel.id);
+        assert_eq!(active[0].name, "ci");
+        assert_eq!(active[0].description, "Build results");
+    }
+
+    #[test]
+    fn deletes_channel_threads_and_all_unread_items() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = store.bootstrap("admin").unwrap().unwrap();
+        let bot = store
+            .create_identity(CreateIdentityRequest {
+                handle: "bot".into(),
+                display_name: None,
+                kind: IdentityKind::Agent,
+                owner_id: Some(admin.identity.id.clone()),
+            })
+            .unwrap();
+        let channel = store.get_channel("general").unwrap().unwrap();
+        let root = store
+            .post_message(&channel.id, &admin.identity, "@bot check CI", None)
+            .unwrap();
+        store
+            .ack_unread(&bot.identity.id, &root.created_unread[0].id)
+            .unwrap();
+        store
+            .post_message(&channel.id, &bot.identity, "Passed", Some(root.message.id))
+            .unwrap();
+        store.set_channel_archived(&channel.id, true).unwrap();
+
+        let deleted = store.delete_channel(&channel.id).unwrap();
+        assert_eq!(deleted.channel_id, channel.id);
+        assert_eq!(deleted.unread_removed, [(admin.identity.id, 1)].into());
+        let conn = store.conn.lock().unwrap();
+        for table in ["channels", "messages", "unread_items"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must be empty");
+        }
+    }
 
     #[test]
     fn test_bootstrap_mentions_threads_and_unread_queue() {

@@ -351,11 +351,7 @@ async fn list_channels(
     AuthIdentity(_): AuthIdentity,
     Query(query): Query<ChannelListQuery>,
 ) -> Result<Json<Vec<relaypod_core::Channel>>, ApiError> {
-    let mut channels = state.store.list_channels()?;
-    if !query.include_archived {
-        channels.retain(|channel| channel.archived_at.is_none());
-    }
-    Ok(Json(channels))
+    Ok(Json(state.store.list_channels(query.include_archived)?))
 }
 
 async fn create_channel(

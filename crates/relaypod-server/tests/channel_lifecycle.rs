@@ -144,9 +144,10 @@ async fn humans_manage_channels_and_deletion_cascades() {
     .await;
     assert_eq!(archived.name, "ci");
     assert_eq!(archived.description, "");
+    assert!(archived.archived);
     assert!(archived.archived_at.is_some());
     assert!(
-        matches!(events.try_recv().unwrap(), WsEvent::ChannelUpdated(ch) if ch.id == channel.id && ch.archived_at == archived.archived_at)
+        matches!(events.try_recv().unwrap(), WsEvent::ChannelUpdated(ch) if ch.id == channel.id && ch.name == "ci" && ch.description.is_empty() && ch.archived && ch.archived_at == archived.archived_at)
     );
     assert!(store
         .list_unread(&agent.identity.id)
@@ -160,6 +161,20 @@ async fn humans_manage_channels_and_deletion_cascades() {
     )
     .await;
     assert_eq!(default_list.len(), 1);
+    let active_list: Vec<Channel> = read_body(
+        request(
+            &app,
+            &agent.token,
+            "GET",
+            "/api/channels?include_archived=false",
+            Value::Null,
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(active_list.len(), 1);
+    assert_eq!(active_list[0].id, default_list[0].id);
     let full_list: Vec<Channel> = read_body(
         request(
             &app,
@@ -207,9 +222,10 @@ async fn humans_manage_channels_and_deletion_cascades() {
         StatusCode::OK,
     )
     .await;
+    assert!(!unarchived.archived);
     assert!(unarchived.archived_at.is_none());
     assert!(
-        matches!(events.try_recv().unwrap(), WsEvent::ChannelUpdated(ch) if ch.archived_at.is_none())
+        matches!(events.try_recv().unwrap(), WsEvent::ChannelUpdated(ch) if !ch.archived && ch.archived_at.is_none())
     );
     assert_eq!(
         request(
