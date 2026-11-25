@@ -186,7 +186,10 @@ impl RelayPodApp {
 
     fn render_channel_row(&mut self, ui: &mut egui::Ui, channel: &Channel) {
         let selected = self.state.selected_channel_id.as_deref() == Some(channel.id.as_str());
-        let row = ui.selectable_label(selected, format!("# {}", channel.name));
+        let mut row = ui.selectable_label(selected, format!("# {}", channel.name));
+        if !channel.description.trim().is_empty() {
+            row = row.on_hover_text(&channel.description);
+        }
         if row.clicked() {
             self.select_channel(channel.id.clone());
         }
@@ -954,7 +957,8 @@ impl eframe::App for RelayPodApp {
                                     .color(ui.visuals().weak_text_color()),
                             )
                             .truncate(),
-                        );
+                        )
+                        .on_hover_text(&ch.description);
                     }
                 });
                 ui.separator();
@@ -1479,7 +1483,7 @@ fn render_composer(
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                 let send_btn_width = 72.0;
                 let can_send = !text.trim().is_empty();
                 let btn_fill = if can_send {
@@ -1506,22 +1510,24 @@ fn render_composer(
 
                 ui.add_space(4.0);
                 let edit_width = ui.available_width().max(40.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(edit_width, 44.0),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.set_max_width(edit_width);
-                        ui.add(
-                            egui::TextEdit::multiline(text)
-                                .id(input_id)
-                                .frame(false)
-                                .hint_text(hint_text)
-                                .desired_rows(2)
-                                .desired_width(edit_width)
-                                .min_size(egui::vec2(edit_width, 44.0)),
-                        );
-                    },
-                );
+                ui.vertical(|ui| {
+                    ui.set_width(edit_width);
+                    ui.set_max_width(edit_width);
+                    egui::ScrollArea::vertical()
+                        .id_salt((id_salt, "composer_scroll"))
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .id(input_id)
+                                    .frame(false)
+                                    .hint_text(hint_text)
+                                    .desired_rows(2)
+                                    .desired_width(edit_width)
+                                    .min_size(egui::vec2(edit_width, 44.0)),
+                            );
+                        });
+                });
             });
         });
 
@@ -2216,6 +2222,69 @@ mod tests {
             assert!(
                 composer_right <= thread_left + 0.5,
                 "at window width {screen_w}, channel composer right ({composer_right}) overflowed into thread pane left ({thread_left})"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_height_stabilizes_for_multiline_text() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+
+        let mut mention = MentionState::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(500.0, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let samples = [
+            "short message".to_string(),
+            "This is a longer message that wraps across multiple lines inside the composer box so we can verify that the bottom panel settles cleanly without growing on every frame.".to_string(),
+            (0..15).map(|i| format!("Line {i}: some content here")).collect::<Vec<_>>().join("\n"),
+        ];
+
+        for mut text in samples {
+            let mut heights = Vec::new();
+            for _ in 0..12 {
+                let mut h = 0.0_f32;
+                let _ = ctx.run(input.clone(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let resp = egui::TopBottomPanel::bottom("composer_stability_test")
+                            .frame(egui::Frame::new().inner_margin(Margin {
+                                left: 4,
+                                right: 4,
+                                top: 8,
+                                bottom: 4,
+                            }))
+                            .show_inside(ui, |ui| {
+                                render_composer(
+                                    ui,
+                                    "composer_stability_input",
+                                    &mut text,
+                                    &mut mention,
+                                    "Message #general",
+                                    &[],
+                                );
+                            });
+                        h = resp.response.rect.height();
+                    });
+                });
+                heights.push(h);
+            }
+
+            let settled = heights[3];
+            for (frame, &h) in heights.iter().enumerate().skip(4) {
+                assert!(
+                    (h - settled).abs() < 0.5,
+                    "composer height kept drifting on frame {frame}: settled at {settled}, got {h} (all: {heights:?})"
+                );
+            }
+            assert!(
+                settled <= 200.0,
+                "composer height should be capped by scroll area, got {settled}"
             );
         }
     }
