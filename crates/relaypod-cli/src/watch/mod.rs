@@ -4,8 +4,10 @@ pub mod exec_adapter;
 pub mod herdr_adapter;
 
 use anyhow::{anyhow, Context, Result};
-use relaypod_client::{run_live_ws_loop, RelayPodClient, DEFAULT_PING_INTERVAL};
-use relaypod_core::{UnreadItem, WsEvent};
+use relaypod_client::{
+    run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL,
+};
+use relaypod_core::{UnreadItem, WsClientMessage, WsEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -417,6 +419,7 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<UnreadItem>();
+    let (ws_out_tx, ws_out_rx) = mpsc::unbounded_channel::<WsClientMessage>();
 
     // Sequential worker so one handle never runs overlapping dispatches at the same time
     let worker_client = client.clone();
@@ -424,6 +427,7 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let worker_handle = me.handle.clone();
     let worker_sessions = sessions.clone();
     let worker_adapter = Arc::clone(&adapter);
+    let worker_ws_tx = ws_out_tx.clone();
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
             dispatch_unread_item(
@@ -433,6 +437,7 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 &worker_handle,
                 &item,
                 &worker_sessions,
+                &worker_ws_tx,
             )
             .await;
             if worker_target.cooldown_secs > 0 {
@@ -455,9 +460,10 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let event_tx = tx.clone();
     let event_seen = Arc::clone(&seen_unread);
 
-    run_live_ws_loop(
+    run_live_ws_loop_with_outgoing(
         ws_url,
         DEFAULT_PING_INTERVAL,
+        ws_out_rx,
         move |live| {
             if live {
                 info!(handle = %status_handle, "WebSocket connected (live pings active) — waiting for unread events");
@@ -519,11 +525,18 @@ async fn dispatch_unread_item(
     handle: &str,
     item: &UnreadItem,
     sessions: &SessionStore,
+    ws_out_tx: &mpsc::UnboundedSender<WsClientMessage>,
 ) {
     let thread_id = item
         .parent_id
         .clone()
         .unwrap_or_else(|| item.message_id.clone());
+
+    let _ = ws_out_tx.send(WsClientMessage::Activity {
+        channel_id: item.channel_id.clone(),
+        thread_id: Some(thread_id.clone()),
+        active: true,
+    });
 
     let ctx = DispatchContext {
         target,
@@ -534,6 +547,12 @@ async fn dispatch_unread_item(
     };
 
     let outcome = adapter.dispatch(ctx).await;
+
+    let _ = ws_out_tx.send(WsClientMessage::Activity {
+        channel_id: item.channel_id.clone(),
+        thread_id: Some(thread_id.clone()),
+        active: false,
+    });
 
     if outcome.succeeded {
         info!(

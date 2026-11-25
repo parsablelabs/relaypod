@@ -11,6 +11,15 @@ pub struct StateEffects {
     pub identity_just_created: Option<CreatedIdentity>,
 }
 
+/// Tracks an identity (typically an AI agent) currently working on a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveWorker {
+    pub identity_id: String,
+    pub handle: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+}
+
 /// Pure, display-framework-agnostic client workspace state.
 /// Any UI (egui, iced, gpui, ratatui, etc.) renders from this struct and feeds `ClientEvent`s into `apply()`.
 #[derive(Debug, Default)]
@@ -27,12 +36,30 @@ pub struct WorkspaceState {
     pub selected_channel_id: Option<String>,
     pub messages: Vec<Message>,
     pub active_thread: Option<ThreadView>,
+    pub active_workers: Vec<ActiveWorker>,
 }
 
 impl WorkspaceState {
     pub fn active_channel(&self) -> Option<&Channel> {
         let id = self.selected_channel_id.as_deref()?;
         self.channels.iter().find(|c| c.id == id)
+    }
+
+    pub fn workers_for_thread(&self, channel_id: &str, thread_id: &str) -> Vec<&ActiveWorker> {
+        self.active_workers
+            .iter()
+            .filter(|w| w.channel_id == channel_id && w.thread_id.as_deref() == Some(thread_id))
+            .collect()
+    }
+
+    pub fn is_identity_working(&self, identity_id: &str) -> bool {
+        self.active_workers
+            .iter()
+            .any(|w| w.identity_id == identity_id)
+    }
+
+    pub fn has_active_workers(&self) -> bool {
+        !self.active_workers.is_empty()
     }
 
     pub fn select_channel(&mut self, channel_id: String) -> ClientCommand {
@@ -76,6 +103,7 @@ impl WorkspaceState {
                 self.selected_channel_id = None;
                 self.messages.clear();
                 self.active_thread = None;
+                self.active_workers.clear();
             }
             ClientEvent::ChannelMessages {
                 channel_id,
@@ -137,6 +165,12 @@ impl WorkspaceState {
     fn apply_ws(&mut self, ev: WsEvent, effects: &mut StateEffects) {
         match ev {
             WsEvent::MessageCreated(msg) => {
+                // Clear matching active worker immediately when the reply lands
+                self.active_workers.retain(|w| {
+                    !(w.identity_id == msg.author_id
+                        && w.channel_id == msg.channel_id
+                        && w.thread_id == msg.parent_id)
+                });
                 if let Some(parent_id) = &msg.parent_id {
                     if let Some(parent) = self.messages.iter_mut().find(|m| &m.id == parent_id) {
                         parent.reply_count += 1;
@@ -263,6 +297,9 @@ impl WorkspaceState {
                 identity_id,
                 online,
             } => {
+                if !online {
+                    self.active_workers.retain(|w| w.identity_id != identity_id);
+                }
                 if let Some(id) = self.identities.iter_mut().find(|i| i.id == identity_id) {
                     id.online = online;
                 }
@@ -270,6 +307,27 @@ impl WorkspaceState {
                     if me.id == identity_id {
                         me.online = online;
                     }
+                }
+            }
+            WsEvent::ActivityChanged {
+                identity_id,
+                handle,
+                channel_id,
+                thread_id,
+                active,
+            } => {
+                self.active_workers.retain(|w| {
+                    !(w.identity_id == identity_id
+                        && w.channel_id == channel_id
+                        && w.thread_id == thread_id)
+                });
+                if active {
+                    self.active_workers.push(ActiveWorker {
+                        identity_id,
+                        handle,
+                        channel_id,
+                        thread_id,
+                    });
                 }
             }
         }

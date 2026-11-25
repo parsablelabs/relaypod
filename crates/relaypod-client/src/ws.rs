@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use relaypod_core::{WsClientMessage, WsEvent};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
 
@@ -13,6 +14,22 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
 pub async fn run_live_ws_loop<OnStatus, OnEvent>(
     ws_url: String,
     ping_interval: Duration,
+    on_status: OnStatus,
+    on_event: OnEvent,
+) where
+    OnStatus: FnMut(bool),
+    OnEvent: FnMut(WsEvent),
+{
+    let (_tx, rx) = mpsc::unbounded_channel();
+    run_live_ws_loop_with_outgoing(ws_url, ping_interval, rx, on_status, on_event).await;
+}
+
+/// Variant of [`run_live_ws_loop`] that also forwards outgoing [`WsClientMessage`]s
+/// (such as agent working/activity indicators) over the active WebSocket connection.
+pub async fn run_live_ws_loop_with_outgoing<OnStatus, OnEvent>(
+    ws_url: String,
+    ping_interval: Duration,
+    mut outgoing_rx: mpsc::UnboundedReceiver<WsClientMessage>,
     mut on_status: OnStatus,
     mut on_event: OnEvent,
 ) where
@@ -35,6 +52,13 @@ pub async fn run_live_ws_loop<OnStatus, OnEvent>(
                         _ = ticker.tick() => {
                             if write.send(TungsteniteMsg::Text(ping_payload.clone().into())).await.is_err() {
                                 break;
+                            }
+                        }
+                        Some(msg) = outgoing_rx.recv() => {
+                            if let Ok(text) = serde_json::to_string(&msg) {
+                                if write.send(TungsteniteMsg::Text(text.into())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                         frame = read.next() => {

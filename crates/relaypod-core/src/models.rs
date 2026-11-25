@@ -231,12 +231,25 @@ pub enum WsEvent {
     IdentityCreated(Identity),
     #[serde(rename = "presence.changed")]
     PresenceChanged { identity_id: String, online: bool },
+    #[serde(rename = "activity.changed")]
+    ActivityChanged {
+        identity_id: String,
+        handle: String,
+        channel_id: String,
+        thread_id: Option<String>,
+        active: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
     Ping,
+    Activity {
+        channel_id: String,
+        thread_id: Option<String>,
+        active: bool,
+    },
 }
 
 #[cfg(test)]

@@ -33,6 +33,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<WsEvent>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
+    /// Active working/typing indicators keyed by `(identity_id, channel_id, thread_id) -> handle`.
+    activity: Mutex<HashMap<(String, String, Option<String>), String>>,
     // Keep board events in the same order as their committed writes.
     board_writes: Mutex<()>,
 }
@@ -44,6 +46,7 @@ impl AppState {
             store,
             events,
             presence: Mutex::new(HashMap::new()),
+            activity: Mutex::new(HashMap::new()),
             board_writes: Mutex::new(()),
         })
     }
@@ -126,6 +129,7 @@ impl AppState {
         };
 
         if became_offline {
+            self.clear_activity_for_identity(identity_id);
             self.emit(WsEvent::PresenceChanged {
                 identity_id: identity_id.to_string(),
                 online: false,
@@ -148,11 +152,80 @@ impl AppState {
         };
 
         for identity_id in expired {
+            self.clear_activity_for_identity(&identity_id);
             self.emit(WsEvent::PresenceChanged {
                 identity_id,
                 online: false,
             });
         }
+    }
+
+    fn set_activity(
+        &self,
+        identity_id: &str,
+        handle: &str,
+        channel_id: String,
+        thread_id: Option<String>,
+        active: bool,
+    ) {
+        let changed = {
+            let mut guard = self.activity.lock().expect("activity lock poisoned");
+            let key = (identity_id.to_string(), channel_id.clone(), thread_id.clone());
+            if active {
+                guard.insert(key, handle.to_string());
+                true
+            } else {
+                guard.remove(&key).is_some()
+            }
+        };
+
+        if changed {
+            self.emit(WsEvent::ActivityChanged {
+                identity_id: identity_id.to_string(),
+                handle: handle.to_string(),
+                channel_id,
+                thread_id,
+                active,
+            });
+        }
+    }
+
+    fn clear_activity_for_identity(&self, identity_id: &str) {
+        let removed: Vec<(String, Option<String>, String)> = {
+            let mut guard = self.activity.lock().expect("activity lock poisoned");
+            let keys: Vec<(String, String, Option<String>)> = guard
+                .keys()
+                .filter(|(id, _, _)| id == identity_id)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| guard.remove(&k).map(|h| (k.1, k.2, h)))
+                .collect()
+        };
+
+        for (channel_id, thread_id, handle) in removed {
+            self.emit(WsEvent::ActivityChanged {
+                identity_id: identity_id.to_string(),
+                handle,
+                channel_id,
+                thread_id,
+                active: false,
+            });
+        }
+    }
+
+    fn snapshot_active_events(&self) -> Vec<WsEvent> {
+        let guard = self.activity.lock().expect("activity lock poisoned");
+        guard
+            .iter()
+            .map(|((identity_id, channel_id, thread_id), handle)| WsEvent::ActivityChanged {
+                identity_id: identity_id.clone(),
+                handle: handle.clone(),
+                channel_id: channel_id.clone(),
+                thread_id: thread_id.clone(),
+                active: true,
+            })
+            .collect()
     }
 }
 
@@ -436,6 +509,13 @@ async fn post_message(
         .store
         .post_message(&channel_id, &author, &req.body, req.parent_id)?;
 
+    state.set_activity(
+        &author.id,
+        &author.handle,
+        res.message.channel_id.clone(),
+        res.message.parent_id.clone(),
+        false,
+    );
     state.emit(WsEvent::MessageCreated(res.message.clone()));
     for unread in res.created_unread {
         state.emit(WsEvent::UnreadCreated(unread));
@@ -518,7 +598,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
     state.on_ws_connect(&identity.id);
     info!("ws connected: @{}", identity.handle);
 
+    let initial_activity = state.snapshot_active_events();
     let send_task = tokio::spawn(async move {
+        for event in initial_activity {
+            if let Ok(text) = serde_json::to_string(&event) {
+                if sender.send(WsMessage::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
         while let Ok(event) = rx.recv().await {
             match serde_json::to_string(&event) {
                 Ok(text) => {
@@ -534,8 +622,24 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             WsMessage::Text(text) => {
-                if let Ok(WsClientMessage::Ping) = serde_json::from_str::<WsClientMessage>(&text) {
-                    state.on_ws_ping(&identity.id);
+                if let Ok(client_msg) = serde_json::from_str::<WsClientMessage>(&text) {
+                    match client_msg {
+                        WsClientMessage::Ping => state.on_ws_ping(&identity.id),
+                        WsClientMessage::Activity {
+                            channel_id,
+                            thread_id,
+                            active,
+                        } => {
+                            state.on_ws_ping(&identity.id);
+                            state.set_activity(
+                                &identity.id,
+                                &identity.handle,
+                                channel_id,
+                                thread_id,
+                                active,
+                            );
+                        }
+                    }
                 }
             }
             WsMessage::Ping(_) => {

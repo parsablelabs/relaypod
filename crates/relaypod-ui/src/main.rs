@@ -674,6 +674,17 @@ impl eframe::App for RelayPodApp {
                                 render_thread_bubble(ui, reply, is_me);
                                 ui.add_space(8.0);
                             }
+
+                            let thread_workers: Vec<String> = self
+                                .state
+                                .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
+                                .into_iter()
+                                .map(|w| w.handle.clone())
+                                .collect();
+                            if !thread_workers.is_empty() {
+                                render_working_banner(ui, &thread_workers);
+                                ui.add_space(6.0);
+                            }
                         });
                 });
         }
@@ -738,7 +749,14 @@ impl eframe::App for RelayPodApp {
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         for msg in msgs {
-                            let action = render_message_card(ui, &msg, can_manage && !archived);
+                            let workers: Vec<String> = self
+                                .state
+                                .workers_for_thread(&msg.channel_id, &msg.id)
+                                .into_iter()
+                                .map(|w| w.handle.clone())
+                                .collect();
+                            let action =
+                                render_message_card(ui, &msg, can_manage && !archived, &workers);
                             match action {
                                 MessageCardAction::OpenThread => {
                                     self.show_unread_drawer = false;
@@ -1169,13 +1187,80 @@ fn draw_kind_badge(ui: &mut egui::Ui, kind: IdentityKind) {
     }
 }
 
+fn draw_working_dots(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 14.0), egui::Sense::hover());
+    let time = ui.ctx().input(|i| i.time) as f32;
+    let base_y = rect.center().y + 1.0;
+    let accent = Color32::from_rgb(167, 139, 250);
+
+    for idx in 0..3 {
+        let phase = time * 5.0_f32 - (idx as f32) * 0.75_f32;
+        let bounce = phase.sin().max(0.0);
+        let x = rect.left() + 4.0 + (idx as f32) * 9.0;
+        let y = base_y - bounce * 4.0;
+        let alpha = (130.0 + bounce * 125.0) as u8;
+        let color = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha);
+        ui.painter().circle_filled(egui::pos2(x, y), 2.5, color);
+    }
+    ui.ctx().request_repaint();
+}
+
+fn format_workers_label(handles: &[String]) -> String {
+    match handles {
+        [] => String::new(),
+        [one] => format!("@{one} is working..."),
+        [a, b] => format!("@{a} and @{b} are working..."),
+        many => format!("@{} and {} others are working...", many[0], many.len() - 1),
+    }
+}
+
+fn render_working_banner(ui: &mut egui::Ui, handles: &[String]) {
+    let dark = ui.visuals().dark_mode;
+    let fill = if dark {
+        Color32::from_rgb(42, 38, 56)
+    } else {
+        Color32::from_rgb(243, 238, 255)
+    };
+    let border = if dark {
+        Color32::from_rgb(92, 74, 140)
+    } else {
+        Color32::from_rgb(196, 181, 253)
+    };
+    let text_color = if dark {
+        Color32::from_rgb(216, 204, 255)
+    } else {
+        Color32::from_rgb(91, 33, 182)
+    };
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                draw_working_dots(ui);
+                ui.label(
+                    egui::RichText::new(format_workers_label(handles))
+                        .size(12.0)
+                        .color(text_color),
+                );
+            });
+        });
+}
+
 enum MessageCardAction {
     None,
     OpenThread,
     Delete,
 }
 
-fn render_message_card(ui: &mut egui::Ui, msg: &Message, can_delete: bool) -> MessageCardAction {
+fn render_message_card(
+    ui: &mut egui::Ui,
+    msg: &Message,
+    can_delete: bool,
+    working_handles: &[String],
+) -> MessageCardAction {
     let mut action = MessageCardAction::None;
     egui::Frame::group(ui.style())
         .corner_radius(CornerRadius::same(10))
@@ -1213,6 +1298,10 @@ fn render_message_card(ui: &mut egui::Ui, msg: &Message, can_delete: bool) -> Me
             });
             ui.add_space(4.0);
             markdown::render_markdown(ui, &msg.body);
+            if !working_handles.is_empty() {
+                ui.add_space(6.0);
+                render_working_banner(ui, working_handles);
+            }
         });
     action
 }
