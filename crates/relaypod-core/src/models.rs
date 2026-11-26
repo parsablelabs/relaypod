@@ -31,6 +31,9 @@ impl FromStr for IdentityKind {
     }
 }
 
+/// Default working directory for newly registered agents when no explicit `cwd` is provided.
+pub const DEFAULT_AGENT_CWD: &str = "~/.relaypod/workspace";
+
 /// JSON-serialized configuration and routing metadata for an AI agent identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {

@@ -485,16 +485,20 @@ async fn create_identity(
         req.agent_config = None;
     } else {
         req.owner_id = Some(caller.id);
-        if let Some(ref mut cfg) = req.agent_config {
-            if cfg.args.is_none() {
-                if let Some(ref harness) = cfg.harness {
-                    if let Some(default_args) =
-                        relaypod_core::AgentConfig::default_args_for_harness(harness)
-                    {
-                        cfg.args = Some(default_args.to_string());
-                    }
+        let cfg = req
+            .agent_config
+            .get_or_insert_with(relaypod_core::AgentConfig::default);
+        if cfg.args.is_none() {
+            if let Some(ref harness) = cfg.harness {
+                if let Some(default_args) =
+                    relaypod_core::AgentConfig::default_args_for_harness(harness)
+                {
+                    cfg.args = Some(default_args.to_string());
                 }
             }
+        }
+        if cfg.cwd.is_none() {
+            cfg.cwd = Some(relaypod_core::DEFAULT_AGENT_CWD.to_string());
         }
     }
     let mut created = state.store.create_identity(req)?;

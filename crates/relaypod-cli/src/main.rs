@@ -144,7 +144,7 @@ struct IdentityCreateArgs {
     /// Custom shell command when using --runner exec without --agent-type
     #[arg(long)]
     exec: Option<String>,
-    /// Working directory for the agent (defaults to current directory)
+    /// Working directory for the agent (defaults to ~/.relaypod/workspace)
     #[arg(long)]
     cwd: Option<String>,
     /// Extra CLI flags forwarded to the agent (stored in DB and applied on new sessions)
@@ -571,12 +571,10 @@ async fn main() -> Result<()> {
                             },
                         };
 
-                        let resolved_cwd = match cwd {
-                            Some(c) => Some(c.clone()),
-                            None => std::env::current_dir()
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string()),
-                        };
+                        let resolved_cwd = Some(
+                            cwd.clone()
+                                .unwrap_or_else(|| relaypod_core::DEFAULT_AGENT_CWD.to_string()),
+                        );
                         let cfg_path = match config {
                             Some(p) => p.clone(),
                             None => watch::default_config_path()?,

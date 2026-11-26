@@ -121,7 +121,7 @@ CONFIG_DIR="${RELAYPOD_CONFIG_DIR:-$HOME/.relaypod}"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 DEFAULT_ADMIN="${USER:-admin}"
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/workspace"
 chmod 700 "$CONFIG_DIR"
 
 if [ ! -f "$CONFIG_FILE" ]; then

@@ -1,8 +1,9 @@
 use crate::http::RelayPodClient;
 use crate::ws::{run_live_ws_loop, DEFAULT_PING_INTERVAL};
 use relaypod_core::{
-    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, IdentityKind,
-    Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest, WsEvent,
+    AgentConfig, Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity,
+    IdentityKind, Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest,
+    WsEvent,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub enum ClientCommand {
     CreateIdentity {
         handle: String,
         kind: IdentityKind,
+        agent_config: Option<Box<AgentConfig>>,
     },
     UpdateIdentity {
         identity_id: String,
@@ -246,13 +248,17 @@ where
                             }
                         }
                     }
-                    ClientCommand::CreateIdentity { handle, kind } => {
+                    ClientCommand::CreateIdentity {
+                        handle,
+                        kind,
+                        agent_config,
+                    } => {
                         if let Some(c) = &client {
                             let req = CreateIdentityRequest {
                                 handle,
                                 kind,
                                 owner_id: None,
-                                agent_config: None,
+                                agent_config: agent_config.map(|cfg| *cfg),
                             };
                             match c.create_identity(&req).await {
                                 Ok(created) => {

@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use relaypod_client::{
     run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL,
 };
-use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent};
+use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -338,7 +338,9 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 args: None,
                 prompt: None,
                 instructions_file: None,
-                cwd: opts.cwd_override.as_deref().map(expand_tilde),
+                cwd: Some(expand_tilde(
+                opts.cwd_override.as_deref().unwrap_or(DEFAULT_AGENT_CWD),
+            )),
                 global_max_sessions: None,
                 max_sessions: None,
                 max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
@@ -413,7 +415,9 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
             args: None,
             prompt: None,
             instructions_file: default_instructions_file.clone(),
-            cwd: opts.cwd_override.as_deref().map(expand_tilde),
+            cwd: Some(expand_tilde(
+                opts.cwd_override.as_deref().unwrap_or(DEFAULT_AGENT_CWD),
+            )),
             global_max_sessions: cfg.global_max_sessions,
             max_sessions: None,
             max_consecutive_agent_turns: cfg.max_consecutive_agent_turns,
@@ -483,6 +487,14 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
 
     let base_target = target;
     let effective_target = apply_server_agent_config(&base_target, me.agent_config.as_ref());
+    if let Some(ref cwd) = effective_target.cwd {
+        let default_expanded = expand_tilde(DEFAULT_AGENT_CWD);
+        if cwd == &default_expanded {
+            if let Err(err) = std::fs::create_dir_all(cwd) {
+                warn!(cwd = %cwd, error = %err, "Failed to create default agent workspace directory");
+            }
+        }
+    }
     let initial_adapter = build_adapter(effective_target.runner);
 
     info!(
