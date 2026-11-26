@@ -883,21 +883,7 @@ pub fn insert_watcher_handle_yaml(
     Ok(out)
 }
 
-pub fn append_watcher_handle_to_config(
-    path: &Path,
-    url: &str,
-    handle: &str,
-    entry: &NewWatcherHandleEntry,
-) -> Result<()> {
-    let existing = if path.exists() {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file {}", path.display()))?
-    } else {
-        String::new()
-    };
-
-    let updated = insert_watcher_handle_yaml(&existing, url, handle, entry)?;
-
+fn write_config_atomic(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config dir {}", parent.display()))?;
@@ -921,7 +907,7 @@ pub fn append_watcher_handle_to_config(
         let mut file = opts
             .open(&tmp_path)
             .with_context(|| format!("failed to open temp config {}", tmp_path.display()))?;
-        file.write_all(updated.as_bytes())?;
+        file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
 
@@ -931,6 +917,184 @@ pub fn append_watcher_handle_to_config(
     })?;
 
     Ok(())
+}
+
+pub fn append_watcher_handle_to_config(
+    path: &Path,
+    url: &str,
+    handle: &str,
+    entry: &NewWatcherHandleEntry,
+) -> Result<()> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = insert_watcher_handle_yaml(&existing, url, handle, entry)?;
+    write_config_atomic(path, &updated)
+}
+
+/// Updates the `token:` field for an existing handle under `watcher.handles` in a YAML string.
+/// Returns `Ok(None)` if the handle is not configured in `watcher.handles`.
+pub fn update_watcher_handle_token_yaml(
+    existing: &str,
+    handle: &str,
+    new_token: &str,
+) -> Result<Option<String>> {
+    if existing.trim().is_empty() {
+        return Ok(None);
+    }
+    let parsed = parse_yaml_config(existing)?;
+    if !parsed.watcher.handles.contains_key(handle) {
+        return Ok(None);
+    }
+
+    let mut lines: Vec<String> = existing.lines().map(ToString::to_string).collect();
+
+    // Locate `watcher:` -> `handles:` -> `<handle>:` block.
+    let mut in_watcher = false;
+    let mut watcher_indent = 0usize;
+    let mut in_handles = false;
+    let mut handles_indent = 0usize;
+    let mut handle_start: Option<usize> = None;
+    let mut handle_indent_cols = 0usize;
+    let mut handle_indent_str = String::new();
+    let mut handle_end = lines.len();
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let stripped = strip_yaml_comment(raw);
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (ws, cols) = leading_whitespace(stripped);
+
+        if let Some(start) = handle_start {
+            if cols <= handle_indent_cols && idx > start {
+                handle_end = idx;
+                break;
+            }
+            continue;
+        }
+
+        if in_handles && cols <= handles_indent {
+            in_handles = false;
+        }
+        if in_watcher && cols <= watcher_indent {
+            in_watcher = false;
+        }
+
+        if !in_watcher {
+            if cols == 0 {
+                if let Some((key, _)) = split_key_value(trimmed) {
+                    if key == "watcher" {
+                        in_watcher = true;
+                        watcher_indent = cols;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !in_handles {
+            if let Some((key, _)) = split_key_value(trimmed) {
+                if key == "handles" {
+                    in_handles = true;
+                    handles_indent = cols;
+                }
+            }
+            continue;
+        }
+
+        if let Some((key, _)) = split_key_value(trimmed) {
+            if unquote_yaml(key) == handle {
+                handle_start = Some(idx);
+                handle_indent_cols = cols;
+                handle_indent_str = ws.to_string();
+            }
+        }
+    }
+
+    let start = handle_start.ok_or_else(|| {
+        anyhow!("internal error: handle '{handle}' found during parse but not during update")
+    })?;
+
+    let mut token_line_idx: Option<usize> = None;
+    let mut field_indent: Option<String> = None;
+    for (idx, raw) in lines.iter().enumerate().take(handle_end).skip(start + 1) {
+        let stripped = strip_yaml_comment(raw);
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (ws, cols) = leading_whitespace(stripped);
+        if cols > handle_indent_cols {
+            if field_indent.is_none() {
+                field_indent = Some(ws.to_string());
+            }
+            if let Some((key, _)) = split_key_value(trimmed) {
+                if key == "token" {
+                    token_line_idx = Some(idx);
+                    field_indent = Some(ws.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let indent = field_indent.unwrap_or_else(|| {
+        if handle_indent_str.contains('\t') {
+            format!("{handle_indent_str}\t")
+        } else {
+            format!("{handle_indent_str}  ")
+        }
+    });
+    let rendered = format!("{indent}token: {}", yaml_scalar(new_token));
+
+    if let Some(idx) = token_line_idx {
+        lines[idx] = rendered;
+    } else {
+        lines.insert(start + 1, rendered);
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+
+    let reparsed = parse_yaml_config(&out)
+        .context("internal error: updated config.yaml failed validation")?;
+    let stored = reparsed
+        .watcher
+        .handles
+        .get(handle)
+        .and_then(|h| h.token.as_deref());
+    if stored != Some(new_token) {
+        return Err(anyhow!(
+            "internal error: updated token for '{handle}' did not match after validation"
+        ));
+    }
+
+    Ok(Some(out))
+}
+
+/// Updates the `token:` for an existing handle in `config.yaml` if the file and handle exist.
+/// Returns `Ok(true)` if updated, `Ok(false)` if the file or handle was not present.
+pub fn update_watcher_handle_token_in_config(
+    path: &Path,
+    handle: &str,
+    new_token: &str,
+) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let Some(updated) = update_watcher_handle_token_yaml(&existing, handle, new_token)? else {
+        return Ok(false);
+    };
+    write_config_atomic(path, &updated)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1163,5 +1327,44 @@ watcher:
             &entry
         )
         .is_err());
+    }
+
+    #[test]
+    fn updates_watcher_handle_token_in_yaml() {
+        let yaml = r#"server:
+  admin_handles:
+    - alice
+
+watcher:
+  url: http://127.0.0.1:8787
+  handles:
+    claude-local:
+      runner: herdr
+      agent_type: claude
+      token: rp_old_token
+      cwd: /tmp/repo
+    codex-local:
+      runner: herdr
+      agent_type: codex
+      token: rp_other_token
+"#;
+
+        let updated = update_watcher_handle_token_yaml(yaml, "claude-local", "rp_new_token")
+            .unwrap()
+            .expect("handle exists");
+        let cfg = parse_yaml_config(&updated).unwrap();
+        assert_eq!(
+            cfg.watcher.handles["claude-local"].token.as_deref(),
+            Some("rp_new_token")
+        );
+        assert_eq!(
+            cfg.watcher.handles["codex-local"].token.as_deref(),
+            Some("rp_other_token")
+        );
+
+        // Missing handle returns Ok(None).
+        assert!(update_watcher_handle_token_yaml(yaml, "unknown-bot", "rp_x")
+            .unwrap()
+            .is_none());
     }
 }

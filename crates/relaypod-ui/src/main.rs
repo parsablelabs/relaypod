@@ -81,6 +81,8 @@ struct RelayPodApp {
     pending_delete_message: Option<Message>,
     pending_delete_channel: Option<Channel>,
     pending_delete_identity: Option<Identity>,
+    pending_regenerate_token: Option<Identity>,
+    regenerated_token: Option<CreatedIdentity>,
     channel_edit: Option<Channel>,
     identity_edit: Option<Identity>,
 
@@ -131,6 +133,8 @@ impl RelayPodApp {
             pending_delete_message: None,
             pending_delete_channel: None,
             pending_delete_identity: None,
+            pending_regenerate_token: None,
+            regenerated_token: None,
             channel_edit: None,
             identity_edit: None,
             channel_search: String::new(),
@@ -153,6 +157,17 @@ impl RelayPodApp {
             if let Some(created) = effects.identity_just_created {
                 self.last_created_identity = Some(created);
                 self.new_human_handle.clear();
+            }
+            if let Some(regenerated) = effects.token_just_regenerated {
+                if self
+                    .state
+                    .me
+                    .as_ref()
+                    .is_some_and(|me| me.id == regenerated.identity.id)
+                {
+                    self.token = regenerated.token.clone();
+                }
+                self.regenerated_token = Some(regenerated);
             }
         }
     }
@@ -203,6 +218,19 @@ impl RelayPodApp {
                 IdentityKind::Agent => identity.owner_id.as_deref() == Some(me.id.as_str()),
                 IdentityKind::Human => me.is_admin && identity.id != me.id,
             }
+        })
+    }
+
+    fn can_regenerate_token(&self, identity: &Identity) -> bool {
+        self.state.me.as_ref().is_some_and(|me| {
+            if me.kind != IdentityKind::Human {
+                return false;
+            }
+            if me.is_admin {
+                return true;
+            }
+            identity.kind == IdentityKind::Agent
+                && identity.owner_id.as_deref() == Some(me.id.as_str())
         })
     }
 
@@ -500,6 +528,66 @@ impl RelayPodApp {
             }
         }
 
+        if let Some(identity) = &self.pending_regenerate_token {
+            let mut confirm = false;
+            let mut cancel = false;
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm_regenerate_token")).show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading(format!("Regenerate token for @{}?", identity.handle));
+                    ui.label(
+                        "This immediately invalidates the current token and disconnects active \
+                         sessions using it. You will be shown the new token once.",
+                    );
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let regen = egui::Button::new(
+                            egui::RichText::new("Regenerate").color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(217, 119, 6))
+                        .corner_radius(CornerRadius::same(8));
+                        confirm = ui.add(regen).clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            if confirm {
+                self.runtime.send(ClientCommand::RegenerateIdentityToken {
+                    identity_id: identity.id.clone(),
+                });
+            }
+            if confirm || cancel || modal.should_close() {
+                self.pending_regenerate_token = None;
+            }
+        }
+
+        if let Some(regenerated) = &self.regenerated_token {
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("regenerated_token")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading(format!("New token for @{}", regenerated.identity.handle));
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        Color32::LIGHT_GREEN,
+                        "Save this token now — the previous token is no longer valid:",
+                    );
+                    if ui.small_button("Copy token").clicked() {
+                        ui.ctx().copy_text(regenerated.token.clone());
+                    }
+                });
+                let mut tok = regenerated.token.clone();
+                ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Done").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close || modal.should_close() {
+                self.regenerated_token = None;
+            }
+        }
+
         if let Some(channel) = &self.pending_delete_channel {
             let mut confirm = false;
             let mut cancel = false;
@@ -656,6 +744,8 @@ impl eframe::App for RelayPodApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Disconnect").clicked() {
                         self.last_created_identity = None;
+                        self.pending_regenerate_token = None;
+                        self.regenerated_token = None;
                         self.runtime.send(ClientCommand::Disconnect);
                     }
                     let unread_label = format!("Unread ({})", self.state.unread.len());
@@ -795,11 +885,16 @@ impl eframe::App for RelayPodApp {
                                 self.channel_composer.push_str(&format!("@{} ", id.handle));
                             }
                             let can_rename = self.can_rename_identity(id);
+                            let can_regen = self.can_regenerate_token(id);
                             let can_delete = self.can_delete_identity(id);
-                            if can_rename || can_delete {
+                            if can_rename || can_regen || can_delete {
                                 row.context_menu(|ui| {
                                     if can_rename && ui.button("Rename agent").clicked() {
                                         self.identity_edit = Some(id.clone());
+                                        ui.close_menu();
+                                    }
+                                    if can_regen && ui.button("Regenerate token").clicked() {
+                                        self.pending_regenerate_token = Some(id.clone());
                                         ui.close_menu();
                                     }
                                     if can_delete {

@@ -458,3 +458,210 @@ async fn enforces_message_delete_permissions() {
         StatusCode::NO_CONTENT
     );
 }
+
+#[tokio::test]
+async fn enforces_token_regeneration_permissions_and_invalidates_old_tokens() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let admin = store.bootstrap("admin").unwrap().unwrap();
+    let state = AppState::with_admin_handles(Arc::clone(&store), ["admin"]);
+    let app = build_router(state);
+
+    let alice: CreatedIdentity = read_body(
+        request(
+            &app,
+            &admin.token,
+            "POST",
+            "/api/identities",
+            json!({ "handle": "alice", "kind": "human" }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    let bob: CreatedIdentity = read_body(
+        request(
+            &app,
+            &admin.token,
+            "POST",
+            "/api/identities",
+            json!({ "handle": "bob", "kind": "human" }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    let alice_bot: CreatedIdentity = read_body(
+        request(
+            &app,
+            &alice.token,
+            "POST",
+            "/api/identities",
+            json!({ "handle": "alice-bot", "kind": "agent" }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // Agent cannot regenerate its own token or anyone else's.
+    assert_eq!(
+        request(
+            &app,
+            &alice_bot.token,
+            "POST",
+            &format!("/api/identities/{}/token", alice_bot.identity.id),
+            Value::Null,
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Non-owner human (bob) cannot regenerate alice's agent token.
+    assert_eq!(
+        request(
+            &app,
+            &bob.token,
+            "POST",
+            &format!("/api/identities/{}/token", alice_bot.identity.id),
+            Value::Null,
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Non-admin human cannot regenerate their own token or another human's token.
+    assert_eq!(
+        request(
+            &app,
+            &alice.token,
+            "POST",
+            &format!("/api/identities/{}/token", alice.identity.id),
+            Value::Null,
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &app,
+            &alice.token,
+            "POST",
+            &format!("/api/identities/{}/token", bob.identity.id),
+            Value::Null,
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Owner human (alice) CAN regenerate her own agent's token; old token becomes defunct.
+    let alice_bot_v2: CreatedIdentity = read_body(
+        request(
+            &app,
+            &alice.token,
+            "POST",
+            &format!("/api/identities/{}/token", alice_bot.identity.id),
+            Value::Null,
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(alice_bot_v2.identity.id, alice_bot.identity.id);
+    assert_ne!(alice_bot_v2.token, alice_bot.token);
+    assert_eq!(
+        request(&app, &alice_bot.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, &alice_bot_v2.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // Admin CAN regenerate any agent's token (including alice's agent).
+    let alice_bot_v3: CreatedIdentity = read_body(
+        request(
+            &app,
+            &admin.token,
+            "POST",
+            &format!("/api/identities/{}/token", alice_bot.identity.handle),
+            Value::Null,
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(alice_bot_v3.token, alice_bot_v2.token);
+    assert_eq!(
+        request(&app, &alice_bot_v2.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, &alice_bot_v3.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // Admin CAN regenerate any human's token (both another human and themselves).
+    let bob_v2: CreatedIdentity = read_body(
+        request(
+            &app,
+            &admin.token,
+            "POST",
+            &format!("/api/identities/{}/token", bob.identity.id),
+            Value::Null,
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(bob_v2.token, bob.token);
+    assert_eq!(
+        request(&app, &bob.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, &bob_v2.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let admin_v2: CreatedIdentity = read_body(
+        request(
+            &app,
+            &admin.token,
+            "POST",
+            &format!("/api/identities/{}/token", admin.identity.id),
+            Value::Null,
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(admin_v2.token, admin.token);
+    assert_eq!(
+        request(&app, &admin.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, &admin_v2.token, "GET", "/api/me", Value::Null)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}

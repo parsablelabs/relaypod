@@ -55,6 +55,14 @@ impl RelayPodClient {
         &self.token
     }
 
+    pub fn with_token(&self, token: impl Into<String>) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            token: token.into(),
+            http: self.http.clone(),
+        }
+    }
+
     pub fn ws_url(&self) -> String {
         let ws_base = if let Some(rest) = self.base_url.strip_prefix("https://") {
             format!("wss://{rest}")
@@ -154,6 +162,12 @@ impl RelayPodClient {
     pub async fn delete_identity(&self, identity: &str) -> Result<()> {
         let url = self.endpoint_url(&["api", "identities", identity])?;
         self.delete(url).await
+    }
+
+    pub async fn regenerate_identity_token(&self, identity: &str) -> Result<CreatedIdentity> {
+        let url = self.endpoint_url(&["api", "identities", identity, "token"])?;
+        let resp = self.http.post(url).bearer_auth(&self.token).send().await?;
+        Self::parse_json(resp).await
     }
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {

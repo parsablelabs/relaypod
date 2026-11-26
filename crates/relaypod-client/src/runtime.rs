@@ -51,6 +51,9 @@ pub enum ClientCommand {
     DeleteIdentity {
         identity_id: String,
     },
+    RegenerateIdentityToken {
+        identity_id: String,
+    },
     RefreshUnread,
     AckUnread {
         unread_id: String,
@@ -73,6 +76,7 @@ pub enum ClientEvent {
     ThreadLoaded(ThreadView),
     ChannelCreated(Channel),
     IdentityCreated(CreatedIdentity),
+    TokenRegenerated(CreatedIdentity),
     UnreadLoaded(Vec<UnreadItem>),
     Ws(WsEvent),
     WsStatus(bool),
@@ -109,6 +113,7 @@ where
         let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
         rt.block_on(async move {
             let mut client: Option<RelayPodClient> = None;
+            let mut current_me_id: Option<String> = None;
             let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
 
             let emit = |tx: &Sender<ClientEvent>, notify: &Arc<F>, ev: ClientEvent| {
@@ -128,6 +133,7 @@ where
                             Ok((me, channels, identities, unread)) => {
                                 let ws_url = new_client.ws_url();
                                 let ws_token = new_client.token().to_string();
+                                current_me_id = Some(me.id.clone());
                                 client = Some(new_client);
                                 emit(
                                     &event_tx,
@@ -153,6 +159,7 @@ where
                             handle.abort();
                         }
                         client = None;
+                        current_me_id = None;
                         emit(&event_tx, &notify, ClientEvent::Disconnected);
                     }
                     ClientCommand::LoadChannelMessages { channel_id } => {
@@ -281,6 +288,40 @@ where
                                     &notify,
                                     ClientEvent::Ws(WsEvent::IdentityDeleted { identity_id }),
                                 ),
+                                Err(e) => {
+                                    emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::RegenerateIdentityToken { identity_id } => {
+                        if let Some(c) = &client {
+                            match c.regenerate_identity_token(&identity_id).await {
+                                Ok(regenerated) => {
+                                    // If we rotated our own token, switch the active HTTP client and WS loop
+                                    // to the new token immediately so the session stays connected.
+                                    if current_me_id.as_deref()
+                                        == Some(regenerated.identity.id.as_str())
+                                    {
+                                        let updated_client = c.with_token(regenerated.token.clone());
+                                        let ws_url = updated_client.ws_url();
+                                        let ws_token = updated_client.token().to_string();
+                                        client = Some(updated_client);
+                                        if let Some(handle) = ws_task.take() {
+                                            handle.abort();
+                                        }
+                                        let tx_ws = event_tx.clone();
+                                        let notify_ws = Arc::clone(&notify);
+                                        ws_task = Some(tokio::spawn(async move {
+                                            run_ws_loop(ws_url, ws_token, tx_ws, notify_ws).await;
+                                        }));
+                                    }
+                                    emit(
+                                        &event_tx,
+                                        &notify,
+                                        ClientEvent::TokenRegenerated(regenerated),
+                                    );
+                                }
                                 Err(e) => {
                                     emit(&event_tx, &notify, ClientEvent::Error(e.to_string()));
                                 }

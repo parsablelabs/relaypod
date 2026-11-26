@@ -279,6 +279,24 @@ impl Store {
         Ok(identity)
     }
 
+    /// Generates a fresh bearer token for an active identity, immediately invalidating the old one.
+    pub fn regenerate_identity_token(&self, id_or_handle: &str) -> CoreResult<CreatedIdentity> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity = find_identity(&tx, id_or_handle)?
+            .ok_or_else(|| CoreError::NotFound(format!("identity '{id_or_handle}'")))?;
+
+        let token = generate_token();
+        let token_hash = hash_token(&token);
+        tx.execute(
+            "UPDATE identities SET token_hash = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![&identity.id, &token_hash],
+        )?;
+        tx.commit()?;
+
+        Ok(CreatedIdentity { identity, token })
+    }
+
     /// Deletes an identity:
     /// - Hard-deletes if it has no authored messages and no existing messages mentioning its handle.
     /// - Soft-deletes (revokes token, clears unread queue, hides from active listings) otherwise,
@@ -1258,6 +1276,39 @@ mod tests {
         assert!(matches!(
             store.post_message("general", &admin.identity, &long_body, None),
             Err(CoreError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn regenerates_identity_token_and_invalidates_old_token() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = store.bootstrap("alice").unwrap().unwrap();
+        let agent = store
+            .create_identity(CreateIdentityRequest {
+                handle: "claude-local".into(),
+                kind: IdentityKind::Agent,
+                owner_id: Some(admin.identity.id.clone()),
+            })
+            .unwrap();
+
+        assert!(store.authenticate(&agent.token).unwrap().is_some());
+
+        let rotated = store.regenerate_identity_token(&agent.identity.id).unwrap();
+        assert_eq!(rotated.identity.id, agent.identity.id);
+        assert_eq!(rotated.identity.handle, agent.identity.handle);
+        assert_ne!(rotated.token, agent.token);
+        assert!(rotated.token.starts_with("rp_"));
+
+        // Old token is immediately defunct; new token authenticates the same identity.
+        assert!(store.authenticate(&agent.token).unwrap().is_none());
+        let authed = store.authenticate(&rotated.token).unwrap().unwrap();
+        assert_eq!(authed.id, agent.identity.id);
+
+        // Deleted identity cannot have its token regenerated.
+        store.delete_identity(&agent.identity.id).unwrap();
+        assert!(matches!(
+            store.regenerate_identity_token(&agent.identity.id),
+            Err(CoreError::NotFound(_))
         ));
     }
 }

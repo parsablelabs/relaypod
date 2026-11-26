@@ -37,6 +37,8 @@ struct PresenceEntry {
 pub struct AppState {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<WsEvent>,
+    /// Internal signal carrying an `identity_id` whose token was rotated, so active WS sessions disconnect.
+    token_revoked: broadcast::Sender<String>,
     /// Lowercased human handles granted admin privileges via `config.yaml` (`admin_handles`).
     admin_handles: HashSet<String>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
@@ -57,6 +59,7 @@ impl AppState {
         S: Into<String>,
     {
         let (events, _) = broadcast::channel(512);
+        let (token_revoked, _) = broadcast::channel(256);
         let admin_handles = admin_handles
             .into_iter()
             .map(|h| normalize_handle(&h.into()))
@@ -65,6 +68,7 @@ impl AppState {
         Arc::new(Self {
             store,
             events,
+            token_revoked,
             admin_handles,
             presence: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
@@ -391,6 +395,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/identities/{id}",
             patch(update_identity).delete(delete_identity),
         )
+        .route("/api/identities/{id}/token", post(regenerate_identity_token))
         .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/{id}",
@@ -579,6 +584,52 @@ async fn delete_identity(
         identity_id: deleted.identity_id,
     });
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn regenerate_identity_token(
+    State(state): State<Arc<AppState>>,
+    AuthIdentity(caller): AuthIdentity,
+    Path(identity_id): Path<String>,
+) -> Result<Json<relaypod_core::CreatedIdentity>, ApiError> {
+    require_human(&caller)?;
+    let _write = state
+        .board_writes
+        .lock()
+        .expect("board write lock poisoned");
+
+    let target = state
+        .store
+        .get_identity(&identity_id)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("identity '{identity_id}' not found"),
+            )
+        })?;
+
+    match target.kind {
+        IdentityKind::Human => {
+            if !state.is_admin(&caller) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "only admin humans can regenerate tokens for human identities",
+                ));
+            }
+        }
+        IdentityKind::Agent => {
+            if !state.is_admin(&caller) && target.owner_id.as_deref() != Some(caller.id.as_str()) {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "only the human who registered this agent or an admin can regenerate its token",
+                ));
+            }
+        }
+    }
+
+    let mut regenerated = state.store.regenerate_identity_token(&target.id)?;
+    state.hydrate_identity(&mut regenerated.identity);
+    let _ = state.token_revoked.send(target.id);
+    Ok(Json(regenerated))
 }
 
 #[derive(Debug, Deserialize)]
@@ -805,6 +856,7 @@ async fn ws_handler(
 async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = state.events.subscribe();
+    let mut token_revoked_rx = state.token_revoked.subscribe();
 
     state.on_ws_connect(&identity.id);
     info!("ws connected: @{}", identity.handle);
@@ -862,6 +914,13 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
     loop {
         tokio::select! {
             _ = revoked.notified() => break,
+            revoked_id = token_revoked_rx.recv() => {
+                match revoked_id {
+                    Ok(id) if id == identity.id => break,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
             next = receiver.next() => {
                 let Some(Ok(msg)) = next else { break; };
                 match msg {

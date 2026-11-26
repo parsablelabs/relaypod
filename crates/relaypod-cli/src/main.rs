@@ -186,6 +186,18 @@ enum IdentityAction {
         /// Identity handle or ID to delete
         identity: String,
     },
+    /// Regenerate the bearer token for an identity (immediately invalidates the old token)
+    #[command(alias = "rotate-token")]
+    RegenerateToken {
+        /// Identity handle or ID
+        identity: String,
+        /// Do not update the token in ~/.relaypod/config.yaml if present
+        #[arg(long)]
+        omit_config: bool,
+        /// Path to YAML config file to update (defaults to ~/.relaypod/config.yaml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -579,6 +591,44 @@ async fn main() -> Result<()> {
                 IdentityAction::Delete { identity } => {
                     client.delete_identity(identity).await?;
                     println!("Deleted identity {identity}");
+                }
+                IdentityAction::RegenerateToken {
+                    identity,
+                    omit_config,
+                    config,
+                } => {
+                    let regenerated = client.regenerate_identity_token(identity).await?;
+                    println!(
+                        "Regenerated token for @{} ({})",
+                        regenerated.identity.handle, regenerated.identity.kind
+                    );
+                    println!("New token: {}", regenerated.token);
+                    println!("Previous token is now invalid.");
+
+                    if regenerated.identity.kind == IdentityKind::Agent && !*omit_config {
+                        let cfg_path = match config {
+                            Some(p) => Some(p.clone()),
+                            None => watch::default_config_path().ok(),
+                        };
+                        if let Some(cfg_path) = cfg_path {
+                            if watch::update_watcher_handle_token_in_config(
+                                &cfg_path,
+                                &regenerated.identity.handle,
+                                &regenerated.token,
+                            )? {
+                                println!(
+                                    "Updated token for '{}' in {} (restart 'relaypod watch' to pick it up)",
+                                    regenerated.identity.handle,
+                                    cfg_path.display()
+                                );
+                            }
+                        }
+                    }
+
+                    if regenerated.identity.kind == IdentityKind::Agent {
+                        println!("\nMCP config snippet:");
+                        println!("{}", mcp_config_snippet(&cli.url, &regenerated.token));
+                    }
                 }
             }
         }

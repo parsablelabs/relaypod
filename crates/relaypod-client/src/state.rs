@@ -9,6 +9,7 @@ pub struct StateEffects {
     pub commands: Vec<ClientCommand>,
     pub channel_just_created: bool,
     pub identity_just_created: Option<CreatedIdentity>,
+    pub token_just_regenerated: Option<CreatedIdentity>,
 }
 
 /// Tracks an identity (typically an AI agent) currently working on a response.
@@ -145,6 +146,10 @@ impl WorkspaceState {
                     self.identities.push(created.identity.clone());
                 }
                 effects.identity_just_created = Some(created);
+            }
+            ClientEvent::TokenRegenerated(regenerated) => {
+                self.status_error = None;
+                effects.token_just_regenerated = Some(regenerated);
             }
             ClientEvent::UnreadLoaded(items) => {
                 self.unread = items

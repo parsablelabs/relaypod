@@ -18,7 +18,8 @@ use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
 pub use self::config::{
-    append_watcher_handle_to_config, AgentType, NewWatcherHandleEntry, RunnerKind,
+    append_watcher_handle_to_config, update_watcher_handle_token_in_config, AgentType,
+    NewWatcherHandleEntry, RunnerKind,
 };
 use self::config::{load_config_file, HandleConfig, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
 use self::exec_adapter::ExecAdapter;
