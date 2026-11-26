@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use relaypod_client::{mcp_config_snippet, RelayPodClient};
 use relaypod_core::{
-    CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store, UpdateChannelRequest,
-    UpdateIdentityRequest,
+    AgentConfig, CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store,
+    UpdateChannelRequest, UpdateIdentityRequest,
 };
 use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
@@ -14,7 +14,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "relaypod", version, about = "Shared message board for humans and AI agents")]
+#[command(
+    name = "relaypod",
+    version,
+    about = "Shared message board for humans and AI agents"
+)]
 struct Cli {
     /// RelayPod server URL
     #[arg(long, env = "RELAYPOD_URL", default_value = "http://127.0.0.1:8787")]
@@ -138,21 +142,21 @@ struct IdentityCreateArgs {
     /// Agent harness type (e.g. 'claude', 'codex', 'gemini', 'agy', 'opencode', 'cursor', 'pi', or 'custom')
     #[arg(long, alias = "harness")]
     agent_type: Option<String>,
+    /// Short agent role/capability description (stored in DB for routing/display)
+    #[arg(long)]
+    description: Option<String>,
     /// Custom shell command when using --runner exec without --agent-type
     #[arg(long)]
     exec: Option<String>,
-    /// Working directory for the agent (defaults to current directory)
+    /// Working directory for the agent (defaults to ~/.relaypod/workspace)
     #[arg(long)]
     cwd: Option<String>,
-    /// Extra CLI flags forwarded to the agent
+    /// Extra CLI flags forwarded to the agent (stored in DB and applied on new sessions)
     #[arg(long)]
     args: Option<String>,
-    /// Target Herdr session name (for --runner herdr)
+    /// Optional per-handle custom prompt template
     #[arg(long)]
-    herdr_session: Option<String>,
-    /// Target Herdr workspace label or ID (for --runner herdr)
-    #[arg(long)]
-    herdr_workspace: Option<String>,
+    prompt: Option<String>,
     /// Optional per-handle instructions file path
     #[arg(long)]
     instructions_file: Option<String>,
@@ -165,6 +169,54 @@ struct IdentityCreateArgs {
     /// Do not drain existing unacked items on startup/reconnect
     #[arg(long)]
     no_drain: bool,
+    /// Optional pause in seconds after each dispatch before handling the next unread item
+    #[arg(long)]
+    cooldown_secs: Option<u64>,
+}
+
+#[derive(Args)]
+struct IdentityUpdateArgs {
+    /// Current agent handle or ID
+    identity: String,
+    /// New handle for the agent
+    #[arg(long)]
+    handle: Option<String>,
+    /// Runner: 'herdr' or 'exec'; pass "" to clear
+    #[arg(long)]
+    runner: Option<String>,
+    /// Harness type (e.g. 'claude', 'codex', 'gemini', 'agy', 'pi'); pass "" to clear
+    #[arg(long, alias = "agent-type")]
+    harness: Option<String>,
+    /// Extra CLI flags forwarded to the harness on new sessions; pass "" to clear
+    #[arg(long)]
+    args: Option<String>,
+    /// Custom shell command for --runner exec; pass "" to clear
+    #[arg(long)]
+    exec: Option<String>,
+    /// Working directory for the agent; pass "" to clear
+    #[arg(long)]
+    cwd: Option<String>,
+    /// Custom prompt template; pass "" to clear
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Instructions file path; pass "" to clear
+    #[arg(long)]
+    instructions_file: Option<String>,
+    /// Max concurrent sessions (0 to clear)
+    #[arg(long)]
+    max_sessions: Option<usize>,
+    /// Automatically ack unread items on exit 0
+    #[arg(long)]
+    auto_ack: Option<bool>,
+    /// Drain existing unacked items on startup/reconnect
+    #[arg(long)]
+    drain_on_start: Option<bool>,
+    /// Pause in seconds after each dispatch (0 for none)
+    #[arg(long)]
+    cooldown_secs: Option<u64>,
+    /// Short role/capability description; pass "" to clear
+    #[arg(long)]
+    description: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -172,7 +224,7 @@ enum IdentityAction {
     /// List all active human and agent identities
     List,
     /// Register a new human (admin only) or agent identity.
-    /// For agents, automatically adds a watcher entry to ~/.relaypod/config.yaml unless --omit-config is passed.
+    /// For agents, stores agent config in the server DB and writes only the token to ~/.relaypod/config.yaml unless --omit-config is passed.
     Create(Box<IdentityCreateArgs>),
     /// Rename an agent identity you registered
     Rename {
@@ -181,6 +233,8 @@ enum IdentityAction {
         /// New handle for the agent
         handle: String,
     },
+    /// Update an agent identity's handle and/or DB-backed config
+    Update(Box<IdentityUpdateArgs>),
     /// Delete an agent identity you registered (or a human identity, if admin)
     Delete {
         /// Identity handle or ID to delete
@@ -248,9 +302,10 @@ enum ChannelAction {
 }
 
 fn require_client(cli: &Cli) -> Result<RelayPodClient> {
-    let token = cli.token.clone().ok_or_else(|| {
-        anyhow!("RELAYPOD_TOKEN (or --token) is required for this command")
-    })?;
+    let token = cli
+        .token
+        .clone()
+        .ok_or_else(|| anyhow!("RELAYPOD_TOKEN (or --token) is required for this command"))?;
     Ok(RelayPodClient::new(cli.url.clone(), token))
 }
 
@@ -373,9 +428,26 @@ async fn main() -> Result<()> {
                         } else {
                             "offline"
                         };
+                        let mut details = Vec::new();
+                        if let Some(ref cfg) = id.agent_config {
+                            if let Some(ref r) = cfg.runner {
+                                details.push(format!("runner={r}"));
+                            }
+                            if let Some(ref h) = cfg.harness {
+                                details.push(format!("harness={h}"));
+                            }
+                            if let Some(ref a) = cfg.args {
+                                details.push(format!("args={a}"));
+                            }
+                        }
+                        let detail_suffix = if details.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {{{}}}", details.join(", "))
+                        };
                         println!(
-                            "@{} [{}]{} ({}) unread={}",
-                            id.handle, id.kind, admin_tag, status, id.unread_count
+                            "@{} [{}]{} ({}) unread={}{}",
+                            id.handle, id.kind, admin_tag, status, id.unread_count, detail_suffix
                         );
                     }
                 }
@@ -387,19 +459,18 @@ async fn main() -> Result<()> {
                         config,
                         runner,
                         agent_type,
+                        description,
                         exec,
                         cwd,
                         args,
-                        herdr_session,
-                        herdr_workspace,
+                        prompt,
                         instructions_file,
                         max_sessions,
                         auto_ack,
                         no_drain,
+                        cooldown_secs,
                     } = create_args.as_ref();
-                    let parsed_kind = kind
-                        .parse::<IdentityKind>()
-                        .map_err(|e| anyhow!(e))?;
+                    let parsed_kind = kind.parse::<IdentityKind>().map_err(|e| anyhow!(e))?;
 
                     // Validate/prompt watcher config inputs before creating the remote identity so
                     // we never leave an orphaned agent if flags are missing/invalid.
@@ -460,7 +531,10 @@ async fn main() -> Result<()> {
                                             (Some(at), resolved_exec)
                                         }
                                         watch::AgentType::Other(ref other)
-                                            if matches!(other.as_str(), "gemini" | "agy" | "pi") =>
+                                            if matches!(
+                                                other.as_str(),
+                                                "gemini" | "agy" | "pi"
+                                            ) =>
                                         {
                                             (Some(at), resolved_exec)
                                         }
@@ -503,12 +577,10 @@ async fn main() -> Result<()> {
                             },
                         };
 
-                        let resolved_cwd = match cwd {
-                            Some(c) => Some(c.clone()),
-                            None => std::env::current_dir()
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string()),
-                        };
+                        let resolved_cwd = Some(
+                            cwd.clone()
+                                .unwrap_or_else(|| relaypod_core::DEFAULT_AGENT_CWD.to_string()),
+                        );
                         let cfg_path = match config {
                             Some(p) => p.clone(),
                             None => watch::default_config_path()?,
@@ -524,11 +596,62 @@ async fn main() -> Result<()> {
                         None
                     };
 
+                    let (db_runner, db_harness, db_exec, db_cwd) = if let Some((
+                        _,
+                        parsed_runner,
+                        ref parsed_at,
+                        ref final_exec,
+                        ref resolved_cwd,
+                    )) = watcher_plan
+                    {
+                        let r = match parsed_runner {
+                            watch::RunnerKind::Herdr => "herdr",
+                            watch::RunnerKind::Exec => "exec",
+                        };
+                        (
+                            Some(r.to_string()),
+                            parsed_at.as_ref().map(|t| t.as_herdr_kind().to_string()),
+                            final_exec.clone(),
+                            resolved_cwd.clone(),
+                        )
+                    } else {
+                        (
+                            Some(runner.clone()),
+                            agent_type.clone(),
+                            exec.clone(),
+                            cwd.clone(),
+                        )
+                    };
+                    let agent_config = if parsed_kind == IdentityKind::Agent {
+                        let cfg = AgentConfig {
+                            runner: db_runner,
+                            harness: db_harness,
+                            args: args.clone(),
+                            exec: db_exec,
+                            cwd: db_cwd,
+                            prompt: prompt.clone(),
+                            instructions_file: instructions_file.clone(),
+                            max_sessions: *max_sessions,
+                            auto_ack: Some(*auto_ack),
+                            drain_on_start: Some(!*no_drain),
+                            cooldown_secs: *cooldown_secs,
+                            description: description.clone(),
+                        };
+                        if cfg.is_empty() {
+                            None
+                        } else {
+                            Some(cfg)
+                        }
+                    } else {
+                        None
+                    };
+
                     let created = client
                         .create_identity(&CreateIdentityRequest {
                             handle: handle.clone(),
                             kind: parsed_kind,
                             owner_id: None,
+                            agent_config,
                         })
                         .await?;
                     println!(
@@ -536,37 +659,21 @@ async fn main() -> Result<()> {
                         created.identity.handle, created.identity.kind
                     );
                     println!("Token: {}", created.token);
+                    if let Some(ref cfg) = created.identity.agent_config {
+                        if let Some(ref saved_args) = cfg.args {
+                            println!("Args: {saved_args}");
+                        }
+                    }
 
-                    if let Some((
-                        cfg_path,
-                        parsed_runner,
-                        parsed_agent_type,
-                        final_exec,
-                        resolved_cwd,
-                    )) = watcher_plan
-                    {
-                        let entry = watch::NewWatcherHandleEntry {
-                            runner: parsed_runner,
-                            agent_type: parsed_agent_type,
-                            token: created.token.clone(),
-                            exec: final_exec,
-                            args: args.clone(),
-                            cwd: resolved_cwd,
-                            herdr_session: herdr_session.clone(),
-                            herdr_workspace: herdr_workspace.clone(),
-                            instructions_file: instructions_file.clone(),
-                            max_sessions: *max_sessions,
-                            auto_ack: *auto_ack,
-                            drain_on_start: !*no_drain,
-                        };
-                        watch::append_watcher_handle_to_config(
+                    if let Some((cfg_path, _, _, _, _)) = watcher_plan {
+                        watch::append_watcher_token_to_config(
                             &cfg_path,
                             &cli.url,
                             &created.identity.handle,
-                            &entry,
+                            &created.token,
                         )?;
                         println!(
-                            "Added watcher handle '{}' to {}",
+                            "Added token '{}' to watcher.agent_tokens in {}",
                             created.identity.handle,
                             cfg_path.display()
                         );
@@ -583,10 +690,92 @@ async fn main() -> Result<()> {
                             identity,
                             &UpdateIdentityRequest {
                                 handle: Some(handle.clone()),
+                                agent_config: None,
                             },
                         )
                         .await?;
                     println!("Renamed identity {} to @{}", updated.id, updated.handle);
+                }
+                IdentityAction::Update(update_args) => {
+                    let IdentityUpdateArgs {
+                        identity,
+                        handle,
+                        runner,
+                        harness,
+                        args,
+                        exec,
+                        cwd,
+                        prompt,
+                        instructions_file,
+                        max_sessions,
+                        auto_ack,
+                        drain_on_start,
+                        cooldown_secs,
+                        description,
+                    } = update_args.as_ref();
+                    let has_config_change = runner.is_some()
+                        || harness.is_some()
+                        || args.is_some()
+                        || exec.is_some()
+                        || cwd.is_some()
+                        || prompt.is_some()
+                        || instructions_file.is_some()
+                        || max_sessions.is_some()
+                        || auto_ack.is_some()
+                        || drain_on_start.is_some()
+                        || cooldown_secs.is_some()
+                        || description.is_some();
+                    if handle.is_none() && !has_config_change {
+                        return Err(anyhow!(
+                            "specify at least one field to update (e.g. --handle, --runner, --harness, --args, --cooldown-secs, --description)"
+                        ));
+                    }
+
+                    let agent_config = if has_config_change {
+                        let all = client.list_identities().await?;
+                        let normalized = identity.trim().trim_start_matches('@').to_lowercase();
+                        let existing = all
+                            .into_iter()
+                            .find(|i| i.id == *identity || i.handle.to_lowercase() == normalized)
+                            .and_then(|i| i.agent_config)
+                            .unwrap_or_default();
+                        Some(AgentConfig {
+                            runner: runner.clone().or(existing.runner),
+                            harness: harness.clone().or(existing.harness),
+                            args: args.clone().or(existing.args),
+                            exec: exec.clone().or(existing.exec),
+                            cwd: cwd.clone().or(existing.cwd),
+                            prompt: prompt.clone().or(existing.prompt),
+                            instructions_file: instructions_file
+                                .clone()
+                                .or(existing.instructions_file),
+                            max_sessions: match max_sessions {
+                                Some(0) => None,
+                                Some(n) => Some(*n),
+                                None => existing.max_sessions,
+                            },
+                            auto_ack: auto_ack.or(existing.auto_ack),
+                            drain_on_start: drain_on_start.or(existing.drain_on_start),
+                            cooldown_secs: cooldown_secs.or(existing.cooldown_secs),
+                            description: description.clone().or(existing.description),
+                        })
+                    } else {
+                        None
+                    };
+
+                    let updated = client
+                        .update_identity(
+                            identity,
+                            &UpdateIdentityRequest {
+                                handle: handle.clone(),
+                                agent_config,
+                            },
+                        )
+                        .await?;
+                    println!("Updated @{} ({})", updated.handle, updated.id);
+                    if let Some(ref cfg) = updated.agent_config {
+                        println!("{}", serde_json::to_string_pretty(cfg)?);
+                    }
                 }
                 IdentityAction::Delete { identity } => {
                     client.delete_identity(identity).await?;
@@ -611,13 +800,13 @@ async fn main() -> Result<()> {
                             None => watch::default_config_path().ok(),
                         };
                         if let Some(cfg_path) = cfg_path {
-                            if watch::update_watcher_handle_token_in_config(
+                            if watch::update_watcher_token_in_config(
                                 &cfg_path,
                                 &regenerated.identity.handle,
                                 &regenerated.token,
                             )? {
                                 println!(
-                                    "Updated token for '{}' in {} (restart 'relaypod watch' to pick it up)",
+                                    "Updated token '{}' in {} (restart 'relaypod watch' to pick it up)",
                                     regenerated.identity.handle,
                                     cfg_path.display()
                                 );
@@ -712,7 +901,10 @@ async fn main() -> Result<()> {
                 } else {
                     String::new()
                 };
-                println!("[{}] @{}: {}{}", msg.id, msg.author_handle, msg.body, replies);
+                println!(
+                    "[{}] @{}: {}{}",
+                    msg.id, msg.author_handle, msg.body, replies
+                );
             }
         }
         Commands::Thread { message_id } => {

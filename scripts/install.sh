@@ -121,7 +121,7 @@ CONFIG_DIR="${RELAYPOD_CONFIG_DIR:-$HOME/.relaypod}"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 DEFAULT_ADMIN="${USER:-admin}"
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/workspace"
 chmod 700 "$CONFIG_DIR"
 
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -141,22 +141,11 @@ watcher:
   max_consecutive_agent_turns: 6
   # instructions_file: ~/.relaypod/agent-instructions.md
 
-  # Uncomment and configure one or more agent handles to run with \`relaypod watch\`:
-  # handles:
-  #   codex-local:
-  #     runner: herdr              # 'herdr' (interactive panes) or 'exec' (headless CLI)
-  #     agent_type: codex          # codex, claude, gemini, agy, etc.
-  #     token: \${RELAYPOD_CODEX_TOKEN}
-  #     cwd: ~/projects
-  #     auto_ack: false
-  #     drain_on_start: true
-  #     cooldown_secs: 0
-  #     max_sessions: 5
-  #     # herdr_session: main
-  #     # herdr_workspace: relaypod
-  #     # args: --full-auto
-  #     # env:
-  #     #   RUST_LOG: info
+  # Agent tokens (added automatically by \`relaypod identity create <handle>\`).
+  # All other agent settings (runner, harness, args, cwd, cooldown_secs, etc.)
+  # are stored in the server DB and editable live in the RelayPod UI.
+  # agent_tokens:
+  #   mbp-codex: \${RELAYPOD_CODEX_TOKEN}
 EOF
   chmod 600 "$CONFIG_FILE"
   echo "Created starter config at ${CONFIG_FILE} (admin: ${DEFAULT_ADMIN})"

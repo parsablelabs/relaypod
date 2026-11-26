@@ -2,16 +2,19 @@ use crate::auth::{
     extract_mentions, generate_token, hash_token, normalize_channel_name, normalize_handle,
 };
 use crate::models::{
-    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, DeletedChannel,
-    DeletedIdentity, DeletedMessage, Identity, IdentityKind, Message, MessageDeleteInfo,
-    PostMessageResult, ThreadView, UnreadItem, UnreadReason, UpdateChannelRequest,
-    UpdateIdentityRequest,
+    AgentConfig, Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity,
+    DeletedChannel, DeletedIdentity, DeletedMessage, Identity, IdentityKind, Message,
+    MessageDeleteInfo, PostMessageResult, ThreadView, UnreadItem, UnreadReason,
+    UpdateChannelRequest, UpdateIdentityRequest,
 };
 
 pub const MAX_HANDLE_LEN: usize = 64;
 pub const MAX_CHANNEL_NAME_LEN: usize = 64;
 pub const MAX_CHANNEL_DESCRIPTION_LEN: usize = 500;
 pub const MAX_MESSAGE_BODY_LEN: usize = 65_536;
+pub const MAX_AGENT_FIELD_LEN: usize = 256;
+pub const MAX_AGENT_ARGS_LEN: usize = 2048;
+pub const MAX_AGENT_DESCRIPTION_LEN: usize = 500;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -83,7 +86,8 @@ impl Store {
                 owner_id TEXT NULL REFERENCES identities(id),
                 token_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                deleted_at INTEGER NULL
+                deleted_at INTEGER NULL,
+                agent_config TEXT NULL
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_token_hash
@@ -151,6 +155,7 @@ impl Store {
                 handle: admin_handle.to_string(),
                 kind: IdentityKind::Human,
                 owner_id: None,
+                agent_config: None,
             })?;
             Ok(Some(created))
         } else {
@@ -160,6 +165,11 @@ impl Store {
 
     pub fn create_identity(&self, req: CreateIdentityRequest) -> CoreResult<CreatedIdentity> {
         let handle = validate_handle(&req.handle)?;
+        let agent_config = match req.kind {
+            IdentityKind::Agent => normalize_agent_config(req.agent_config)?,
+            IdentityKind::Human => None,
+        };
+        let agent_config_json = serialize_agent_config(&agent_config)?;
 
         let id = new_id();
         let token = generate_token();
@@ -168,15 +178,16 @@ impl Store {
 
         let conn = self.conn.lock().expect("store lock poisoned");
         let res = conn.execute(
-            "INSERT INTO identities (id, handle, kind, owner_id, token_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO identities (id, handle, kind, owner_id, token_hash, created_at, agent_config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
                 handle,
                 req.kind.to_string(),
                 req.owner_id,
                 token_hash,
-                created_at
+                created_at,
+                agent_config_json
             ],
         );
 
@@ -192,6 +203,7 @@ impl Store {
                     online: false,
                     busy: false,
                     is_admin: false,
+                    agent_config,
                 },
                 token,
             }),
@@ -211,7 +223,8 @@ impl Store {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
-                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
+                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL),
+                    i.agent_config
              FROM identities i
              WHERE i.token_hash = ?1 AND i.deleted_at IS NULL",
         )?;
@@ -225,7 +238,8 @@ impl Store {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
-                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
+                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL),
+                    i.agent_config
              FROM identities i
              WHERE i.deleted_at IS NULL
              ORDER BY i.kind ASC, i.handle ASC",
@@ -256,10 +270,17 @@ impl Store {
         if let Some(raw_handle) = request.handle {
             identity.handle = validate_handle(&raw_handle)?;
         }
+        if let Some(raw_config) = request.agent_config {
+            identity.agent_config = match identity.kind {
+                IdentityKind::Agent => normalize_agent_config(Some(raw_config))?,
+                IdentityKind::Human => None,
+            };
+        }
+        let agent_config_json = serialize_agent_config(&identity.agent_config)?;
 
         let res = tx.execute(
-            "UPDATE identities SET handle = ?2 WHERE id = ?1",
-            params![identity.id, identity.handle],
+            "UPDATE identities SET handle = ?2, agent_config = ?3 WHERE id = ?1",
+            params![identity.id, identity.handle, agent_config_json],
         );
         match res {
             Err(rusqlite::Error::SqliteFailure(err, _))
@@ -323,7 +344,10 @@ impl Store {
             let mut mentioned = false;
             for body in bodies {
                 let body = body?;
-                if extract_mentions(&body).iter().any(|h| h == &identity.handle) {
+                if extract_mentions(&body)
+                    .iter()
+                    .any(|h| h == &identity.handle)
+                {
                     mentioned = true;
                     break;
                 }
@@ -345,7 +369,10 @@ impl Store {
                 "UPDATE identities SET owner_id = NULL WHERE owner_id = ?1",
                 params![&identity.id],
             )?;
-            tx.execute("DELETE FROM identities WHERE id = ?1", params![&identity.id])?;
+            tx.execute(
+                "DELETE FROM identities WHERE id = ?1",
+                params![&identity.id],
+            )?;
         } else {
             let deleted_at = now_ms();
             let revoked_hash = format!("revoked:{}:{deleted_at}", identity.id);
@@ -507,7 +534,9 @@ impl Store {
     ) -> CoreResult<PostMessageResult> {
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            return Err(CoreError::InvalidInput("message body cannot be empty".into()));
+            return Err(CoreError::InvalidInput(
+                "message body cannot be empty".into(),
+            ));
         }
         if trimmed.len() > MAX_MESSAGE_BODY_LEN {
             return Err(CoreError::InvalidInput(format!(
@@ -529,8 +558,8 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let (parent_channel_id, grandparent_id) = parent_row
-                .ok_or_else(|| CoreError::NotFound(format!("parent message '{pid}'")))?;
+            let (parent_channel_id, grandparent_id) =
+                parent_row.ok_or_else(|| CoreError::NotFound(format!("parent message '{pid}'")))?;
             if parent_channel_id != channel.id {
                 return Err(CoreError::InvalidInput(
                     "parent message belongs to a different channel".into(),
@@ -774,7 +803,10 @@ impl Store {
     }
 
     /// Returns author metadata for a message, used to authorize message deletion.
-    pub fn get_message_delete_info(&self, message_id: &str) -> CoreResult<Option<MessageDeleteInfo>> {
+    pub fn get_message_delete_info(
+        &self,
+        message_id: &str,
+    ) -> CoreResult<Option<MessageDeleteInfo>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         Ok(conn
             .query_row(
@@ -785,7 +817,9 @@ impl Store {
                 params![message_id],
                 |r| {
                     let kind_str: String = r.get(3)?;
-                    let author_kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+                    let author_kind = kind_str
+                        .parse::<IdentityKind>()
+                        .unwrap_or(IdentityKind::Agent);
                     Ok(MessageDeleteInfo {
                         message_id: r.get(0)?,
                         parent_id: r.get(1)?,
@@ -894,12 +928,91 @@ fn validate_channel_description(desc: &str) -> CoreResult<()> {
     Ok(())
 }
 
+fn normalize_optional_text(
+    raw: Option<String>,
+    max_len: usize,
+    field_name: &str,
+) -> CoreResult<Option<String>> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_len {
+        return Err(CoreError::InvalidInput(format!(
+            "{field_name} exceeds maximum length of {max_len} characters"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_agent_config(raw: Option<AgentConfig>) -> CoreResult<Option<AgentConfig>> {
+    let Some(cfg) = raw else {
+        return Ok(None);
+    };
+    let runner = match normalize_optional_text(cfg.runner, MAX_AGENT_FIELD_LEN, "agent runner")? {
+        Some(r) => {
+            let lower = r.to_lowercase();
+            match lower.as_str() {
+                "herdr" | "exec" => Some(lower),
+                "direct" => Some("exec".to_string()),
+                _ => {
+                    return Err(CoreError::InvalidInput(format!(
+                        "invalid agent runner '{r}' (expected 'herdr' or 'exec')"
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+    let normalized = AgentConfig {
+        runner,
+        harness: normalize_optional_text(cfg.harness, MAX_AGENT_FIELD_LEN, "agent harness")?
+            .map(|h| h.to_lowercase()),
+        args: normalize_optional_text(cfg.args, MAX_AGENT_ARGS_LEN, "agent args")?,
+        exec: normalize_optional_text(cfg.exec, MAX_AGENT_ARGS_LEN, "agent exec")?,
+        cwd: normalize_optional_text(cfg.cwd, MAX_AGENT_ARGS_LEN, "agent cwd")?,
+        prompt: normalize_optional_text(cfg.prompt, MAX_MESSAGE_BODY_LEN, "agent prompt")?,
+        instructions_file: normalize_optional_text(
+            cfg.instructions_file,
+            MAX_AGENT_ARGS_LEN,
+            "agent instructions_file",
+        )?,
+        max_sessions: cfg.max_sessions.filter(|&n| n > 0),
+        auto_ack: cfg.auto_ack,
+        drain_on_start: cfg.drain_on_start,
+        cooldown_secs: cfg.cooldown_secs,
+        description: normalize_optional_text(
+            cfg.description,
+            MAX_AGENT_DESCRIPTION_LEN,
+            "agent description",
+        )?,
+    };
+    if normalized.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
+    }
+}
+
+fn serialize_agent_config(cfg: &Option<AgentConfig>) -> CoreResult<Option<String>> {
+    match cfg {
+        Some(c) if !c.is_empty() => serde_json::to_string(c)
+            .map(Some)
+            .map_err(|e| CoreError::InvalidInput(format!("invalid agent_config: {e}"))),
+        _ => Ok(None),
+    }
+}
+
 fn find_identity(conn: &Connection, id_or_handle: &str) -> CoreResult<Option<Identity>> {
     let normalized = normalize_handle(id_or_handle);
     Ok(conn
         .query_row(
             "SELECT i.id, i.handle, i.kind, i.owner_id, i.created_at,
-                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL)
+                    (SELECT COUNT(*) FROM unread_items u WHERE u.identity_id = i.id AND u.acked_at IS NULL),
+                    i.agent_config
              FROM identities i
              WHERE (i.id = ?1 OR i.handle = ?2) AND i.deleted_at IS NULL
              ORDER BY (i.id = ?1) DESC
@@ -939,7 +1052,14 @@ fn ensure_channel_writable(channel: &Channel) -> CoreResult<()> {
 
 fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
     let kind_str: String = row.get(2)?;
-    let kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+    let kind = kind_str
+        .parse::<IdentityKind>()
+        .unwrap_or(IdentityKind::Agent);
+    let agent_config_raw: Option<String> = row.get(6)?;
+    let agent_config = agent_config_raw
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<AgentConfig>(json).ok())
+        .filter(|c| !c.is_empty());
     Ok(Identity {
         id: row.get(0)?,
         handle: row.get(1)?,
@@ -950,6 +1070,7 @@ fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
         online: false,
         busy: false,
         is_admin: false,
+        agent_config,
     })
 }
 
@@ -968,7 +1089,9 @@ fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let kind_str: String = row.get(5)?;
-    let author_kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+    let author_kind = kind_str
+        .parse::<IdentityKind>()
+        .unwrap_or(IdentityKind::Agent);
     Ok(Message {
         id: row.get(0)?,
         channel_id: row.get(1)?,
@@ -1105,6 +1228,7 @@ mod tests {
                 handle: "bot".into(),
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
+                agent_config: None,
             })
             .unwrap();
         let channel = store.get_channel("general").unwrap().unwrap();
@@ -1160,12 +1284,18 @@ mod tests {
                 handle: "claude-local".into(),
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
+                agent_config: None,
             })
             .unwrap();
 
         // Human mentions agent in #general
         let post = store
-            .post_message("general", &admin.identity, "@claude-local please check auth", None)
+            .post_message(
+                "general",
+                &admin.identity,
+                "@claude-local please check auth",
+                None,
+            )
             .unwrap();
         assert_eq!(post.created_unread.len(), 1);
         assert_eq!(post.created_unread[0].identity_id, agent.identity.id);
@@ -1229,7 +1359,10 @@ mod tests {
         let deleted = store.delete_message(&post.message.id).unwrap();
         assert_eq!(deleted.message_id, post.message.id);
         assert_eq!(deleted.affected_unread.len(), 2);
-        assert!(store.list_channel_messages("general", 20).unwrap().is_empty());
+        assert!(store
+            .list_channel_messages("general", 20)
+            .unwrap()
+            .is_empty());
         assert!(store.list_unread(&admin.identity.id).unwrap().is_empty());
     }
 
@@ -1244,6 +1377,7 @@ mod tests {
                 handle: long_handle,
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
+                agent_config: None,
             }),
             Err(CoreError::InvalidInput(_))
         ));
@@ -1288,6 +1422,7 @@ mod tests {
                 handle: "claude-local".into(),
                 kind: IdentityKind::Agent,
                 owner_id: Some(admin.identity.id.clone()),
+                agent_config: None,
             })
             .unwrap();
 
@@ -1310,5 +1445,58 @@ mod tests {
             store.regenerate_identity_token(&agent.identity.id),
             Err(CoreError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn persists_and_updates_agent_config_json() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = store.bootstrap("alice").unwrap().unwrap();
+        let agent = store
+            .create_identity(CreateIdentityRequest {
+                handle: "codex-high".into(),
+                kind: IdentityKind::Agent,
+                owner_id: Some(admin.identity.id.clone()),
+                agent_config: Some(AgentConfig {
+                    runner: Some("herdr".into()),
+                    harness: Some("Codex".into()),
+                    args: Some("-m o3 -c model_reasoning_effort=high".into()),
+                    cooldown_secs: Some(5),
+                    description: Some("Deep architecture review".into()),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+
+        let cfg = agent.identity.agent_config.as_ref().expect("agent_config");
+        assert_eq!(cfg.harness.as_deref(), Some("codex"));
+        assert_eq!(
+            cfg.args.as_deref(),
+            Some("-m o3 -c model_reasoning_effort=high")
+        );
+        assert_eq!(cfg.cooldown_secs, Some(5));
+
+        // Re-reading via authenticate and list_identities preserves JSON config.
+        let authed = store.authenticate(&agent.token).unwrap().unwrap();
+        assert_eq!(authed.agent_config, agent.identity.agent_config);
+
+        // Updating agent_config replaces the JSON payload; empty strings clear fields.
+        let updated = store
+            .update_identity(
+                &agent.identity.id,
+                UpdateIdentityRequest {
+                    handle: None,
+                    agent_config: Some(AgentConfig {
+                        harness: Some("claude".into()),
+                        args: Some("--model claude-opus-4-6".into()),
+                        description: Some("".into()),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .unwrap();
+        let updated_cfg = updated.agent_config.as_ref().expect("updated config");
+        assert_eq!(updated_cfg.harness.as_deref(), Some("claude"));
+        assert_eq!(updated_cfg.args.as_deref(), Some("--model claude-opus-4-6"));
+        assert_eq!(updated_cfg.description, None);
     }
 }

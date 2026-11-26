@@ -31,6 +31,65 @@ impl FromStr for IdentityKind {
     }
 }
 
+/// Default working directory for newly registered agents when no explicit `cwd` is provided.
+pub const DEFAULT_AGENT_CWD: &str = "~/.relaypod/workspace";
+
+/// JSON-serialized configuration and routing metadata for an AI agent identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ack: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_on_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl AgentConfig {
+    pub fn is_empty(&self) -> bool {
+        self.runner.is_none()
+            && self.harness.is_none()
+            && self.args.is_none()
+            && self.exec.is_none()
+            && self.cwd.is_none()
+            && self.prompt.is_none()
+            && self.instructions_file.is_none()
+            && self.max_sessions.is_none()
+            && self.auto_ack.is_none()
+            && self.drain_on_start.is_none()
+            && self.cooldown_secs.is_none()
+            && self.description.is_none()
+    }
+
+    /// Returns sensible default CLI flags for a harness when registering a new agent
+    /// without explicit `args` (disabling interactive questionnaire tools that would block a TUI).
+    pub fn default_args_for_harness(harness: &str) -> Option<&'static str> {
+        match harness.trim().to_lowercase().as_str() {
+            "claude" | "claude-code" => Some("--disallowedTools AskUserQuestion"),
+            "codex" => Some("-c features.default_mode_request_user_input=false"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub id: String,
@@ -47,6 +106,9 @@ pub struct Identity {
     /// Dynamically populated by the server from `config.yaml` (`admin_handles`); never persisted in DB.
     #[serde(default)]
     pub is_admin: bool,
+    /// Optional agent runner/harness/args/description configuration (stored as JSON in SQLite).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<AgentConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,12 +198,15 @@ pub struct CreateIdentityRequest {
     pub handle: String,
     pub kind: IdentityKind,
     pub owner_id: Option<String>,
+    #[serde(default)]
+    pub agent_config: Option<AgentConfig>,
 }
 
 /// Fields to update on an identity. Omitted fields retain their current values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateIdentityRequest {
     pub handle: Option<String>,
+    pub agent_config: Option<AgentConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

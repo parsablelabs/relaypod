@@ -196,7 +196,8 @@ async fn run_managed_agent(
                         session_id = %sid,
                         "Captured agent session ID for thread"
                     );
-                    ctx.sessions.set(ctx.identity_id, ctx.thread_id, sid.clone());
+                    ctx.sessions
+                        .set(ctx.identity_id, ctx.thread_id, sid.clone());
                     captured_session = Some(sid);
                 }
             }

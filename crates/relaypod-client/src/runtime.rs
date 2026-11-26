@@ -1,8 +1,9 @@
 use crate::http::RelayPodClient;
 use crate::ws::{run_live_ws_loop, DEFAULT_PING_INTERVAL};
 use relaypod_core::{
-    Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity, IdentityKind,
-    Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest, WsEvent,
+    AgentConfig, Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity,
+    IdentityKind, Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest,
+    WsEvent,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -43,10 +44,11 @@ pub enum ClientCommand {
     CreateIdentity {
         handle: String,
         kind: IdentityKind,
+        agent_config: Option<Box<AgentConfig>>,
     },
     UpdateIdentity {
         identity_id: String,
-        request: UpdateIdentityRequest,
+        request: Box<UpdateIdentityRequest>,
     },
     DeleteIdentity {
         identity_id: String,
@@ -213,9 +215,7 @@ where
                         if let Some(c) = &client {
                             let req = CreateChannelRequest { name, description };
                             match c.create_channel(&req).await {
-                                Ok(ch) => {
-                                    emit(&event_tx, &notify, ClientEvent::ChannelCreated(ch))
-                                }
+                                Ok(ch) => emit(&event_tx, &notify, ClientEvent::ChannelCreated(ch)),
                                 Err(e) => {
                                     emit(&event_tx, &notify, ClientEvent::Error(e.to_string()))
                                 }
@@ -246,12 +246,17 @@ where
                             }
                         }
                     }
-                    ClientCommand::CreateIdentity { handle, kind } => {
+                    ClientCommand::CreateIdentity {
+                        handle,
+                        kind,
+                        agent_config,
+                    } => {
                         if let Some(c) = &client {
                             let req = CreateIdentityRequest {
                                 handle,
                                 kind,
                                 owner_id: None,
+                                agent_config: agent_config.map(|cfg| *cfg),
                             };
                             match c.create_identity(&req).await {
                                 Ok(created) => {
@@ -268,7 +273,7 @@ where
                         request,
                     } => {
                         if let Some(c) = &client {
-                            match c.update_identity(&identity_id, &request).await {
+                            match c.update_identity(&identity_id, request.as_ref()).await {
                                 Ok(updated) => emit(
                                     &event_tx,
                                     &notify,
@@ -303,7 +308,8 @@ where
                                     if current_me_id.as_deref()
                                         == Some(regenerated.identity.id.as_str())
                                     {
-                                        let updated_client = c.with_token(regenerated.token.clone());
+                                        let updated_client =
+                                            c.with_token(regenerated.token.clone());
                                         let ws_url = updated_client.ws_url();
                                         let ws_token = updated_client.token().to_string();
                                         client = Some(updated_client);

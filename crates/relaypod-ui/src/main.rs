@@ -3,10 +3,12 @@ mod markdown;
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, CornerRadius, Margin, Stroke};
-use relaypod_client::{spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState};
+use relaypod_client::{
+    mcp_config_snippet, spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState,
+};
 use relaypod_core::{
-    Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
-    UpdateIdentityRequest,
+    AgentConfig, Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
+    UpdateIdentityRequest, DEFAULT_AGENT_CWD,
 };
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
@@ -51,6 +53,223 @@ struct MentionState {
     last_popup_rect: Option<egui::Rect>,
 }
 
+struct AgentEditDraft {
+    id: String,
+    handle: String,
+    runner: String,
+    harness: String,
+    args: String,
+    exec: String,
+    cwd: String,
+    prompt: String,
+    instructions_file: String,
+    max_sessions: String,
+    auto_ack: bool,
+    drain_on_start: bool,
+    cooldown_secs: String,
+    description: String,
+}
+
+impl AgentEditDraft {
+    fn new_blank() -> Self {
+        Self {
+            id: String::new(),
+            handle: String::new(),
+            runner: "herdr".to_string(),
+            harness: String::new(),
+            args: String::new(),
+            exec: String::new(),
+            cwd: DEFAULT_AGENT_CWD.to_string(),
+            prompt: String::new(),
+            instructions_file: String::new(),
+            max_sessions: String::new(),
+            auto_ack: false,
+            drain_on_start: true,
+            cooldown_secs: String::new(),
+            description: String::new(),
+        }
+    }
+
+    fn from_identity(id: &Identity) -> Self {
+        let cfg = id.agent_config.as_ref();
+        Self {
+            id: id.id.clone(),
+            handle: id.handle.clone(),
+            runner: cfg
+                .and_then(|c| c.runner.clone())
+                .unwrap_or_else(|| "herdr".to_string()),
+            harness: cfg.and_then(|c| c.harness.clone()).unwrap_or_default(),
+            args: cfg.and_then(|c| c.args.clone()).unwrap_or_default(),
+            exec: cfg.and_then(|c| c.exec.clone()).unwrap_or_default(),
+            cwd: cfg.and_then(|c| c.cwd.clone()).unwrap_or_default(),
+            prompt: cfg.and_then(|c| c.prompt.clone()).unwrap_or_default(),
+            instructions_file: cfg
+                .and_then(|c| c.instructions_file.clone())
+                .unwrap_or_default(),
+            max_sessions: cfg
+                .and_then(|c| c.max_sessions)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            auto_ack: cfg.and_then(|c| c.auto_ack).unwrap_or(false),
+            drain_on_start: cfg.and_then(|c| c.drain_on_start).unwrap_or(true),
+            cooldown_secs: cfg
+                .and_then(|c| c.cooldown_secs)
+                .filter(|&n| n > 0)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            description: cfg.and_then(|c| c.description.clone()).unwrap_or_default(),
+        }
+    }
+
+    fn max_sessions_valid(&self) -> bool {
+        self.max_sessions.trim().is_empty() || self.max_sessions.trim().parse::<usize>().is_ok()
+    }
+
+    fn cooldown_valid(&self) -> bool {
+        self.cooldown_secs.trim().is_empty() || self.cooldown_secs.trim().parse::<u64>().is_ok()
+    }
+
+    fn to_agent_config(&self, is_create: bool) -> AgentConfig {
+        let parsed_max = self
+            .max_sessions
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0);
+        let parsed_cooldown = if is_create {
+            self.cooldown_secs
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n > 0)
+        } else {
+            self.cooldown_secs.trim().parse::<u64>().ok().or(Some(0))
+        };
+        // On create, omit blank `args` so the server populates default non-interactive harness args.
+        let args = if is_create && self.args.trim().is_empty() {
+            None
+        } else {
+            Some(self.args.clone())
+        };
+        AgentConfig {
+            runner: Some(self.runner.clone()),
+            harness: Some(self.harness.clone()),
+            args,
+            exec: Some(self.exec.clone()),
+            cwd: Some(self.cwd.clone()),
+            prompt: Some(self.prompt.clone()),
+            instructions_file: Some(self.instructions_file.clone()),
+            max_sessions: parsed_max,
+            auto_ack: Some(self.auto_ack),
+            drain_on_start: Some(self.drain_on_start),
+            cooldown_secs: parsed_cooldown,
+            description: Some(self.description.clone()),
+        }
+    }
+
+    fn render_fields(&mut self, ui: &mut egui::Ui, id_prefix: &str, is_create: bool) {
+        let cooldown_valid = self.cooldown_valid();
+        let max_sessions_valid = self.max_sessions_valid();
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Runner");
+            egui::ComboBox::from_id_salt(format!("{id_prefix}_runner"))
+                .selected_text(&self.runner)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.runner, "herdr".to_string(), "herdr");
+                    ui.selectable_value(&mut self.runner, "exec".to_string(), "exec");
+                });
+        });
+
+        ui.label("Harness");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.harness)
+                .hint_text("claude, codex, gemini, agy, pi...")
+                .desired_width(f32::INFINITY),
+        );
+        ui.label("Description");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.description)
+                .hint_text("Role / capabilities for routing")
+                .desired_width(f32::INFINITY),
+        );
+        ui.label(if is_create {
+            "Args (leave empty for harness default)"
+        } else {
+            "Args (passed to harness on new sessions)"
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.args)
+                .hint_text("e.g. --model claude-opus-4-6")
+                .desired_width(f32::INFINITY),
+        );
+        ui.label("Working directory (cwd)");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.cwd)
+                .hint_text(DEFAULT_AGENT_CWD)
+                .desired_width(f32::INFINITY),
+        );
+
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Advanced options")
+            .id_salt(format!("{id_prefix}_advanced"))
+            .show(ui, |ui| {
+                if self.runner != "herdr" {
+                    ui.label("Custom exec command (optional)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.exec)
+                            .hint_text("Only needed for custom harnesses")
+                            .desired_width(f32::INFINITY),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Cooldown (secs):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cooldown_secs)
+                            .hint_text("0")
+                            .desired_width(64.0),
+                    );
+                    ui.label("Max sessions:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.max_sessions)
+                            .hint_text("∞")
+                            .desired_width(64.0),
+                    );
+                });
+                if !cooldown_valid {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        "Cooldown must be a non-negative integer.",
+                    );
+                }
+                if !max_sessions_valid {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        "Max sessions must be a non-negative integer.",
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.auto_ack, "Auto-ack on exit 0");
+                    ui.checkbox(&mut self.drain_on_start, "Drain unread on start");
+                });
+                ui.label("Instructions file");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.instructions_file)
+                        .hint_text("~/.relaypod/instructions.md")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label("Custom prompt template");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.prompt)
+                        .desired_rows(2)
+                        .hint_text("Leave empty to use default RelayPod prompt")
+                        .desired_width(f32::INFINITY),
+                );
+            });
+    }
+}
+
 /// Pure `egui` presentation layer over `relaypod_client::{WorkspaceState, ClientRuntime}`.
 struct RelayPodApp {
     runtime: ClientRuntime,
@@ -74,8 +293,9 @@ struct RelayPodApp {
     new_channel_name: String,
     new_channel_desc: String,
 
-    show_new_human_modal: bool,
-    new_human_handle: String,
+    show_new_identity_modal: bool,
+    new_identity_kind: IdentityKind,
+    new_identity_draft: AgentEditDraft,
     last_created_identity: Option<CreatedIdentity>,
 
     pending_delete_message: Option<Message>,
@@ -84,7 +304,7 @@ struct RelayPodApp {
     pending_regenerate_token: Option<Identity>,
     regenerated_token: Option<CreatedIdentity>,
     channel_edit: Option<Channel>,
-    identity_edit: Option<Identity>,
+    identity_edit: Option<AgentEditDraft>,
 
     channel_search: String,
     channels_section: CollapsibleSection,
@@ -127,8 +347,9 @@ impl RelayPodApp {
             show_new_channel_modal: false,
             new_channel_name: String::new(),
             new_channel_desc: String::new(),
-            show_new_human_modal: false,
-            new_human_handle: String::new(),
+            show_new_identity_modal: false,
+            new_identity_kind: IdentityKind::Agent,
+            new_identity_draft: AgentEditDraft::new_blank(),
             last_created_identity: None,
             pending_delete_message: None,
             pending_delete_channel: None,
@@ -156,7 +377,7 @@ impl RelayPodApp {
             }
             if let Some(created) = effects.identity_just_created {
                 self.last_created_identity = Some(created);
-                self.new_human_handle.clear();
+                self.new_identity_draft = AgentEditDraft::new_blank();
             }
             if let Some(regenerated) = effects.token_just_regenerated {
                 if self
@@ -384,25 +605,76 @@ impl RelayPodApp {
             }
         }
 
-        if self.show_new_human_modal {
+        if self.show_new_identity_modal {
             let mut close = false;
-            let modal = egui::Modal::new(egui::Id::new("new_human")).show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.heading("Register Human");
-                ui.label("Handle (e.g. alice)");
-                ui.text_edit_singleline(&mut self.new_human_handle);
+            let is_admin = self.is_admin();
+            if !is_admin {
+                self.new_identity_kind = IdentityKind::Agent;
+            }
+            let max_sessions_valid = self.new_identity_draft.max_sessions_valid();
+            let cooldown_valid = self.new_identity_draft.cooldown_valid();
 
+            let modal = egui::Modal::new(egui::Id::new("new_identity")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(if is_admin {
+                    "Register Identity"
+                } else {
+                    "Register Agent"
+                });
+
+                if is_admin {
+                    ui.horizontal(|ui| {
+                        ui.label("Kind:");
+                        ui.selectable_value(
+                            &mut self.new_identity_kind,
+                            IdentityKind::Agent,
+                            "Agent",
+                        );
+                        ui.selectable_value(
+                            &mut self.new_identity_kind,
+                            IdentityKind::Human,
+                            "Human",
+                        );
+                    });
+                }
+
+                let is_agent = self.new_identity_kind == IdentityKind::Agent;
+
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        ui.label(if is_agent {
+                            "Handle (e.g. claude-dev)"
+                        } else {
+                            "Handle (e.g. alice)"
+                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_identity_draft.handle)
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        if is_agent {
+                            self.new_identity_draft.render_fields(ui, "new_agent", true);
+                        }
+                    });
+
+                ui.add_space(6.0);
+                let can_create = !self.new_identity_draft.handle.trim().is_empty()
+                    && (!is_agent || (max_sessions_valid && cooldown_valid));
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(
-                            !self.new_human_handle.trim().is_empty(),
-                            egui::Button::new("Create"),
-                        )
+                        .add_enabled(can_create, egui::Button::new("Create"))
                         .clicked()
                     {
+                        let agent_config = if is_agent {
+                            Some(Box::new(self.new_identity_draft.to_agent_config(true)))
+                        } else {
+                            None
+                        };
                         self.runtime.send(ClientCommand::CreateIdentity {
-                            handle: self.new_human_handle.clone(),
-                            kind: IdentityKind::Human,
+                            handle: self.new_identity_draft.handle.clone(),
+                            kind: self.new_identity_kind,
+                            agent_config,
                         });
                     }
                     if ui.button("Close").clicked() {
@@ -426,10 +698,36 @@ impl RelayPodApp {
                     });
                     let mut tok = created.token.clone();
                     ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
+
+                    if created.identity.kind == IdentityKind::Agent {
+                        ui.add_space(4.0);
+                        let cfg_line =
+                            format!("    {}: {}", created.identity.handle, created.token);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Add under watcher.agent_tokens in ~/.relaypod/config.yaml:",
+                                )
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Copy config line").clicked() {
+                                ui.ctx().copy_text(cfg_line.clone());
+                            }
+                            if ui.small_button("Copy MCP JSON").clicked() {
+                                ui.ctx().copy_text(mcp_config_snippet(
+                                    &self.server_url,
+                                    &created.token,
+                                ));
+                            }
+                        });
+                    }
                 }
             });
             if close || modal.should_close() {
-                self.show_new_human_modal = false;
+                self.show_new_identity_modal = false;
                 self.last_created_identity = None;
             }
         }
@@ -466,19 +764,39 @@ impl RelayPodApp {
             }
         }
 
-        if let Some(identity) = &mut self.identity_edit {
+        if let Some(draft) = &mut self.identity_edit {
             let mut save = false;
             let mut cancel = false;
-            let modal = egui::Modal::new(egui::Id::new("rename_agent")).show(ctx, |ui| {
-                ui.set_width(360.0);
-                ui.heading("Rename agent");
-                ui.label("Handle");
-                ui.text_edit_singleline(&mut identity.handle);
+            let max_sessions_valid = draft.max_sessions_valid();
+            let cooldown_valid = draft.cooldown_valid();
+
+            let modal = egui::Modal::new(egui::Id::new("edit_agent")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Edit agent");
+
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        ui.label("Handle");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.handle)
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        draft.render_fields(ui, "edit_agent", false);
+                    });
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Config changes apply to new agent sessions.")
+                        .size(11.5)
+                        .color(ui.visuals().weak_text_color()),
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     save = ui
                         .add_enabled(
-                            !identity.handle.trim().is_empty(),
+                            !draft.handle.trim().is_empty() && max_sessions_valid && cooldown_valid,
                             egui::Button::new("Save"),
                         )
                         .clicked();
@@ -487,10 +805,11 @@ impl RelayPodApp {
             });
             if save {
                 self.runtime.send(ClientCommand::UpdateIdentity {
-                    identity_id: identity.id.clone(),
-                    request: UpdateIdentityRequest {
-                        handle: Some(identity.handle.clone()),
-                    },
+                    identity_id: draft.id.clone(),
+                    request: Box::new(UpdateIdentityRequest {
+                        handle: Some(draft.handle.clone()),
+                        agent_config: Some(draft.to_agent_config(false)),
+                    }),
                 });
             }
             if save || cancel || modal.should_close() {
@@ -501,23 +820,24 @@ impl RelayPodApp {
         if let Some(identity) = &self.pending_delete_identity {
             let mut confirm = false;
             let mut cancel = false;
-            let modal = egui::Modal::new(egui::Id::new("confirm_delete_identity")).show(ctx, |ui| {
-                ui.set_width(360.0);
-                ui.heading(format!("Delete @{}?", identity.handle));
-                ui.label(
-                    "This revokes the identity's token and removes it from the workspace. \
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm_delete_identity")).show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.heading(format!("Delete @{}?", identity.handle));
+                    ui.label(
+                        "This revokes the identity's token and removes it from the workspace. \
                      Existing messages and mentions are preserved.",
-                );
-                ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let delete =
-                        egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
-                            .fill(Color32::from_rgb(220, 38, 38))
-                            .corner_radius(CornerRadius::same(8));
-                    confirm = ui.add(delete).clicked();
-                    cancel = ui.button("Cancel").clicked();
+                    );
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete =
+                            egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(220, 38, 38))
+                                .corner_radius(CornerRadius::same(8));
+                        confirm = ui.add(delete).clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
                 });
-            });
             if confirm {
                 self.runtime.send(ClientCommand::DeleteIdentity {
                     identity_id: identity.id.clone(),
@@ -812,7 +1132,10 @@ impl eframe::App for RelayPodApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("+").on_hover_text("New channel").clicked()
+                                        if ui
+                                            .small_button("+")
+                                            .on_hover_text("New channel")
+                                            .clicked()
                                         {
                                             self.show_new_channel_modal = true;
                                         }
@@ -860,10 +1183,17 @@ impl eframe::App for RelayPodApp {
 
                 ui.horizontal(|ui| {
                     ui.strong("IDENTITIES");
-                    if self.is_admin() {
+                    if self.can_manage_channels() {
+                        let tooltip = if self.is_admin() {
+                            "Register agent or human"
+                        } else {
+                            "Register agent"
+                        };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("+ Human").clicked() {
-                                self.show_new_human_modal = true;
+                            if ui.small_button("+").on_hover_text(tooltip).clicked() {
+                                self.show_new_identity_modal = true;
+                                self.new_identity_kind = IdentityKind::Agent;
+                                self.new_identity_draft = AgentEditDraft::new_blank();
                                 self.last_created_identity = None;
                             }
                         });
@@ -880,17 +1210,24 @@ impl eframe::App for RelayPodApp {
                         };
                         ui.horizontal(|ui| {
                             draw_kind_badge(ui, id.kind);
-                            let row = ui.selectable_label(false, label);
+                            let mut row = ui.selectable_label(false, label);
+                            if let Some(ref cfg) = id.agent_config {
+                                let tooltip = format_agent_config_tooltip(cfg);
+                                if !tooltip.is_empty() {
+                                    row = row.on_hover_text(tooltip);
+                                }
+                            }
                             if row.clicked() {
                                 self.channel_composer.push_str(&format!("@{} ", id.handle));
                             }
-                            let can_rename = self.can_rename_identity(id);
+                            let can_edit = self.can_rename_identity(id);
                             let can_regen = self.can_regenerate_token(id);
                             let can_delete = self.can_delete_identity(id);
-                            if can_rename || can_regen || can_delete {
+                            if can_edit || can_regen || can_delete {
                                 row.context_menu(|ui| {
-                                    if can_rename && ui.button("Rename agent").clicked() {
-                                        self.identity_edit = Some(id.clone());
+                                    if can_edit && ui.button("Edit agent").clicked() {
+                                        self.identity_edit =
+                                            Some(AgentEditDraft::from_identity(id));
                                         ui.close_menu();
                                     }
                                     if can_regen && ui.button("Regenerate token").clicked() {
@@ -1011,116 +1348,115 @@ impl eframe::App for RelayPodApp {
             .min_width(min_thread_w)
             .max_width(max_thread_w)
             .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Thread");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Close").clicked() {
-                                self.state.active_thread = None;
-                                self.prefilled_thread_id = None;
-                                self.thread_composer.clear();
-                                self.thread_panel_open_seq =
-                                    self.thread_panel_open_seq.wrapping_add(1);
-                            }
-                        });
+                ui.horizontal(|ui| {
+                    ui.heading("Thread");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Close").clicked() {
+                            self.state.active_thread = None;
+                            self.prefilled_thread_id = None;
+                            self.thread_composer.clear();
+                            self.thread_panel_open_seq = self.thread_panel_open_seq.wrapping_add(1);
+                        }
                     });
-                    ui.separator();
+                });
+                ui.separator();
 
-                    let identities = self.state.identities.clone();
-                    egui::TopBottomPanel::bottom("thread_composer")
-                        .frame(egui::Frame::new().inner_margin(Margin {
-                            left: 4,
-                            right: 4,
-                            top: 8,
-                            bottom: 4,
-                        }))
-                        .show_inside(ui, |ui| {
-                            if !self
-                                .state
-                                .channels
-                                .iter()
-                                .any(|ch| ch.id == thread.parent.channel_id && !ch.archived)
-                            {
-                                ui.label("This channel is archived.");
-                                return;
-                            }
-                            if render_composer(
-                                ui,
-                                "thread_composer_input",
-                                &mut self.thread_composer,
-                                &mut self.thread_mention,
-                                "Reply in thread... (@ to mention, Shift+Enter for newline)",
+                let identities = self.state.identities.clone();
+                egui::TopBottomPanel::bottom("thread_composer")
+                    .frame(egui::Frame::new().inner_margin(Margin {
+                        left: 4,
+                        right: 4,
+                        top: 8,
+                        bottom: 4,
+                    }))
+                    .show_inside(ui, |ui| {
+                        if !self
+                            .state
+                            .channels
+                            .iter()
+                            .any(|ch| ch.id == thread.parent.channel_id && !ch.archived)
+                        {
+                            ui.label("This channel is archived.");
+                            return;
+                        }
+                        if render_composer(
+                            ui,
+                            "thread_composer_input",
+                            &mut self.thread_composer,
+                            &mut self.thread_mention,
+                            "Reply in thread... (@ to mention, Shift+Enter for newline)",
+                            &identities,
+                        ) {
+                            let body = std::mem::take(&mut self.thread_composer);
+                            let next_prefill = last_mentioned_handle_in_text(
+                                &body,
                                 &identities,
-                            ) {
-                                let body = std::mem::take(&mut self.thread_composer);
-                                let next_prefill = last_mentioned_handle_in_text(
-                                    &body,
+                                my_handle.as_deref(),
+                            )
+                            .or_else(|| {
+                                last_mentioned_handle_in_thread(
+                                    &thread,
                                     &identities,
                                     my_handle.as_deref(),
                                 )
-                                .or_else(|| {
-                                    last_mentioned_handle_in_thread(
-                                        &thread,
-                                        &identities,
-                                        my_handle.as_deref(),
-                                    )
-                                });
-                                if let Some(h) = next_prefill {
-                                    self.thread_composer = format!("@{h} ");
-                                }
-                                self.runtime.send(ClientCommand::PostMessage {
-                                    channel_id: thread.parent.channel_id.clone(),
-                                    body,
-                                    parent_id: Some(thread.parent.id.clone()),
-                                });
-                            }
-                        });
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("thread_messages_scroll")
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add_space(4.0);
-                            let parent_is_me =
-                                my_id.as_deref() == Some(thread.parent.author_id.as_str());
-                            render_thread_bubble(ui, &thread.parent, parent_is_me);
-
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{} {}",
-                                        thread.replies.len(),
-                                        if thread.replies.len() == 1 {
-                                            "reply"
-                                        } else {
-                                            "replies"
-                                        }
-                                    ))
-                                    .size(11.5)
-                                    .color(ui.visuals().weak_text_color()),
-                                ));
-                                ui.separator();
                             });
-                            ui.add_space(6.0);
-
-                            for reply in &thread.replies {
-                                let is_me = my_id.as_deref() == Some(reply.author_id.as_str());
-                                render_thread_bubble(ui, reply, is_me);
-                                ui.add_space(8.0);
+                            if let Some(h) = next_prefill {
+                                self.thread_composer = format!("@{h} ");
                             }
+                            self.runtime.send(ClientCommand::PostMessage {
+                                channel_id: thread.parent.channel_id.clone(),
+                                body,
+                                parent_id: Some(thread.parent.id.clone()),
+                            });
+                        }
+                    });
 
-                            let thread_workers: Vec<String> = self
-                                .state
-                                .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
-                                .into_iter()
-                                .map(|w| w.handle.clone())
-                                .collect();
-                            if !thread_workers.is_empty() {
-                                render_working_banner(ui, &thread_workers);
-                                ui.add_space(6.0);
-                            }
+                egui::ScrollArea::vertical()
+                    .id_salt("thread_messages_scroll")
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let parent_is_me =
+                            my_id.as_deref() == Some(thread.parent.author_id.as_str());
+                        render_thread_bubble(ui, &thread.parent, parent_is_me);
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    thread.replies.len(),
+                                    if thread.replies.len() == 1 {
+                                        "reply"
+                                    } else {
+                                        "replies"
+                                    }
+                                ))
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
+                            ));
+                            ui.separator();
                         });
-                });
+                        ui.add_space(6.0);
+
+                        for reply in &thread.replies {
+                            let is_me = my_id.as_deref() == Some(reply.author_id.as_str());
+                            render_thread_bubble(ui, reply, is_me);
+                            ui.add_space(8.0);
+                        }
+
+                        let thread_workers: Vec<String> = self
+                            .state
+                            .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
+                            .into_iter()
+                            .map(|w| w.handle.clone())
+                            .collect();
+                        if !thread_workers.is_empty() {
+                            render_working_banner(ui, &thread_workers);
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
         }
 
         // Center panel: Channel feed + composer
@@ -1249,6 +1585,26 @@ impl eframe::App for RelayPodApp {
 
         self.render_modals(ctx);
     }
+}
+
+fn format_agent_config_tooltip(cfg: &AgentConfig) -> String {
+    let mut lines = Vec::new();
+    if let Some(ref r) = cfg.runner {
+        lines.push(format!("Runner: {r}"));
+    }
+    if let Some(ref h) = cfg.harness {
+        lines.push(format!("Harness: {h}"));
+    }
+    if let Some(ref d) = cfg.description {
+        lines.push(format!("Role: {d}"));
+    }
+    if let Some(ref a) = cfg.args {
+        lines.push(format!("Args: {a}"));
+    }
+    if let Some(c) = cfg.cooldown_secs.filter(|&n| n > 0) {
+        lines.push(format!("Cooldown: {c}s"));
+    }
+    lines.join("\n")
 }
 
 fn is_non_loopback_http(url: &str) -> bool {
@@ -1660,8 +2016,7 @@ fn render_composer(
                 }
             }
         }
-    } else if has_focus
-        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    } else if has_focus && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
     {
         send_triggered = true;
     }
@@ -2154,6 +2509,7 @@ mod tests {
             busy: false,
             is_admin: false,
             created_at: 0,
+            agent_config: None,
         };
         let ids = vec![
             mk("alice", IdentityKind::Human),
@@ -2197,7 +2553,10 @@ mod tests {
 
         let all = filter_channels(&channels, "   ");
         assert_eq!(
-            all.active.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            all.active
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Alpha", "general", "relaypod"]
         );
         assert_eq!(

@@ -19,48 +19,12 @@ watcher:
   # (defaults to 6; set to 0 to disable)
   max_consecutive_agent_turns: 6
 
-  handles:
-    # Interactive Herdr runner (`runner: herdr`):
-    # Launches each RelayPod thread as a live interactive agent pane in Herdr
-    # named `relaypod-<handle>-<thread>` (tab label `relaypod-<channel>-<thread>`),
-    # so you can inspect output, view working/blocked/idle status, and intervene.
-    codex-local:
-      runner: herdr
-      agent_type: codex
-      # Supports ${ENV_VAR} expansion (or omit to fall back to RELAYPOD_TOKEN)
-      token: ${RELAYPOD_CODEX_TOKEN}
-      # Optional extra CLI flags forwarded to the agent (`herdr agent start ... -- <args>`)
-      # args: --full-auto
-      # Optional per-handle instructions file (overrides watcher `instructions_file`)
-      instructions_file: ~/.relaypod/agent-instructions.md
-      cwd: ~/projects
-      # Optional: target a specific Herdr session or workspace label/ID (workspace defaults to "relaypod")
-      # herdr_session: main
-      # herdr_workspace: relaypod
-      # Optional: per-handle max live Herdr panes (evicts only this handle's oldest idle/done pane)
-      # max_sessions: 5
-      # Set to true to auto-ack after exit 0 (default: false — let the agent ack via MCP)
-      auto_ack: false
-      # Drain existing unacked items on startup/reconnect (default: true)
-      drain_on_start: true
-      # Optional delay (seconds) between consecutive runs for this handle (default: 0)
-      cooldown_secs: 0
-      # Optional extra environment variables for this handle's command
-      env:
-        RUST_LOG: info
-
-    # Headless exec runner (`runner: exec`, the default):
-    # Runs `codex exec --json` / `claude -p --output-format json` and resumes
-    # per-thread sessions via `~/.relaypod/sessions.json`.
-    # claude-local:
-    #   runner: exec
-    #   agent_type: claude
-    #   token: ${RELAYPOD_CLAUDE_TOKEN}
-    #   cwd: ~/projects/relaypod
-    #   auto_ack: false
-
-    # Custom shell command mode (`runner: exec`, omit `agent_type` and provide `exec:`):
-    # custom-bot:
-    #   token: ${RELAYPOD_CUSTOM_TOKEN}
-    #   exec: 'my-script --channel "$RELAYPOD_CHANNEL" --thread "$RELAYPOD_THREAD_ID" --unread "$RELAYPOD_UNREAD_ID"'
-    #   auto_ack: true
+  agent_tokens:
+    # Flat map of unique local names to agent bearer tokens (supports ${ENV_VAR} expansion).
+    # Runner, harness, args, cwd, cooldown_secs, max_sessions, auto_ack,
+    # drain_on_start, instructions_file, and prompt are stored in the server DB and editable
+    # live in the RelayPod UI (Edit agent) or via `relaypod identity update`.
+    #
+    # Running `relaypod identity create <handle> --kind agent` automatically appends an entry here.
+    mbp-codex: ${RELAYPOD_CODEX_TOKEN}
+    # mbp-claude: ${RELAYPOD_CLAUDE_TOKEN}
