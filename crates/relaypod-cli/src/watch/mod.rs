@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use relaypod_client::{
     run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL,
 };
-use relaypod_core::{UnreadItem, WsClientMessage, WsEvent};
+use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,10 +18,9 @@ use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
 pub use self::config::{
-    append_watcher_handle_to_config, update_watcher_handle_token_in_config, AgentType,
-    NewWatcherHandleEntry, RunnerKind,
+    append_watcher_token_to_config, update_watcher_token_in_config, AgentType, RunnerKind,
 };
-use self::config::{load_config_file, HandleConfig, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
+use self::config::{load_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
 use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
 
@@ -71,7 +70,7 @@ pub struct WatchOptions {
     pub no_drain: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTarget {
     pub label: String,
     pub runner: RunnerKind,
@@ -83,8 +82,6 @@ pub struct ResolvedTarget {
     pub prompt: Option<String>,
     pub instructions_file: Option<PathBuf>,
     pub cwd: Option<String>,
-    pub herdr_session: Option<String>,
-    pub herdr_workspace: Option<String>,
     pub global_max_sessions: Option<usize>,
     pub max_sessions: Option<usize>,
     pub max_consecutive_agent_turns: Option<usize>,
@@ -342,8 +339,6 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 prompt: None,
                 instructions_file: None,
                 cwd: opts.cwd_override.as_deref().map(expand_tilde),
-                herdr_session: None,
-                herdr_workspace: None,
                 global_max_sessions: None,
                 max_sessions: None,
                 max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
@@ -367,115 +362,116 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     info!("Loading watch config from {}", cfg_path.display());
     let cfg = load_config_file(&cfg_path)?.watcher;
 
-    let selected: Vec<(String, HandleConfig)> = if let Some(ref wanted) = opts.handle_filter {
+    let selected: Vec<(String, String)> = if let Some(ref wanted) = opts.handle_filter {
         let key = wanted.trim_start_matches('@');
-        let h = cfg.handles.get(key).cloned().ok_or_else(|| {
+        let token = cfg.agent_tokens.get(key).cloned().ok_or_else(|| {
             anyhow!(
-                "handle '@{key}' not found in {} (available: {})",
+                "token '{key}' not found under `watcher.agent_tokens` in {} (available: {})",
                 cfg_path.display(),
-                cfg.handles
+                cfg.agent_tokens
                     .keys()
-                    .map(|k| format!("@{k}"))
+                    .cloned()
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         })?;
-        vec![(key.to_string(), h)]
+        vec![(key.to_string(), token)]
     } else {
-        cfg.handles.into_iter().collect()
+        cfg.agent_tokens.into_iter().collect()
     };
 
+    let default_instructions_file = cfg
+        .instructions_file
+        .as_deref()
+        .map(|p| PathBuf::from(expand_tilde(p)));
+    if let Some(ref p) = default_instructions_file {
+        if !p.exists() {
+            return Err(anyhow!(
+                "watcher instructions_file not found: {}",
+                p.display()
+            ));
+        }
+    }
+
+    let url = cfg.url.unwrap_or_else(|| opts.default_url.clone());
     let mut targets = Vec::new();
-    for (name, h) in selected {
-        let url = h
-            .url
-            .or_else(|| cfg.url.clone())
-            .unwrap_or_else(|| opts.default_url.clone());
-
-        let token = h
-            .token
-            .or_else(|| opts.default_token.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "handle '@{name}' has no token configured and RELAYPOD_TOKEN is not set"
-                )
-            })?;
-
-        let exec = opts.exec_override.clone().unwrap_or(h.exec);
-        let (runner, agent_type) = if opts.exec_override.is_some() {
-            (RunnerKind::Exec, None)
+    for (name, token) in selected {
+        let exec = opts.exec_override.clone().unwrap_or_default();
+        let runner = if opts.exec_override.is_some() {
+            RunnerKind::Exec
         } else {
-            (h.runner, h.agent_type)
+            RunnerKind::Herdr
         };
 
-        match runner {
-            RunnerKind::Exec => {
-                if agent_type.is_none() && exec.trim().is_empty() {
-                    return Err(anyhow!(
-                        "handle '@{name}' must set either `agent_type` (codex/claude) or `exec`"
-                    ));
-                }
-                if let Some(AgentType::Other(ref other)) = agent_type {
-                    return Err(anyhow!(
-                        "handle '@{name}' uses `agent_type: {other}` which is not supported by `runner: exec` (use `runner: herdr` or `codex`/`claude`)"
-                    ));
-                }
-            }
-            RunnerKind::Herdr => {
-                if agent_type.is_none() {
-                    return Err(anyhow!(
-                        "handle '@{name}' with `runner: herdr` requires `agent_type` (e.g. codex, claude, gemini)"
-                    ));
-                }
-            }
-        }
-
-        let instructions_file = h
-            .instructions_file
-            .or_else(|| cfg.instructions_file.clone())
-            .map(|p| PathBuf::from(expand_tilde(&p)));
-        if let Some(ref p) = instructions_file {
-            if !p.exists() {
-                return Err(anyhow!(
-                    "handle '@{name}' instructions_file not found: {}",
-                    p.display()
-                ));
-            }
-        }
-
         targets.push(ResolvedTarget {
-            label: format!("@{name}"),
+            label: name,
             runner,
-            agent_type,
-            url,
+            agent_type: None,
+            url: url.clone(),
             token,
             exec,
-            args: h.args,
-            prompt: h.prompt,
-            instructions_file,
-            cwd: opts
-                .cwd_override
-                .clone()
-                .or(h.cwd)
-                .as_deref()
-                .map(expand_tilde),
-            herdr_session: h.herdr_session,
-            herdr_workspace: h.herdr_workspace,
+            args: None,
+            prompt: None,
+            instructions_file: default_instructions_file.clone(),
+            cwd: opts.cwd_override.as_deref().map(expand_tilde),
             global_max_sessions: cfg.global_max_sessions,
-            max_sessions: h.max_sessions,
+            max_sessions: None,
             max_consecutive_agent_turns: cfg.max_consecutive_agent_turns,
-            auto_ack: opts.auto_ack_override.unwrap_or(h.auto_ack),
-            drain_on_start: if opts.no_drain {
-                false
-            } else {
-                h.drain_on_start
-            },
-            cooldown_secs: h.cooldown_secs,
-            env: h.env,
+            auto_ack: opts.auto_ack_override.unwrap_or(false),
+            drain_on_start: !opts.no_drain,
+            cooldown_secs: 0,
+            env: BTreeMap::new(),
         });
     }
 
     Ok(targets)
+}
+
+fn apply_server_agent_config(
+    base: &ResolvedTarget,
+    agent_config: Option<&AgentConfig>,
+) -> ResolvedTarget {
+    let mut effective = base.clone();
+    if let Some(cfg) = agent_config {
+        if let Some(ref runner_str) = cfg.runner {
+            if let Some(parsed) = RunnerKind::parse(runner_str) {
+                effective.runner = parsed;
+            }
+        }
+        if let Some(ref exec) = cfg.exec {
+            effective.exec = exec.clone();
+        }
+        if let Some(ref h) = cfg.harness {
+            if let Some(parsed) = AgentType::parse(h) {
+                effective.agent_type = Some(parsed);
+            }
+        }
+        if let Some(ref args) = cfg.args {
+            effective.args = Some(args.clone());
+        }
+        if let Some(ref cwd) = cfg.cwd {
+            effective.cwd = Some(expand_tilde(cwd));
+        }
+        if let Some(ref prompt) = cfg.prompt {
+            effective.prompt = Some(prompt.clone());
+        }
+        if let Some(ref instr) = cfg.instructions_file {
+            effective.instructions_file = Some(PathBuf::from(expand_tilde(instr)));
+        }
+        if let Some(max_sessions) = cfg.max_sessions {
+            effective.max_sessions = Some(max_sessions);
+        }
+        if let Some(auto_ack) = cfg.auto_ack {
+            effective.auto_ack = auto_ack;
+        }
+        if let Some(drain_on_start) = cfg.drain_on_start {
+            effective.drain_on_start = drain_on_start;
+        }
+        if let Some(cooldown_secs) = cfg.cooldown_secs {
+            effective.cooldown_secs = cooldown_secs;
+        }
+    }
+    effective
 }
 
 async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> Result<()> {
@@ -485,29 +481,33 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
         .await
         .with_context(|| format!("failed to authenticate {} at {}", target.label, target.url))?;
 
-    let adapter = build_adapter(target.runner);
+    let base_target = target;
+    let effective_target = apply_server_agent_config(&base_target, me.agent_config.as_ref());
+    let initial_adapter = build_adapter(effective_target.runner);
 
     info!(
         handle = %me.handle,
         kind = %me.kind,
-        runner = %adapter.name(),
-        agent_type = ?target.agent_type,
-        url = %target.url,
-        auto_ack = target.auto_ack,
+        runner = %initial_adapter.name(),
+        agent_type = ?effective_target.agent_type,
+        args = ?effective_target.args,
+        url = %effective_target.url,
+        auto_ack = effective_target.auto_ack,
+        cooldown_secs = effective_target.cooldown_secs,
         "Authenticated watcher"
     );
 
     let live_handle = Arc::new(Mutex::new(me.handle.clone()));
+    let live_target = Arc::new(Mutex::new(effective_target));
     let (tx, mut rx) = mpsc::unbounded_channel::<UnreadItem>();
     let (ws_out_tx, ws_out_rx) = mpsc::unbounded_channel::<WsClientMessage>();
 
     // Sequential worker so one handle never runs overlapping dispatches at the same time
     let worker_client = client.clone();
-    let worker_target = target.clone();
+    let worker_target = Arc::clone(&live_target);
     let worker_identity_id = me.id.clone();
     let worker_handle = Arc::clone(&live_handle);
     let worker_sessions = sessions.clone();
-    let worker_adapter = Arc::clone(&adapter);
     let worker_ws_tx = ws_out_tx.clone();
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
@@ -515,11 +515,16 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 .lock()
                 .expect("live_handle lock poisoned")
                 .clone();
+            let current_target = worker_target
+                .lock()
+                .expect("live_target lock poisoned")
+                .clone();
+            let adapter = build_adapter(current_target.runner);
             dispatch_unread_item(
                 &DispatchEnv {
-                    adapter: worker_adapter.as_ref(),
+                    adapter: adapter.as_ref(),
                     client: &worker_client,
-                    target: &worker_target,
+                    target: &current_target,
                     identity_id: &worker_identity_id,
                     sessions: &worker_sessions,
                     ws_out_tx: &worker_ws_tx,
@@ -528,8 +533,8 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 &item,
             )
             .await;
-            if worker_target.cooldown_secs > 0 {
-                tokio::time::sleep(Duration::from_secs(worker_target.cooldown_secs)).await;
+            if current_target.cooldown_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(current_target.cooldown_secs)).await;
             }
         }
     });
@@ -539,12 +544,14 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let ws_token = client.token().to_string();
 
     let status_handle = Arc::clone(&live_handle);
+    let status_target = Arc::clone(&live_target);
     let status_client = client.clone();
     let status_tx = tx.clone();
     let status_seen = Arc::clone(&seen_unread);
-    let drain_on_start = target.drain_on_start;
 
     let event_handle = Arc::clone(&live_handle);
+    let event_target = Arc::clone(&live_target);
+    let event_base_target = base_target;
     let event_me_id = me.id.clone();
     let event_tx = tx.clone();
     let event_seen = Arc::clone(&seen_unread);
@@ -559,6 +566,10 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 .lock()
                 .expect("live_handle lock poisoned")
                 .clone();
+            let drain_on_start = status_target
+                .lock()
+                .expect("live_target lock poisoned")
+                .drain_on_start;
             if live {
                 info!(handle = %h, "WebSocket connected (live pings active) — waiting for unread events");
                 if drain_on_start {
@@ -587,14 +598,30 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
         },
         move |ev| match ev {
             WsEvent::IdentityUpdated(updated) if updated.id == event_me_id => {
-                let mut guard = event_handle.lock().expect("live_handle lock poisoned");
-                if *guard != updated.handle {
+                {
+                    let mut guard = event_handle.lock().expect("live_handle lock poisoned");
+                    if *guard != updated.handle {
+                        info!(
+                            old_handle = %*guard,
+                            new_handle = %updated.handle,
+                            "Watcher identity renamed"
+                        );
+                        *guard = updated.handle.clone();
+                    }
+                }
+                let next_target =
+                    apply_server_agent_config(&event_base_target, updated.agent_config.as_ref());
+                let mut tguard = event_target.lock().expect("live_target lock poisoned");
+                if *tguard != next_target {
                     info!(
-                        old_handle = %*guard,
-                        new_handle = %updated.handle,
-                        "Watcher identity renamed"
+                        handle = %updated.handle,
+                        runner = ?next_target.runner,
+                        agent_type = ?next_target.agent_type,
+                        args = ?next_target.args,
+                        cooldown_secs = next_target.cooldown_secs,
+                        "Reloaded agent config from server (applies to new sessions)"
                     );
-                    *guard = updated.handle;
+                    *tguard = next_target;
                 }
             }
             WsEvent::UnreadCreated(item) if item.identity_id == event_me_id => {
@@ -908,17 +935,17 @@ pub(crate) fn build_agent_prompt(
         render_exec_template(custom, handle, item, thread_id)
     } else if is_resume {
         format!(
-            "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Remember: other agents only wake up when explicitly @mentioned.",
+            "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Remember: other agents only wake up when explicitly @mentioned.",
             handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else if let Some(history) = prior_thread_context {
         format!(
-            "You are @{}. Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+            "You are @{}. Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
             handle, item.channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else {
         format!(
-            "You are @{}. New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+            "You are @{}. New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
             handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
         )
     };

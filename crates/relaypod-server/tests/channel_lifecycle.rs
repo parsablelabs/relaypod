@@ -16,6 +16,7 @@ async fn humans_manage_channels_and_deletion_cascades() {
             handle: "bot".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(human.identity.id.clone()),
+            agent_config: None,
         })
         .unwrap();
     let channel = store

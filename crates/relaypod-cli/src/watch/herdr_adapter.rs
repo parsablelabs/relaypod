@@ -55,7 +55,6 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         )
     })?;
     let kind = agent_type.as_herdr_kind();
-    let herdr_session = ctx.target.herdr_session.as_deref();
 
     let existing_pane = ctx
         .sessions
@@ -63,7 +62,7 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         .and_then(|s| s.strip_prefix(SESSION_PREFIX).map(ToString::to_string));
 
     let (pane_id, is_resume) = if let Some(pane) = existing_pane {
-        match get_herdr_agent_status(herdr_session, &pane).await {
+        match get_herdr_agent_status(&pane).await {
             Ok(status) => {
                 ctx.sessions.touch(ctx.identity_id, ctx.thread_id);
                 info!(
@@ -79,7 +78,7 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
                         pane_id = %pane,
                         "Waiting for busy Herdr agent to settle before sending follow-up"
                     );
-                    run_herdr_json(herdr_session, &["agent", "wait", &pane]).await?;
+                    run_herdr_json(&["agent", "wait", &pane]).await?;
                 }
                 (pane, true)
             }
@@ -92,8 +91,8 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
                     "Previous Herdr agent pane is no longer available; starting a fresh pane"
                 );
                 ctx.sessions.remove(ctx.identity_id, ctx.thread_id);
-                evict_lru_panes_if_needed(ctx, herdr_session).await;
-                let new_pane = spawn_herdr_agent_pane(ctx, herdr_session, kind).await?;
+                evict_lru_panes_if_needed(ctx).await;
+                let new_pane = spawn_herdr_agent_pane(ctx, kind).await?;
                 ctx.sessions.set(
                     ctx.identity_id,
                     ctx.thread_id,
@@ -103,8 +102,8 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
             }
         }
     } else {
-        evict_lru_panes_if_needed(ctx, herdr_session).await;
-        let new_pane = spawn_herdr_agent_pane(ctx, herdr_session, kind).await?;
+        evict_lru_panes_if_needed(ctx).await;
+        let new_pane = spawn_herdr_agent_pane(ctx, kind).await?;
         ctx.sessions.set(
             ctx.identity_id,
             ctx.thread_id,
@@ -131,14 +130,8 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         "Submitting prompt to Herdr agent"
     );
 
-    let prompt_resp = submit_herdr_prompt_with_retry(
-        herdr_session,
-        ctx.handle,
-        &pane_id,
-        &prompt,
-        !is_resume,
-    )
-    .await?;
+    let prompt_resp =
+        submit_herdr_prompt_with_retry(ctx.handle, &pane_id, &prompt, !is_resume).await?;
 
     let settled_status = extract_agent_status(&prompt_resp).unwrap_or("unknown");
     info!(
@@ -163,7 +156,6 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
 }
 
 async fn submit_herdr_prompt_with_retry(
-    herdr_session: Option<&str>,
     handle: &str,
     pane_id: &str,
     prompt: &str,
@@ -173,12 +165,7 @@ async fn submit_herdr_prompt_with_retry(
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=max_attempts {
-        match run_herdr_json(
-            herdr_session,
-            &["agent", "prompt", pane_id, prompt, "--wait"],
-        )
-        .await
-        {
+        match run_herdr_json(&["agent", "prompt", pane_id, prompt, "--wait"]).await {
             Ok(val) => return Ok(val),
             Err(err) => {
                 let msg = format!("{err:#}");
@@ -192,9 +179,7 @@ async fn submit_herdr_prompt_with_retry(
                     );
                     if is_fresh_pane && attempt == 1 {
                         // Dismiss any startup announcement banner (e.g. `esc to dismiss`) before retrying.
-                        let _ =
-                            run_herdr_json(herdr_session, &["agent", "send-keys", pane_id, "esc"])
-                                .await;
+                        let _ = run_herdr_json(&["agent", "send-keys", pane_id, "esc"]).await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                     last_err = Some(err);
@@ -211,7 +196,7 @@ async fn submit_herdr_prompt_with_retry(
 /// Enforces per-handle `max_sessions` and top-level `global_max_sessions` before spawning a new
 /// Herdr pane by closing the least-recently-used `idle`/`done` pane(s).
 /// Active (`working`) or `blocked` panes are never evicted.
-async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Option<&str>) {
+async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>) {
     if let Some(handle_cap) = ctx.target.max_sessions.filter(|&n| n > 0) {
         let handle_candidates: Vec<(String, String, String)> = ctx
             .sessions
@@ -225,14 +210,7 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
                     .map(|pane| (ctx.identity_id.to_string(), tid, pane.to_string()))
             })
             .collect();
-        evict_candidates_to_cap(
-            ctx,
-            herdr_session,
-            handle_candidates,
-            handle_cap,
-            "max_sessions",
-        )
-        .await;
+        evict_candidates_to_cap(ctx, handle_candidates, handle_cap, "max_sessions").await;
     }
 
     if let Some(global_cap) = ctx.target.global_max_sessions.filter(|&n| n > 0) {
@@ -248,20 +226,12 @@ async fn evict_lru_panes_if_needed(ctx: &DispatchContext<'_>, herdr_session: Opt
                     .map(|pane| (owner, tid, pane.to_string()))
             })
             .collect();
-        evict_candidates_to_cap(
-            ctx,
-            herdr_session,
-            global_candidates,
-            global_cap,
-            "global_max_sessions",
-        )
-        .await;
+        evict_candidates_to_cap(ctx, global_candidates, global_cap, "global_max_sessions").await;
     }
 }
 
 async fn evict_candidates_to_cap(
     ctx: &DispatchContext<'_>,
-    herdr_session: Option<&str>,
     candidates: Vec<(String, String, String)>,
     cap: usize,
     cap_label: &str,
@@ -269,7 +239,7 @@ async fn evict_candidates_to_cap(
     // Check which panes are actually still alive in Herdr; prune stale entries immediately.
     let mut live: Vec<(String, String, String, String)> = Vec::new();
     for (owner_handle, tid, pane_id) in candidates {
-        match get_herdr_agent_status(herdr_session, &pane_id).await {
+        match get_herdr_agent_status(&pane_id).await {
             Ok(status) => live.push((owner_handle, tid, pane_id, status)),
             Err(_) => {
                 ctx.sessions.remove(&owner_handle, &tid);
@@ -297,7 +267,7 @@ async fn evict_candidates_to_cap(
             cap = cap,
             "Evicting LRU Herdr pane to stay within session cap"
         );
-        match run_herdr_json(herdr_session, &["pane", "close", &pane_id]).await {
+        match run_herdr_json(&["pane", "close", &pane_id]).await {
             Ok(_) => {
                 ctx.sessions.remove(&owner_handle, &tid);
                 live_count = live_count.saturating_sub(1);
@@ -324,11 +294,7 @@ async fn evict_candidates_to_cap(
     }
 }
 
-async fn spawn_herdr_agent_pane(
-    ctx: &DispatchContext<'_>,
-    herdr_session: Option<&str>,
-    kind: &str,
-) -> Result<String> {
+async fn spawn_herdr_agent_pane(ctx: &DispatchContext<'_>, kind: &str) -> Result<String> {
     let label = herdr_tab_label(&ctx.item.channel_name, ctx.thread_id);
     let agent_name = herdr_agent_name(ctx.handle, ctx.thread_id);
 
@@ -338,14 +304,7 @@ async fn spawn_herdr_agent_pane(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
-    let pane_id = create_herdr_pane(
-        herdr_session,
-        ctx.target.herdr_workspace.as_deref(),
-        ctx.target.cwd.as_deref(),
-        &label,
-        &env_args,
-    )
-    .await?;
+    let pane_id = create_herdr_pane(ctx.target.cwd.as_deref(), &label, &env_args).await?;
 
     let extra_args = ctx
         .target
@@ -389,7 +348,7 @@ async fn spawn_herdr_agent_pane(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        match run_herdr_json(herdr_session, &start_refs).await {
+        match run_herdr_json(&start_refs).await {
             Ok(_) => {
                 last_err = None;
                 break;
@@ -420,7 +379,7 @@ async fn spawn_herdr_agent_pane(
 
     if let Some(err) = last_err {
         // Avoid leaking an empty shell tab if agent startup failed.
-        let _ = run_herdr_json(herdr_session, &["pane", "close", &pane_id]).await;
+        let _ = run_herdr_json(&["pane", "close", &pane_id]).await;
         return Err(err).with_context(|| {
             format!("failed to start Herdr agent `{agent_name}` ({kind}) in pane {pane_id}")
         });
@@ -430,19 +389,14 @@ async fn spawn_herdr_agent_pane(
 }
 
 async fn create_herdr_pane(
-    herdr_session: Option<&str>,
-    workspace_selector: Option<&str>,
     cwd: Option<&str>,
     tab_label: &str,
     env_args: &[String],
 ) -> Result<String> {
-    let target_ws = workspace_selector
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_HERDR_WORKSPACE);
+    let target_ws = DEFAULT_HERDR_WORKSPACE;
 
-    // Look up an existing workspace matching by ID or label (default: "relaypod").
-    let existing_ws_id = match run_herdr_json(herdr_session, &["workspace", "list"]).await {
+    // Look up the dedicated "relaypod" workspace by ID or label.
+    let existing_ws_id = match run_herdr_json(&["workspace", "list"]).await {
         Ok(val) => find_workspace_id(&val, target_ws),
         Err(err) => {
             warn!(error = %err, "Failed to list Herdr workspaces; will attempt to create workspace");
@@ -470,13 +424,12 @@ async fn create_herdr_pane(
         tab_args.push("--no-focus".into());
 
         let tab_refs: Vec<&str> = tab_args.iter().map(String::as_str).collect();
-        let val = run_herdr_json(herdr_session, &tab_refs).await?;
+        let val = run_herdr_json(&tab_refs).await?;
         return extract_pane_id(&val)
             .ok_or_else(|| anyhow!("missing pane_id in `herdr tab create` response: {val}"));
     }
 
-    // Dedicated workspace does not exist yet — create it labeled `target_ws` (e.g. "relaypod")
-    // and reuse its initial tab/pane.
+    // Dedicated "relaypod" workspace does not exist yet — create it and reuse its initial tab/pane.
     info!(workspace = %target_ws, "Creating dedicated Herdr workspace");
     let mut ws_args: Vec<String> = vec!["workspace".into(), "create".into()];
     if let Some(dir) = cwd {
@@ -492,18 +445,18 @@ async fn create_herdr_pane(
     ws_args.push("--no-focus".into());
 
     let ws_refs: Vec<&str> = ws_args.iter().map(String::as_str).collect();
-    let val = run_herdr_json(herdr_session, &ws_refs).await?;
+    let val = run_herdr_json(&ws_refs).await?;
 
     if let Some(tab_id) = extract_tab_id(&val) {
-        let _ = run_herdr_json(herdr_session, &["tab", "rename", &tab_id, tab_label]).await;
+        let _ = run_herdr_json(&["tab", "rename", &tab_id, tab_label]).await;
     }
 
     extract_pane_id(&val)
         .ok_or_else(|| anyhow!("missing pane_id in `herdr workspace create` response: {val}"))
 }
 
-async fn get_herdr_agent_status(herdr_session: Option<&str>, pane_id: &str) -> Result<String> {
-    let val = run_herdr_json(herdr_session, &["agent", "get", pane_id]).await?;
+async fn get_herdr_agent_status(pane_id: &str) -> Result<String> {
+    let val = run_herdr_json(&["agent", "get", pane_id]).await?;
     Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
 }
 
@@ -531,11 +484,8 @@ fn redact_herdr_args(args: &[&str]) -> String {
     out.join(" ")
 }
 
-async fn run_herdr_json(herdr_session: Option<&str>, args: &[&str]) -> Result<Value> {
+async fn run_herdr_json(args: &[&str]) -> Result<Value> {
     let mut cmd = Command::new("herdr");
-    if let Some(session) = herdr_session {
-        cmd.arg("--session").arg(session);
-    }
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

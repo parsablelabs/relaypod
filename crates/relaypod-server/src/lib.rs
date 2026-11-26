@@ -482,8 +482,20 @@ async fn create_identity(
             ));
         }
         req.owner_id = None;
+        req.agent_config = None;
     } else {
         req.owner_id = Some(caller.id);
+        if let Some(ref mut cfg) = req.agent_config {
+            if cfg.args.is_none() {
+                if let Some(ref harness) = cfg.harness {
+                    if let Some(default_args) =
+                        relaypod_core::AgentConfig::default_args_for_harness(harness)
+                    {
+                        cfg.args = Some(default_args.to_string());
+                    }
+                }
+            }
+        }
     }
     let mut created = state.store.create_identity(req)?;
     state.hydrate_identity(&mut created.identity);
@@ -511,13 +523,13 @@ async fn update_identity(
     if target.kind != IdentityKind::Agent {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "only agent identities can be renamed",
+            "only agent identities can be updated",
         ));
     }
     if target.owner_id.as_deref() != Some(caller.id.as_str()) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "only the human who registered this agent can rename it",
+            "only the human who registered this agent can update it",
         ));
     }
 

@@ -16,6 +16,7 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
             handle: "alice".into(),
             kind: IdentityKind::Human,
             owner_id: None,
+            agent_config: None,
         })
         .unwrap();
     let agent = store
@@ -23,6 +24,7 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
             handle: "codex-local".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
+            agent_config: None,
         })
         .unwrap();
     let general = store.get_channel("general").unwrap().unwrap();
@@ -125,6 +127,7 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             handle: "alice".into(),
             kind: IdentityKind::Human,
             owner_id: None,
+            agent_config: None,
         })
         .unwrap();
     let unused_agent = store
@@ -132,6 +135,7 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             handle: "temp-bot".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
+            agent_config: None,
         })
         .unwrap();
     let mentioned_agent = store
@@ -139,6 +143,7 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             handle: "mentioned-bot".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
+            agent_config: None,
         })
         .unwrap();
     let general = store.get_channel("general").unwrap().unwrap();
@@ -196,6 +201,7 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             handle: "temp-bot".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
+            agent_config: None,
         })
         .unwrap();
     assert_ne!(recreated.identity.id, unused_agent.identity.id);
@@ -225,6 +231,168 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
             handle: "mentioned-bot".into(),
             kind: IdentityKind::Agent,
             owner_id: Some(owner.identity.id.clone()),
+            agent_config: None,
         })
         .is_err());
+}
+
+#[tokio::test]
+async fn updates_agent_config_json_and_broadcasts_ws_event() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let owner = store.bootstrap("bob").unwrap().unwrap();
+    let state = AppState::new(Arc::clone(&store));
+    let mut events = state.events.subscribe();
+    let app = build_router(state);
+
+    let created: relaypod_core::CreatedIdentity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "POST",
+            "/api/identities",
+            json!({
+                "handle": "claude-dev",
+                "kind": "agent",
+                "agent_config": {
+                    "harness": "claude",
+                    "args": "--model claude-sonnet-4-6",
+                    "description": "General coding"
+                }
+            }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    let _ = events.try_recv();
+    let cfg = created.identity.agent_config.as_ref().expect("agent_config");
+    assert_eq!(cfg.harness.as_deref(), Some("claude"));
+    assert_eq!(cfg.args.as_deref(), Some("--model claude-sonnet-4-6"));
+
+    // Owner updates agent config via PATCH; WS broadcasts the updated config for watcher hot-reload.
+    let updated: Identity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "PATCH",
+            &format!("/api/identities/{}", created.identity.id),
+            json!({
+                "agent_config": {
+                    "harness": "claude",
+                    "args": "--model claude-opus-4-6 --effort high",
+                    "cooldown_secs": 3,
+                    "description": "Deep debugging"
+                }
+            }),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    let updated_cfg = updated.agent_config.as_ref().expect("updated config");
+    assert_eq!(updated_cfg.cooldown_secs, Some(3));
+    assert_eq!(
+        updated_cfg.args.as_deref(),
+        Some("--model claude-opus-4-6 --effort high")
+    );
+
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        WsEvent::IdentityUpdated(id)
+            if id.id == created.identity.id
+                && id.agent_config.as_ref().and_then(|c| c.cooldown_secs) == Some(3)
+    ));
+
+    // Other agents/humans can inspect agent_config via GET /api/identities for routing.
+    let list: Vec<Identity> = read_body(
+        request(&app, &created.token, "GET", "/api/identities", Value::Null).await,
+        StatusCode::OK,
+    )
+    .await;
+    let found = list
+        .iter()
+        .find(|i| i.id == created.identity.id)
+        .expect("agent in list");
+    assert_eq!(
+        found.agent_config.as_ref().and_then(|c| c.description.as_deref()),
+        Some("Deep debugging")
+    );
+
+    // Creating a claude or codex agent without explicit `args` populates default non-interactive args,
+    // which the owner can later clear or modify via PATCH.
+    let claude_default: relaypod_core::CreatedIdentity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "POST",
+            "/api/identities",
+            json!({
+                "handle": "claude-auto",
+                "kind": "agent",
+                "agent_config": { "harness": "claude" }
+            }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(
+        claude_default
+            .identity
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.args.as_deref()),
+        Some("--disallowedTools AskUserQuestion")
+    );
+
+    let codex_default: relaypod_core::CreatedIdentity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "POST",
+            "/api/identities",
+            json!({
+                "handle": "codex-auto",
+                "kind": "agent",
+                "agent_config": { "harness": "codex" }
+            }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(
+        codex_default
+            .identity
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.args.as_deref()),
+        Some("-c features.default_mode_request_user_input=false")
+    );
+
+    // Explicitly passing empty `args: ""` opts out of default args.
+    let claude_opt_out: relaypod_core::CreatedIdentity = read_body(
+        request(
+            &app,
+            &owner.token,
+            "POST",
+            "/api/identities",
+            json!({
+                "handle": "claude-raw",
+                "kind": "agent",
+                "agent_config": { "harness": "claude", "args": "" }
+            }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(
+        claude_opt_out
+            .identity
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.args.as_deref()),
+        None
+    );
 }

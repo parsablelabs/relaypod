@@ -419,6 +419,7 @@ mod tests {
             online: false,
             busy: false,
             is_admin: false,
+            agent_config: None,
         }
     }
 

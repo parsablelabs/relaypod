@@ -46,7 +46,7 @@ pub enum ClientCommand {
     },
     UpdateIdentity {
         identity_id: String,
-        request: UpdateIdentityRequest,
+        request: Box<UpdateIdentityRequest>,
     },
     DeleteIdentity {
         identity_id: String,
@@ -252,6 +252,7 @@ where
                                 handle,
                                 kind,
                                 owner_id: None,
+                                agent_config: None,
                             };
                             match c.create_identity(&req).await {
                                 Ok(created) => {
@@ -268,7 +269,7 @@ where
                         request,
                     } => {
                         if let Some(c) = &client {
-                            match c.update_identity(&identity_id, &request).await {
+                            match c.update_identity(&identity_id, request.as_ref()).await {
                                 Ok(updated) => emit(
                                     &event_tx,
                                     &notify,
