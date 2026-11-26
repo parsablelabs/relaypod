@@ -15,3 +15,4 @@ eframe.workspace = true
 egui.workspace = true
 relaypod-client = { path = "../relaypod-client" }
 relaypod-core = { path = "../relaypod-core" }
+tracing-subscriber.workspace = true

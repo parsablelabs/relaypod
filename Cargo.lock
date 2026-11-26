@@ -3116,6 +3116,7 @@ dependencies = [
  "egui",
  "relaypod-client",
  "relaypod-core",
+ "tracing-subscriber",
 ]
 
 [[package]]

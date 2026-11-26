@@ -1,6 +1,7 @@
 pub mod http;
 pub mod runtime;
 pub mod state;
+pub mod watch;
 pub mod ws;
 
 pub use http::{mcp_config_snippet, RelayPodClient};

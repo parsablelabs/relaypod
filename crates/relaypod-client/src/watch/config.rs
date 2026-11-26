@@ -773,6 +773,126 @@ pub fn update_watcher_token_in_config(path: &Path, name: &str, new_token: &str) 
     Ok(true)
 }
 
+/// Inserts or updates a `name: token` entry under `watcher.agent_tokens` in `config.yaml`.
+pub fn upsert_watcher_token_in_config(
+    path: &Path,
+    url: &str,
+    name: &str,
+    token: &str,
+) -> Result<()> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = match update_watcher_token_yaml(&existing, name, token)? {
+        Some(updated) => updated,
+        None => insert_watcher_token_yaml(&existing, url, name, token)?,
+    };
+    write_config_atomic(path, &updated)
+}
+
+/// Removes an existing `name: token` entry under `watcher.agent_tokens` in a YAML string.
+/// Returns `Ok(None)` if `name` is not configured under `watcher.agent_tokens`.
+pub fn remove_watcher_token_yaml(existing: &str, name: &str) -> Result<Option<String>> {
+    if existing.trim().is_empty() {
+        return Ok(None);
+    }
+    let parsed = parse_yaml_config(existing)?;
+    if !parsed.watcher.agent_tokens.contains_key(name) {
+        return Ok(None);
+    }
+
+    let mut lines: Vec<String> = existing.lines().map(ToString::to_string).collect();
+    let mut in_watcher = false;
+    let mut watcher_indent = 0usize;
+    let mut in_tokens = false;
+    let mut tokens_indent = 0usize;
+    let mut remove_idx: Option<usize> = None;
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let stripped = strip_yaml_comment(raw);
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (_, cols) = leading_whitespace(stripped);
+
+        if in_tokens && cols <= tokens_indent {
+            in_tokens = false;
+        }
+        if in_watcher && cols <= watcher_indent {
+            in_watcher = false;
+        }
+
+        if !in_watcher {
+            if cols == 0 {
+                if let Some((key, _)) = split_key_value(trimmed) {
+                    if key == "watcher" {
+                        in_watcher = true;
+                        watcher_indent = cols;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if !in_tokens {
+            if let Some((key, _)) = split_key_value(trimmed) {
+                if key == "agent_tokens" {
+                    in_tokens = true;
+                    tokens_indent = cols;
+                }
+            }
+            continue;
+        }
+
+        if let Some((key, _)) = split_key_value(trimmed) {
+            if unquote_yaml(key).trim_start_matches('@') == name {
+                remove_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let Some(idx) = remove_idx else {
+        return Err(anyhow!(
+            "internal error: token '{name}' found during parse but not during removal"
+        ));
+    };
+    lines.remove(idx);
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+
+    let reparsed =
+        parse_yaml_config(&out).context("internal error: updated config.yaml failed validation")?;
+    if reparsed.watcher.agent_tokens.contains_key(name) {
+        return Err(anyhow!(
+            "internal error: token '{name}' still present after removal"
+        ));
+    }
+
+    Ok(Some(out))
+}
+
+/// Removes a `name: token` entry under `watcher.agent_tokens` in `config.yaml` if present.
+/// Returns `Ok(true)` if removed, `Ok(false)` if the file or key was not present.
+pub fn remove_watcher_token_from_config(path: &Path, name: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let Some(updated) = remove_watcher_token_yaml(&existing, name)? else {
+        return Ok(false);
+    };
+    write_config_atomic(path, &updated)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1101,43 @@ watcher:
 
         // Missing key returns Ok(None).
         assert!(update_watcher_token_yaml(yaml, "unknown-bot", "rp_x")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn removes_watcher_token_from_yaml() {
+        let yaml = r#"server:
+  admin_handles:
+    - alice
+
+watcher:
+  url: http://127.0.0.1:8787
+  agent_tokens:
+    claude-local: rp_old_token
+    codex-local: rp_other_token
+"#;
+
+        let removed = remove_watcher_token_yaml(yaml, "claude-local")
+            .unwrap()
+            .expect("key exists");
+        let cfg = parse_yaml_config(&removed).unwrap();
+        assert!(!cfg.watcher.agent_tokens.contains_key("claude-local"));
+        assert_eq!(
+            cfg.watcher
+                .agent_tokens
+                .get("codex-local")
+                .map(String::as_str),
+            Some("rp_other_token")
+        );
+
+        let removed_last = remove_watcher_token_yaml(&removed, "codex-local")
+            .unwrap()
+            .expect("second key exists");
+        let cfg_empty = parse_yaml_config(&removed_last).unwrap();
+        assert!(cfg_empty.watcher.agent_tokens.is_empty());
+
+        assert!(remove_watcher_token_yaml(yaml, "missing-bot")
             .unwrap()
             .is_none());
     }

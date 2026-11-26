@@ -1,10 +1,12 @@
 use crate::http::RelayPodClient;
+use crate::watch::{WatcherSnapshot, WatcherSupervisor};
 use crate::ws::{run_live_ws_loop, DEFAULT_PING_INTERVAL};
 use relaypod_core::{
     AgentConfig, Channel, CreateChannelRequest, CreateIdentityRequest, CreatedIdentity, Identity,
     IdentityKind, Message, ThreadView, UnreadItem, UpdateChannelRequest, UpdateIdentityRequest,
     WsEvent,
 };
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -60,6 +62,15 @@ pub enum ClientCommand {
     AckUnread {
         unread_id: String,
     },
+    StartWatcher {
+        default_url: String,
+        config_path: Option<PathBuf>,
+    },
+    StopWatcher,
+    ReloadWatcher {
+        default_url: String,
+        config_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -82,6 +93,7 @@ pub enum ClientEvent {
     UnreadLoaded(Vec<UnreadItem>),
     Ws(WsEvent),
     WsStatus(bool),
+    WatcherState(WatcherSnapshot),
     Error(String),
 }
 
@@ -117,6 +129,13 @@ where
             let mut client: Option<RelayPodClient> = None;
             let mut current_me_id: Option<String> = None;
             let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
+
+            let tx_watcher = event_tx.clone();
+            let notify_watcher = Arc::clone(&notify);
+            let mut watcher = WatcherSupervisor::new(move |snapshot| {
+                let _ = tx_watcher.send(ClientEvent::WatcherState(snapshot));
+                (notify_watcher)();
+            });
 
             let emit = |tx: &Sender<ClientEvent>, notify: &Arc<F>, ev: ClientEvent| {
                 let _ = tx.send(ev);
@@ -160,6 +179,7 @@ where
                         if let Some(handle) = ws_task.take() {
                             handle.abort();
                         }
+                        watcher.stop();
                         client = None;
                         current_me_id = None;
                         emit(&event_tx, &notify, ClientEvent::Disconnected);
@@ -359,6 +379,19 @@ where
                                 }
                             }
                         }
+                    }
+                    ClientCommand::StartWatcher {
+                        default_url,
+                        config_path,
+                    }
+                    | ClientCommand::ReloadWatcher {
+                        default_url,
+                        config_path,
+                    } => {
+                        watcher.start_or_reload(default_url, config_path);
+                    }
+                    ClientCommand::StopWatcher => {
+                        watcher.stop();
                     }
                 }
             }

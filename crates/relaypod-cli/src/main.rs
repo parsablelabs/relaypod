@@ -1,9 +1,8 @@
 mod mcp;
-mod watch;
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
-use relaypod_client::{mcp_config_snippet, RelayPodClient};
+use relaypod_client::{mcp_config_snippet, watch, RelayPodClient};
 use relaypod_core::{
     AgentConfig, CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store,
     UpdateChannelRequest, UpdateIdentityRequest,
@@ -392,8 +391,9 @@ async fn main() -> Result<()> {
         } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "relaypod_cli=info,relaypod=info".into()),
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        "relaypod_client=info,relaypod_cli=info,relaypod=info".into()
+                    }),
                 )
                 .init();
 

@@ -3,6 +3,7 @@ mod markdown;
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, CornerRadius, Margin, Stroke};
+use relaypod_client::watch::{self, TargetPhase};
 use relaypod_client::{
     mcp_config_snippet, spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState,
 };
@@ -27,6 +28,13 @@ fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 }
 
 fn main() -> eframe::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "relaypod_client=info,relaypod_ui=info".into()),
+        )
+        .init();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 760.0])
         .with_title("RelayPod");
@@ -296,15 +304,21 @@ struct RelayPodApp {
     show_new_identity_modal: bool,
     new_identity_kind: IdentityKind,
     new_identity_draft: AgentEditDraft,
+    new_identity_watch_locally: bool,
     last_created_identity: Option<CreatedIdentity>,
+    last_created_watcher_note: Option<Result<String, String>>,
 
     pending_delete_message: Option<Message>,
     pending_delete_channel: Option<Channel>,
     pending_delete_identity: Option<Identity>,
     pending_regenerate_token: Option<Identity>,
     regenerated_token: Option<CreatedIdentity>,
+    regenerated_watcher_note: Option<Result<String, String>>,
     channel_edit: Option<Channel>,
     identity_edit: Option<AgentEditDraft>,
+
+    show_watcher_modal: bool,
+    watcher_auto_start: bool,
 
     channel_search: String,
     channels_section: CollapsibleSection,
@@ -350,14 +364,19 @@ impl RelayPodApp {
             show_new_identity_modal: false,
             new_identity_kind: IdentityKind::Agent,
             new_identity_draft: AgentEditDraft::new_blank(),
+            new_identity_watch_locally: true,
             last_created_identity: None,
+            last_created_watcher_note: None,
             pending_delete_message: None,
             pending_delete_channel: None,
             pending_delete_identity: None,
             pending_regenerate_token: None,
             regenerated_token: None,
+            regenerated_watcher_note: None,
             channel_edit: None,
             identity_edit: None,
+            show_watcher_modal: false,
+            watcher_auto_start: true,
             channel_search: String::new(),
             channels_section: CollapsibleSection::new(true),
             archived_channels_section: CollapsibleSection::new(false),
@@ -370,12 +389,48 @@ impl RelayPodApp {
             for cmd in effects.commands {
                 self.runtime.send(cmd);
             }
+            if effects.just_connected && self.watcher_auto_start {
+                self.runtime.send(ClientCommand::StartWatcher {
+                    default_url: self.server_url.clone(),
+                    config_path: None,
+                });
+            }
             if effects.channel_just_created {
                 self.show_new_channel_modal = false;
                 self.new_channel_name.clear();
                 self.new_channel_desc.clear();
             }
             if let Some(created) = effects.identity_just_created {
+                if created.identity.kind == IdentityKind::Agent && self.new_identity_watch_locally {
+                    match watch::default_config_path().and_then(|path| {
+                        watch::upsert_watcher_token_in_config(
+                            &path,
+                            &self.server_url,
+                            &created.identity.handle,
+                            &created.token,
+                        )
+                        .map(|()| path)
+                    }) {
+                        Ok(path) => {
+                            self.watcher_auto_start = true;
+                            self.runtime.send(ClientCommand::ReloadWatcher {
+                                default_url: self.server_url.clone(),
+                                config_path: None,
+                            });
+                            self.last_created_watcher_note = Some(Ok(format!(
+                                "Saved '{}' to {} and started local watcher.",
+                                created.identity.handle,
+                                path.display()
+                            )));
+                        }
+                        Err(err) => {
+                            self.last_created_watcher_note =
+                                Some(Err(format!("Failed to update config.yaml: {err}")));
+                        }
+                    }
+                } else {
+                    self.last_created_watcher_note = None;
+                }
                 self.last_created_identity = Some(created);
                 self.new_identity_draft = AgentEditDraft::new_blank();
             }
@@ -387,6 +442,36 @@ impl RelayPodApp {
                     .is_some_and(|me| me.id == regenerated.identity.id)
                 {
                     self.token = regenerated.token.clone();
+                }
+                if regenerated.identity.kind == IdentityKind::Agent {
+                    let key = self
+                        .state
+                        .watcher
+                        .token_name_for_identity(&regenerated.identity.id)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| regenerated.identity.handle.clone());
+                    self.regenerated_watcher_note =
+                        match watch::default_config_path().and_then(|path| {
+                            watch::update_watcher_token_in_config(&path, &key, &regenerated.token)
+                                .map(|updated| (path, updated))
+                        }) {
+                            Ok((path, true)) => {
+                                if self.state.watcher.running || self.watcher_auto_start {
+                                    self.runtime.send(ClientCommand::ReloadWatcher {
+                                        default_url: self.server_url.clone(),
+                                        config_path: None,
+                                    });
+                                }
+                                Some(Ok(format!(
+                                    "Updated '{key}' in {} and reloaded local watcher.",
+                                    path.display()
+                                )))
+                            }
+                            Ok((_, false)) => None,
+                            Err(err) => Some(Err(format!("Failed to update config.yaml: {err}"))),
+                        };
+                } else {
+                    self.regenerated_watcher_note = None;
                 }
                 self.regenerated_token = Some(regenerated);
             }
@@ -655,6 +740,11 @@ impl RelayPodApp {
 
                         if is_agent {
                             self.new_identity_draft.render_fields(ui, "new_agent", true);
+                            ui.add_space(6.0);
+                            ui.checkbox(
+                                &mut self.new_identity_watch_locally,
+                                "Watch on this machine (save to ~/.relaypod/config.yaml)",
+                            );
                         }
                     });
 
@@ -699,11 +789,23 @@ impl RelayPodApp {
                     let mut tok = created.token.clone();
                     ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
 
+                    if let Some(ref note) = self.last_created_watcher_note {
+                        ui.add_space(4.0);
+                        match note {
+                            Ok(msg) => {
+                                ui.colored_label(Color32::LIGHT_GREEN, msg);
+                            }
+                            Err(err) => {
+                                ui.colored_label(Color32::LIGHT_RED, err);
+                            }
+                        }
+                    }
+
                     if created.identity.kind == IdentityKind::Agent {
                         ui.add_space(4.0);
                         let cfg_line =
                             format!("    {}: {}", created.identity.handle, created.token);
-                        ui.horizontal(|ui| {
+                        if self.last_created_watcher_note.is_none() {
                             ui.label(
                                 egui::RichText::new(
                                     "Add under watcher.agent_tokens in ~/.relaypod/config.yaml:",
@@ -711,7 +813,7 @@ impl RelayPodApp {
                                 .size(11.5)
                                 .color(ui.visuals().weak_text_color()),
                             );
-                        });
+                        }
                         ui.horizontal(|ui| {
                             if ui.small_button("Copy config line").clicked() {
                                 ui.ctx().copy_text(cfg_line.clone());
@@ -729,6 +831,7 @@ impl RelayPodApp {
             if close || modal.should_close() {
                 self.show_new_identity_modal = false;
                 self.last_created_identity = None;
+                self.last_created_watcher_note = None;
             }
         }
 
@@ -839,6 +942,25 @@ impl RelayPodApp {
                     });
                 });
             if confirm {
+                if identity.kind == IdentityKind::Agent {
+                    if let Some(token_name) = self
+                        .state
+                        .watcher
+                        .token_name_for_identity(&identity.id)
+                        .map(ToString::to_string)
+                    {
+                        if let Ok(path) = watch::default_config_path() {
+                            if let Ok(true) =
+                                watch::remove_watcher_token_from_config(&path, &token_name)
+                            {
+                                self.runtime.send(ClientCommand::ReloadWatcher {
+                                    default_url: self.server_url.clone(),
+                                    config_path: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 self.runtime.send(ClientCommand::DeleteIdentity {
                     identity_id: identity.id.clone(),
                 });
@@ -896,6 +1018,17 @@ impl RelayPodApp {
                 });
                 let mut tok = regenerated.token.clone();
                 ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
+                if let Some(ref note) = self.regenerated_watcher_note {
+                    ui.add_space(4.0);
+                    match note {
+                        Ok(msg) => {
+                            ui.colored_label(Color32::LIGHT_GREEN, msg);
+                        }
+                        Err(err) => {
+                            ui.colored_label(Color32::LIGHT_RED, err);
+                        }
+                    }
+                }
                 ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Done").clicked() {
@@ -905,6 +1038,7 @@ impl RelayPodApp {
             });
             if close || modal.should_close() {
                 self.regenerated_token = None;
+                self.regenerated_watcher_note = None;
             }
         }
 
@@ -1007,6 +1141,192 @@ impl RelayPodApp {
                 self.pending_delete_message = None;
             }
         }
+
+        if self.show_watcher_modal {
+            let mut close = false;
+            let watcher = self.state.watcher.clone();
+            let modal = egui::Modal::new(egui::Id::new("watcher_modal")).show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.horizontal(|ui| {
+                    ui.heading("Local Agent Watcher");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                        if ui.button("Reload config").clicked() {
+                            self.watcher_auto_start = true;
+                            self.runtime.send(ClientCommand::ReloadWatcher {
+                                default_url: self.server_url.clone(),
+                                config_path: None,
+                            });
+                        }
+                        if watcher.running {
+                            if ui.button("Stop").clicked() {
+                                self.watcher_auto_start = false;
+                                self.runtime.send(ClientCommand::StopWatcher);
+                            }
+                        } else if ui.button("Start").clicked() {
+                            self.watcher_auto_start = true;
+                            self.runtime.send(ClientCommand::StartWatcher {
+                                default_url: self.server_url.clone(),
+                                config_path: None,
+                            });
+                        }
+                    });
+                });
+
+                let cfg_label = watcher
+                    .config_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.relaypod/config.yaml".to_string());
+                ui.label(
+                    egui::RichText::new(format!("Config: {cfg_label}"))
+                        .size(11.5)
+                        .color(ui.visuals().weak_text_color()),
+                );
+
+                if let Some(ref err) = watcher.last_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::LIGHT_RED, err);
+                }
+
+                ui.add_space(8.0);
+                ui.strong(format!("Watched Agents ({})", watcher.targets.len()));
+                ui.add_space(4.0);
+
+                if watcher.targets.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No local agents are currently running. Click '+' next to IDENTITIES \
+                             to create an agent and watch it on this machine, or add entries under \
+                             watcher.agent_tokens in ~/.relaypod/config.yaml and click Reload config.",
+                        )
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                } else {
+                    egui::Frame::group(ui.style())
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for target in &watcher.targets {
+                                ui.horizontal(|ui| {
+                                    let (dot_color, pulse, phase_text, err_tooltip) =
+                                        match &target.phase {
+                                            TargetPhase::Connecting => {
+                                                (Color32::YELLOW, false, "Connecting...".into(), None)
+                                            }
+                                            TargetPhase::Connected => {
+                                                (Color32::LIGHT_GREEN, true, "Connected".into(), None)
+                                            }
+                                            TargetPhase::Working { channel } => (
+                                                Color32::from_rgb(96, 165, 250),
+                                                true,
+                                                format!("Working in #{channel}"),
+                                                None,
+                                            ),
+                                            TargetPhase::Reconnecting => (
+                                                Color32::YELLOW,
+                                                false,
+                                                "Reconnecting...".into(),
+                                                None,
+                                            ),
+                                            TargetPhase::Error(msg) => (
+                                                Color32::LIGHT_RED,
+                                                false,
+                                                "Error".into(),
+                                                Some(msg.clone()),
+                                            ),
+                                        };
+                                    draw_status_dot(ui, dot_color, pulse);
+
+                                    let primary = match &target.handle {
+                                        Some(h) => format!("@{h}"),
+                                        None => target.token_name.clone(),
+                                    };
+                                    ui.strong(&primary);
+
+                                    if target.handle.as_deref() != Some(target.token_name.as_str())
+                                        && target.handle.is_some()
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "(key: {})",
+                                                target.token_name
+                                            ))
+                                            .size(11.5)
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    }
+
+                                    let meta = match (&target.runner, &target.harness) {
+                                        (Some(r), Some(h)) => format!("{r}/{h}"),
+                                        (Some(r), None) => r.clone(),
+                                        _ => String::new(),
+                                    };
+                                    if !meta.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(meta)
+                                                .size(11.5)
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                    }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let lbl = ui.colored_label(dot_color, phase_text);
+                                            if let Some(tip) = err_tooltip {
+                                                lbl.on_hover_text(tip);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                }
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(format!(
+                    "Recent Activity ({})",
+                    watcher.recent_logs.len()
+                ))
+                .id_salt("watcher_recent_activity")
+                .default_open(!watcher.recent_logs.is_empty())
+                .show(ui, |ui| {
+                    if watcher.recent_logs.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No watcher activity yet.")
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    } else {
+                        egui::Frame::group(ui.style())
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::vertical()
+                                    .id_salt("watcher_logs_scroll")
+                                    .max_height(160.0)
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        for line in &watcher.recent_logs {
+                                            ui.label(
+                                                egui::RichText::new(line)
+                                                    .monospace()
+                                                    .size(11.5),
+                                            );
+                                        }
+                                    });
+                            });
+                    }
+                });
+            });
+            if close || modal.should_close() {
+                self.show_watcher_modal = false;
+            }
+        }
     }
 }
 
@@ -1064,8 +1384,11 @@ impl eframe::App for RelayPodApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Disconnect").clicked() {
                         self.last_created_identity = None;
+                        self.last_created_watcher_note = None;
                         self.pending_regenerate_token = None;
                         self.regenerated_token = None;
+                        self.regenerated_watcher_note = None;
+                        self.show_watcher_modal = false;
                         self.runtime.send(ClientCommand::Disconnect);
                     }
                     let unread_label = format!("My Unread ({})", self.state.unread.len());
@@ -1078,6 +1401,20 @@ impl eframe::App for RelayPodApp {
                             self.runtime.send(ClientCommand::RefreshUnread);
                         }
                     }
+
+                    let (watcher_label, watcher_color, watcher_pulse) =
+                        watcher_pill_summary(&self.state.watcher);
+                    let pill =
+                        egui::Button::new(egui::RichText::new(watcher_label).color(watcher_color))
+                            .selected(self.show_watcher_modal);
+                    if ui
+                        .add(pill)
+                        .on_hover_text("Local agent watcher status & controls")
+                        .clicked()
+                    {
+                        self.show_watcher_modal = !self.show_watcher_modal;
+                    }
+                    draw_status_dot(ui, watcher_color, watcher_pulse);
                 });
             });
             if let Some(err) = self.state.status_error.clone() {
@@ -1194,7 +1531,9 @@ impl eframe::App for RelayPodApp {
                                 self.show_new_identity_modal = true;
                                 self.new_identity_kind = IdentityKind::Agent;
                                 self.new_identity_draft = AgentEditDraft::new_blank();
+                                self.new_identity_watch_locally = true;
                                 self.last_created_identity = None;
+                                self.last_created_watcher_note = None;
                             }
                         });
                     }
@@ -1215,11 +1554,21 @@ impl eframe::App for RelayPodApp {
                                     .selectable(false)
                                     .sense(egui::Sense::click()),
                             );
-                            if let Some(ref cfg) = id.agent_config {
-                                let tooltip = format_agent_config_tooltip(cfg);
-                                if !tooltip.is_empty() {
-                                    row = row.on_hover_text(tooltip);
-                                }
+                            let mut tooltip_lines = id
+                                .agent_config
+                                .as_ref()
+                                .map(format_agent_config_tooltip)
+                                .filter(|s| !s.is_empty())
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            if let Some(token_key) =
+                                self.state.watcher.token_name_for_identity(&id.id)
+                            {
+                                tooltip_lines
+                                    .push(format!("Watched locally (config key: {token_key})"));
+                            }
+                            if !tooltip_lines.is_empty() {
+                                row = row.on_hover_text(tooltip_lines.join("\n"));
                             }
                             let can_edit = self.can_rename_identity(id);
                             let can_regen = self.can_regenerate_token(id);
@@ -1606,6 +1955,41 @@ fn format_agent_config_tooltip(cfg: &AgentConfig) -> String {
         lines.push(format!("Cooldown: {c}s"));
     }
     lines.join("\n")
+}
+
+fn watcher_pill_summary(snapshot: &watch::WatcherSnapshot) -> (String, Color32, bool) {
+    if snapshot.last_error.is_some() {
+        return ("Watcher (err)".to_string(), Color32::LIGHT_RED, false);
+    }
+    if !snapshot.running || snapshot.targets.is_empty() {
+        return ("Watcher: Off".to_string(), Color32::from_gray(145), false);
+    }
+    let total = snapshot.targets.len();
+    let connected = snapshot.connected_count();
+    let working = snapshot.working_count();
+    let errors = snapshot.error_count();
+
+    if errors > 0 {
+        (
+            format!("Watcher ({connected}/{total})"),
+            Color32::LIGHT_RED,
+            false,
+        )
+    } else if working > 0 {
+        (
+            format!("Watcher ({total} • working)"),
+            Color32::from_rgb(96, 165, 250),
+            true,
+        )
+    } else if connected == total {
+        (format!("Watcher ({total})"), Color32::LIGHT_GREEN, true)
+    } else {
+        (
+            format!("Watcher ({connected}/{total})"),
+            Color32::YELLOW,
+            false,
+        )
+    }
 }
 
 fn is_non_loopback_http(url: &str) -> bool {
@@ -2856,5 +3240,56 @@ mod tests {
                 "composer height should be capped by scroll area, got {settled}"
             );
         }
+    }
+
+    #[test]
+    fn formats_watcher_pill_summary_for_all_states() {
+        let off = watch::WatcherSnapshot::default();
+        assert_eq!(watcher_pill_summary(&off).0, "Watcher: Off");
+
+        let err = watch::WatcherSnapshot {
+            last_error: Some("bad yaml".into()),
+            ..Default::default()
+        };
+        assert_eq!(watcher_pill_summary(&err).0, "Watcher (err)");
+
+        let mk_target = |name: &str, phase: TargetPhase| watch::WatchedTargetState {
+            token_name: name.into(),
+            identity_id: Some("id1".into()),
+            handle: Some(name.into()),
+            runner: Some("herdr".into()),
+            harness: Some("claude".into()),
+            phase,
+        };
+
+        let connected = watch::WatcherSnapshot {
+            running: true,
+            targets: vec![
+                mk_target("claude", TargetPhase::Connected),
+                mk_target("codex", TargetPhase::Connected),
+            ],
+            ..Default::default()
+        };
+        let (label, color, pulse) = watcher_pill_summary(&connected);
+        assert_eq!(label, "Watcher (2)");
+        assert_eq!(color, Color32::LIGHT_GREEN);
+        assert!(pulse);
+
+        let working = watch::WatcherSnapshot {
+            running: true,
+            targets: vec![
+                mk_target(
+                    "claude",
+                    TargetPhase::Working {
+                        channel: "general".into(),
+                    },
+                ),
+                mk_target("codex", TargetPhase::Connected),
+            ],
+            ..Default::default()
+        };
+        let (label, _, pulse) = watcher_pill_summary(&working);
+        assert_eq!(label, "Watcher (2 • working)");
+        assert!(pulse);
     }
 }
