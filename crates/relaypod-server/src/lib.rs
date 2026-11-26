@@ -105,10 +105,12 @@ impl AppState {
             let was_online = guard
                 .get(identity_id)
                 .is_some_and(|e| e.connections > 0 && e.last_ping.elapsed() <= PRESENCE_TTL);
-            let entry = guard.entry(identity_id.to_string()).or_insert(PresenceEntry {
-                connections: 0,
-                last_ping: now,
-            });
+            let entry = guard
+                .entry(identity_id.to_string())
+                .or_insert(PresenceEntry {
+                    connections: 0,
+                    last_ping: now,
+                });
             entry.connections += 1;
             entry.last_ping = now;
             !was_online
@@ -129,10 +131,12 @@ impl AppState {
             let was_online = guard
                 .get(identity_id)
                 .is_some_and(|e| e.connections > 0 && e.last_ping.elapsed() <= PRESENCE_TTL);
-            let entry = guard.entry(identity_id.to_string()).or_insert(PresenceEntry {
-                connections: 1,
-                last_ping: now,
-            });
+            let entry = guard
+                .entry(identity_id.to_string())
+                .or_insert(PresenceEntry {
+                    connections: 1,
+                    last_ping: now,
+                });
             if entry.connections == 0 {
                 entry.connections = 1;
             }
@@ -214,7 +218,11 @@ impl AppState {
         }
         let changed = {
             let mut guard = self.activity.lock().expect("activity lock poisoned");
-            let key = (identity_id.to_string(), channel_id.clone(), thread_id.clone());
+            let key = (
+                identity_id.to_string(),
+                channel_id.clone(),
+                thread_id.clone(),
+            );
             if active {
                 if !guard.contains_key(&key) {
                     let count = guard.keys().filter(|(id, _, _)| id == identity_id).count();
@@ -282,13 +290,15 @@ impl AppState {
         let guard = self.activity.lock().expect("activity lock poisoned");
         guard
             .iter()
-            .map(|((identity_id, channel_id, thread_id), handle)| WsEvent::ActivityChanged {
-                identity_id: identity_id.clone(),
-                handle: handle.clone(),
-                channel_id: channel_id.clone(),
-                thread_id: thread_id.clone(),
-                active: true,
-            })
+            .map(
+                |((identity_id, channel_id, thread_id), handle)| WsEvent::ActivityChanged {
+                    identity_id: identity_id.clone(),
+                    handle: handle.clone(),
+                    channel_id: channel_id.clone(),
+                    thread_id: thread_id.clone(),
+                    active: true,
+                },
+            )
             .collect()
     }
 }
@@ -329,7 +339,13 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.message })).into_response()
+        (
+            self.status,
+            Json(ErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -390,12 +406,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/me", get(get_me))
-        .route("/api/identities", get(list_identities).post(create_identity))
+        .route(
+            "/api/identities",
+            get(list_identities).post(create_identity),
+        )
         .route(
             "/api/identities/{id}",
             patch(update_identity).delete(delete_identity),
         )
-        .route("/api/identities/{id}/token", post(regenerate_identity_token))
+        .route(
+            "/api/identities/{id}/token",
+            post(regenerate_identity_token),
+        )
         .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/{id}",
@@ -519,10 +541,12 @@ async fn update_identity(
         .lock()
         .expect("board write lock poisoned");
 
-    let target = state
-        .store
-        .get_identity(&identity_id)?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("identity '{identity_id}' not found")))?;
+    let target = state.store.get_identity(&identity_id)?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("identity '{identity_id}' not found"),
+        )
+    })?;
 
     if target.kind != IdentityKind::Agent {
         return Err(ApiError::new(
@@ -555,15 +579,12 @@ async fn delete_identity(
         .lock()
         .expect("board write lock poisoned");
 
-    let target = state
-        .store
-        .get_identity(&identity_id)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("identity '{identity_id}' not found"),
-            )
-        })?;
+    let target = state.store.get_identity(&identity_id)?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("identity '{identity_id}' not found"),
+        )
+    })?;
 
     match target.kind {
         IdentityKind::Human => {
@@ -613,15 +634,12 @@ async fn regenerate_identity_token(
         .lock()
         .expect("board write lock poisoned");
 
-    let target = state
-        .store
-        .get_identity(&identity_id)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("identity '{identity_id}' not found"),
-            )
-        })?;
+    let target = state.store.get_identity(&identity_id)?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("identity '{identity_id}' not found"),
+        )
+    })?;
 
     match target.kind {
         IdentityKind::Human => {
@@ -703,15 +721,12 @@ async fn delete_channel(
         .board_writes
         .lock()
         .expect("board write lock poisoned");
-    let channel = state
-        .store
-        .get_channel(&channel_id)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("channel '{channel_id}' not found"),
-            )
-        })?;
+    let channel = state.store.get_channel(&channel_id)?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("channel '{channel_id}' not found"),
+        )
+    })?;
     if !state.is_admin(&caller) && channel.created_by.as_deref() != Some(caller.id.as_str()) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -742,7 +757,9 @@ async fn list_channel_messages(
     Path(channel_id): Path<String>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Vec<relaypod_core::Message>>, ApiError> {
-    let msgs = state.store.list_channel_messages(&channel_id, query.limit)?;
+    let msgs = state
+        .store
+        .list_channel_messages(&channel_id, query.limit)?;
     Ok(Json(msgs))
 }
 

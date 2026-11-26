@@ -344,7 +344,10 @@ impl Store {
             let mut mentioned = false;
             for body in bodies {
                 let body = body?;
-                if extract_mentions(&body).iter().any(|h| h == &identity.handle) {
+                if extract_mentions(&body)
+                    .iter()
+                    .any(|h| h == &identity.handle)
+                {
                     mentioned = true;
                     break;
                 }
@@ -366,7 +369,10 @@ impl Store {
                 "UPDATE identities SET owner_id = NULL WHERE owner_id = ?1",
                 params![&identity.id],
             )?;
-            tx.execute("DELETE FROM identities WHERE id = ?1", params![&identity.id])?;
+            tx.execute(
+                "DELETE FROM identities WHERE id = ?1",
+                params![&identity.id],
+            )?;
         } else {
             let deleted_at = now_ms();
             let revoked_hash = format!("revoked:{}:{deleted_at}", identity.id);
@@ -528,7 +534,9 @@ impl Store {
     ) -> CoreResult<PostMessageResult> {
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            return Err(CoreError::InvalidInput("message body cannot be empty".into()));
+            return Err(CoreError::InvalidInput(
+                "message body cannot be empty".into(),
+            ));
         }
         if trimmed.len() > MAX_MESSAGE_BODY_LEN {
             return Err(CoreError::InvalidInput(format!(
@@ -550,8 +558,8 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let (parent_channel_id, grandparent_id) = parent_row
-                .ok_or_else(|| CoreError::NotFound(format!("parent message '{pid}'")))?;
+            let (parent_channel_id, grandparent_id) =
+                parent_row.ok_or_else(|| CoreError::NotFound(format!("parent message '{pid}'")))?;
             if parent_channel_id != channel.id {
                 return Err(CoreError::InvalidInput(
                     "parent message belongs to a different channel".into(),
@@ -795,7 +803,10 @@ impl Store {
     }
 
     /// Returns author metadata for a message, used to authorize message deletion.
-    pub fn get_message_delete_info(&self, message_id: &str) -> CoreResult<Option<MessageDeleteInfo>> {
+    pub fn get_message_delete_info(
+        &self,
+        message_id: &str,
+    ) -> CoreResult<Option<MessageDeleteInfo>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         Ok(conn
             .query_row(
@@ -806,7 +817,9 @@ impl Store {
                 params![message_id],
                 |r| {
                     let kind_str: String = r.get(3)?;
-                    let author_kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+                    let author_kind = kind_str
+                        .parse::<IdentityKind>()
+                        .unwrap_or(IdentityKind::Agent);
                     Ok(MessageDeleteInfo {
                         message_id: r.get(0)?,
                         parent_id: r.get(1)?,
@@ -1039,7 +1052,9 @@ fn ensure_channel_writable(channel: &Channel) -> CoreResult<()> {
 
 fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Identity> {
     let kind_str: String = row.get(2)?;
-    let kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+    let kind = kind_str
+        .parse::<IdentityKind>()
+        .unwrap_or(IdentityKind::Agent);
     let agent_config_raw: Option<String> = row.get(6)?;
     let agent_config = agent_config_raw
         .as_deref()
@@ -1074,7 +1089,9 @@ fn row_to_channel(row: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let kind_str: String = row.get(5)?;
-    let author_kind = kind_str.parse::<IdentityKind>().unwrap_or(IdentityKind::Agent);
+    let author_kind = kind_str
+        .parse::<IdentityKind>()
+        .unwrap_or(IdentityKind::Agent);
     Ok(Message {
         id: row.get(0)?,
         channel_id: row.get(1)?,
@@ -1273,7 +1290,12 @@ mod tests {
 
         // Human mentions agent in #general
         let post = store
-            .post_message("general", &admin.identity, "@claude-local please check auth", None)
+            .post_message(
+                "general",
+                &admin.identity,
+                "@claude-local please check auth",
+                None,
+            )
             .unwrap();
         assert_eq!(post.created_unread.len(), 1);
         assert_eq!(post.created_unread[0].identity_id, agent.identity.id);
@@ -1337,7 +1359,10 @@ mod tests {
         let deleted = store.delete_message(&post.message.id).unwrap();
         assert_eq!(deleted.message_id, post.message.id);
         assert_eq!(deleted.affected_unread.len(), 2);
-        assert!(store.list_channel_messages("general", 20).unwrap().is_empty());
+        assert!(store
+            .list_channel_messages("general", 20)
+            .unwrap()
+            .is_empty());
         assert!(store.list_unread(&admin.identity.id).unwrap().is_empty());
     }
 

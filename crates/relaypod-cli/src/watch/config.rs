@@ -37,9 +37,10 @@ impl AgentType {
         match normalized.as_str() {
             "codex" => Some(Self::Codex),
             "claude" | "claude-code" => Some(Self::Claude),
-            other if other
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') =>
+            other
+                if other.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                }) =>
             {
                 Some(Self::Other(other.to_string()))
             }
@@ -272,7 +273,9 @@ pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
                     }
                     "global_max_sessions" => {
                         let parsed = val.parse::<usize>().map_err(|_| {
-                            anyhow!("line {line_no}: invalid integer `{val}` for global_max_sessions")
+                            anyhow!(
+                                "line {line_no}: invalid integer `{val}` for global_max_sessions"
+                            )
                         })?;
                         cfg.watcher.global_max_sessions =
                             if parsed == 0 { None } else { Some(parsed) };
@@ -578,7 +581,10 @@ pub fn insert_watcher_token_yaml(
                 while insert_at > t_start + 1 && lines[insert_at - 1].trim().is_empty() {
                     insert_at -= 1;
                 }
-                lines.insert(insert_at, format!("{entry_indent}{name}: {}", yaml_scalar(token)));
+                lines.insert(
+                    insert_at,
+                    format!("{entry_indent}{name}: {}", yaml_scalar(token)),
+                );
             } else {
                 let mut insert_at = watcher_end;
                 while insert_at > w_start + 1 && lines[insert_at - 1].trim().is_empty() {
@@ -741,8 +747,8 @@ pub fn update_watcher_token_yaml(
     let mut out = lines.join("\n");
     out.push('\n');
 
-    let reparsed = parse_yaml_config(&out)
-        .context("internal error: updated config.yaml failed validation")?;
+    let reparsed =
+        parse_yaml_config(&out).context("internal error: updated config.yaml failed validation")?;
     if reparsed.watcher.agent_tokens.get(name).map(String::as_str) != Some(new_token) {
         return Err(anyhow!(
             "internal error: updated token for '{name}' did not match after validation"
@@ -801,7 +807,10 @@ watcher:
         );
         assert_eq!(cfg.watcher.agent_tokens.len(), 2);
         assert_eq!(
-            cfg.watcher.agent_tokens.get("mbp-codex").map(String::as_str),
+            cfg.watcher
+                .agent_tokens
+                .get("mbp-codex")
+                .map(String::as_str),
             Some("rp_123")
         );
         assert_eq!(

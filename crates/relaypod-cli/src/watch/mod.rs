@@ -4,9 +4,7 @@ pub mod exec_adapter;
 pub mod herdr_adapter;
 
 use anyhow::{anyhow, Context, Result};
-use relaypod_client::{
-    run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL,
-};
+use relaypod_client::{run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL};
 use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -128,8 +126,7 @@ impl SessionStore {
     }
 
     fn next_tick(&self) -> u64 {
-        self.tick
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn key(identity_id: &str, thread_id: &str) -> String {
@@ -214,10 +211,7 @@ impl SessionStore {
             .map(|(k, tid, sid)| (ts.get(&k).copied().unwrap_or(0), tid, sid))
             .collect();
         scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        scored
-            .into_iter()
-            .map(|(_, tid, sid)| (tid, sid))
-            .collect()
+        scored.into_iter().map(|(_, tid, sid)| (tid, sid)).collect()
     }
 
     /// Returns `(handle, thread_id, session_id)` across all handles, ordered least-recently-used first.
@@ -262,10 +256,7 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
         return Err(anyhow!("no handles configured to watch"));
     }
 
-    info!(
-        "Starting RelayPod watcher for {} target(s)",
-        targets.len()
-    );
+    info!("Starting RelayPod watcher for {} target(s)", targets.len());
 
     let sessions = SessionStore::load_default();
     let mut join_handles = Vec::with_capacity(targets.len());
@@ -339,8 +330,8 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
                 prompt: None,
                 instructions_file: None,
                 cwd: Some(expand_tilde(
-                opts.cwd_override.as_deref().unwrap_or(DEFAULT_AGENT_CWD),
-            )),
+                    opts.cwd_override.as_deref().unwrap_or(DEFAULT_AGENT_CWD),
+                )),
                 global_max_sessions: None,
                 max_sessions: None,
                 max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
@@ -885,9 +876,7 @@ pub(crate) async fn build_agent_prompt_with_context(
     ctx: &DispatchContext<'_>,
     is_resume: bool,
 ) -> String {
-    let prior_thread = if !is_resume
-        && ctx.target.prompt.is_none()
-        && ctx.item.parent_id.is_some()
+    let prior_thread = if !is_resume && ctx.target.prompt.is_none() && ctx.item.parent_id.is_some()
     {
         match ctx.client.get_thread(ctx.thread_id).await {
             Ok(thread) => format_prior_thread_context(&thread, &ctx.item.message_id),
@@ -1111,8 +1100,8 @@ mod tests {
 
     #[test]
     fn formats_prior_thread_context_up_to_current_message() {
-        let mk_msg = |id: &str, author: &str, body: &str, parent: Option<&str>| {
-            relaypod_core::Message {
+        let mk_msg =
+            |id: &str, author: &str, body: &str, parent: Option<&str>| relaypod_core::Message {
                 id: id.into(),
                 channel_id: "c1".into(),
                 parent_id: parent.map(ToString::to_string),
@@ -1122,8 +1111,7 @@ mod tests {
                 body: body.into(),
                 created_at: 0,
                 reply_count: 0,
-            }
-        };
+            };
         let thread = relaypod_core::ThreadView {
             parent: mk_msg("m1", "alice", "Let's fix issue #4", None),
             replies: vec![
@@ -1143,27 +1131,31 @@ mod tests {
 
     #[test]
     fn analyzes_consecutive_agent_turns_and_human_resets() {
-        let mk_msg =
-            |id: &str, author: &str, kind: relaypod_core::IdentityKind, body: &str| {
-                relaypod_core::Message {
-                    id: id.into(),
-                    channel_id: "c1".into(),
-                    parent_id: if id == "m1" { None } else { Some("m1".into()) },
-                    author_id: author.into(),
-                    author_handle: author.into(),
-                    author_kind: kind,
-                    body: body.into(),
-                    created_at: 0,
-                    reply_count: 0,
-                }
-            };
+        let mk_msg = |id: &str, author: &str, kind: relaypod_core::IdentityKind, body: &str| {
+            relaypod_core::Message {
+                id: id.into(),
+                channel_id: "c1".into(),
+                parent_id: if id == "m1" { None } else { Some("m1".into()) },
+                author_id: author.into(),
+                author_handle: author.into(),
+                author_kind: kind,
+                body: body.into(),
+                created_at: 0,
+                reply_count: 0,
+            }
+        };
         let thread = relaypod_core::ThreadView {
             parent: mk_msg("m1", "alice", relaypod_core::IdentityKind::Human, "go"),
             replies: vec![
                 mk_msg("m2", "agy", relaypod_core::IdentityKind::Agent, "opened PR"),
                 mk_msg("m3", "codex", relaypod_core::IdentityKind::Agent, "nit 1"),
                 mk_msg("m4", "agy", relaypod_core::IdentityKind::Agent, "fixed 1"),
-                mk_msg("m5", "alice", relaypod_core::IdentityKind::Human, "keep going"),
+                mk_msg(
+                    "m5",
+                    "alice",
+                    relaypod_core::IdentityKind::Human,
+                    "keep going",
+                ),
                 mk_msg("m6", "codex", relaypod_core::IdentityKind::Agent, "nit 2"),
                 mk_msg("m7", "agy", relaypod_core::IdentityKind::Agent, "fixed 2"),
             ],

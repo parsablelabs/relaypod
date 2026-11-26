@@ -1,7 +1,5 @@
 use crate::runtime::{ClientCommand, ClientEvent};
-use relaypod_core::{
-    Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent,
-};
+use relaypod_core::{Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent};
 
 /// Follow-up commands or UI signals produced by reducing a `ClientEvent`.
 #[derive(Debug, Default)]
@@ -138,11 +136,7 @@ impl WorkspaceState {
             }
             ClientEvent::IdentityCreated(created) => {
                 self.status_error = None;
-                if !self
-                    .identities
-                    .iter()
-                    .any(|i| i.id == created.identity.id)
-                {
+                if !self.identities.iter().any(|i| i.id == created.identity.id) {
                     self.identities.push(created.identity.clone());
                 }
                 effects.identity_just_created = Some(created);
@@ -214,8 +208,7 @@ impl WorkspaceState {
                             let before = thread.replies.len();
                             thread.replies.retain(|r| r.id != message_id);
                             if thread.replies.len() < before {
-                                thread.parent.reply_count =
-                                    (thread.parent.reply_count - 1).max(0);
+                                thread.parent.reply_count = (thread.parent.reply_count - 1).max(0);
                             }
                         }
                     }
@@ -230,11 +223,16 @@ impl WorkspaceState {
                     }
                 }
                 self.unread.retain(|u| {
-                    u.message_id != message_id && u.parent_id.as_deref() != Some(message_id.as_str())
+                    u.message_id != message_id
+                        && u.parent_id.as_deref() != Some(message_id.as_str())
                 });
             }
             WsEvent::UnreadCreated(item) => {
-                if let Some(id) = self.identities.iter_mut().find(|i| i.id == item.identity_id) {
+                if let Some(id) = self
+                    .identities
+                    .iter_mut()
+                    .find(|i| i.id == item.identity_id)
+                {
                     id.unread_count += 1;
                 }
                 if self.me.as_ref().map(|m| m.id.as_str()) == Some(item.identity_id.as_str())

@@ -405,12 +405,8 @@ async fn create_herdr_pane(
     };
 
     if let Some(ws_id) = existing_ws_id {
-        let mut tab_args: Vec<String> = vec![
-            "tab".into(),
-            "create".into(),
-            "--workspace".into(),
-            ws_id,
-        ];
+        let mut tab_args: Vec<String> =
+            vec!["tab".into(), "create".into(), "--workspace".into(), ws_id];
         if let Some(dir) = cwd {
             tab_args.push("--cwd".into());
             tab_args.push(dir.into());
@@ -510,9 +506,8 @@ async fn run_herdr_json(args: &[&str]) -> Result<Value> {
         return Ok(Value::Null);
     }
 
-    serde_json::from_str(&stdout).with_context(|| {
-        format!("failed to parse JSON from `herdr {redacted}`: {stdout}")
-    })
+    serde_json::from_str(&stdout)
+        .with_context(|| format!("failed to parse JSON from `herdr {redacted}`: {stdout}"))
 }
 
 /// Builds a Herdr-compliant agent name matching `[a-z][a-z0-9_-]{0,31}` with a `relaypod-` prefix.
@@ -536,7 +531,10 @@ pub(crate) fn herdr_agent_name(handle: &str, thread_id: &str) -> String {
         .to_string();
 
     if truncated_handle.is_empty() {
-        format!("relaypod{}", if suffix.is_empty() { "-agent" } else { &suffix })
+        format!(
+            "relaypod{}",
+            if suffix.is_empty() { "-agent" } else { &suffix }
+        )
     } else {
         format!("relaypod-{truncated_handle}{suffix}")
     }
@@ -669,7 +667,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(find_workspace_id(&ws_list, "relaypod").as_deref(), Some("w2"));
+        assert_eq!(
+            find_workspace_id(&ws_list, "relaypod").as_deref(),
+            Some("w2")
+        );
         assert_eq!(find_workspace_id(&ws_list, "w1").as_deref(), Some("w1"));
         assert_eq!(find_workspace_id(&ws_list, "missing"), None);
     }

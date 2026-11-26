@@ -215,9 +215,7 @@ where
                         if let Some(c) = &client {
                             let req = CreateChannelRequest { name, description };
                             match c.create_channel(&req).await {
-                                Ok(ch) => {
-                                    emit(&event_tx, &notify, ClientEvent::ChannelCreated(ch))
-                                }
+                                Ok(ch) => emit(&event_tx, &notify, ClientEvent::ChannelCreated(ch)),
                                 Err(e) => {
                                     emit(&event_tx, &notify, ClientEvent::Error(e.to_string()))
                                 }
@@ -310,7 +308,8 @@ where
                                     if current_me_id.as_deref()
                                         == Some(regenerated.identity.id.as_str())
                                     {
-                                        let updated_client = c.with_token(regenerated.token.clone());
+                                        let updated_client =
+                                            c.with_token(regenerated.token.clone());
                                         let ws_url = updated_client.ws_url();
                                         let ws_token = updated_client.token().to_string();
                                         client = Some(updated_client);

@@ -14,7 +14,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "relaypod", version, about = "Shared message board for humans and AI agents")]
+#[command(
+    name = "relaypod",
+    version,
+    about = "Shared message board for humans and AI agents"
+)]
 struct Cli {
     /// RelayPod server URL
     #[arg(long, env = "RELAYPOD_URL", default_value = "http://127.0.0.1:8787")]
@@ -298,9 +302,10 @@ enum ChannelAction {
 }
 
 fn require_client(cli: &Cli) -> Result<RelayPodClient> {
-    let token = cli.token.clone().ok_or_else(|| {
-        anyhow!("RELAYPOD_TOKEN (or --token) is required for this command")
-    })?;
+    let token = cli
+        .token
+        .clone()
+        .ok_or_else(|| anyhow!("RELAYPOD_TOKEN (or --token) is required for this command"))?;
     Ok(RelayPodClient::new(cli.url.clone(), token))
 }
 
@@ -465,9 +470,7 @@ async fn main() -> Result<()> {
                         no_drain,
                         cooldown_secs,
                     } = create_args.as_ref();
-                    let parsed_kind = kind
-                        .parse::<IdentityKind>()
-                        .map_err(|e| anyhow!(e))?;
+                    let parsed_kind = kind.parse::<IdentityKind>().map_err(|e| anyhow!(e))?;
 
                     // Validate/prompt watcher config inputs before creating the remote identity so
                     // we never leave an orphaned agent if flags are missing/invalid.
@@ -528,7 +531,10 @@ async fn main() -> Result<()> {
                                             (Some(at), resolved_exec)
                                         }
                                         watch::AgentType::Other(ref other)
-                                            if matches!(other.as_str(), "gemini" | "agy" | "pi") =>
+                                            if matches!(
+                                                other.as_str(),
+                                                "gemini" | "agy" | "pi"
+                                            ) =>
                                         {
                                             (Some(at), resolved_exec)
                                         }
@@ -590,28 +596,32 @@ async fn main() -> Result<()> {
                         None
                     };
 
-                    let (db_runner, db_harness, db_exec, db_cwd) =
-                        if let Some((_, parsed_runner, ref parsed_at, ref final_exec, ref resolved_cwd)) =
-                            watcher_plan
-                        {
-                            let r = match parsed_runner {
-                                watch::RunnerKind::Herdr => "herdr",
-                                watch::RunnerKind::Exec => "exec",
-                            };
-                            (
-                                Some(r.to_string()),
-                                parsed_at.as_ref().map(|t| t.as_herdr_kind().to_string()),
-                                final_exec.clone(),
-                                resolved_cwd.clone(),
-                            )
-                        } else {
-                            (
-                                Some(runner.clone()),
-                                agent_type.clone(),
-                                exec.clone(),
-                                cwd.clone(),
-                            )
+                    let (db_runner, db_harness, db_exec, db_cwd) = if let Some((
+                        _,
+                        parsed_runner,
+                        ref parsed_at,
+                        ref final_exec,
+                        ref resolved_cwd,
+                    )) = watcher_plan
+                    {
+                        let r = match parsed_runner {
+                            watch::RunnerKind::Herdr => "herdr",
+                            watch::RunnerKind::Exec => "exec",
                         };
+                        (
+                            Some(r.to_string()),
+                            parsed_at.as_ref().map(|t| t.as_herdr_kind().to_string()),
+                            final_exec.clone(),
+                            resolved_cwd.clone(),
+                        )
+                    } else {
+                        (
+                            Some(runner.clone()),
+                            agent_type.clone(),
+                            exec.clone(),
+                            cwd.clone(),
+                        )
+                    };
                     let agent_config = if parsed_kind == IdentityKind::Agent {
                         let cfg = AgentConfig {
                             runner: db_runner,
@@ -627,7 +637,11 @@ async fn main() -> Result<()> {
                             cooldown_secs: *cooldown_secs,
                             description: description.clone(),
                         };
-                        if cfg.is_empty() { None } else { Some(cfg) }
+                        if cfg.is_empty() {
+                            None
+                        } else {
+                            Some(cfg)
+                        }
                     } else {
                         None
                     };
@@ -887,7 +901,10 @@ async fn main() -> Result<()> {
                 } else {
                     String::new()
                 };
-                println!("[{}] @{}: {}{}", msg.id, msg.author_handle, msg.body, replies);
+                println!(
+                    "[{}] @{}: {}{}",
+                    msg.id, msg.author_handle, msg.body, replies
+                );
             }
         }
         Commands::Thread { message_id } => {

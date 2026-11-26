@@ -137,7 +137,11 @@ impl AgentEditDraft {
             .ok()
             .filter(|&n| n > 0);
         let parsed_cooldown = if is_create {
-            self.cooldown_secs.trim().parse::<u64>().ok().filter(|&n| n > 0)
+            self.cooldown_secs
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n > 0)
         } else {
             self.cooldown_secs.trim().parse::<u64>().ok().or(Some(0))
         };
@@ -650,8 +654,7 @@ impl RelayPodApp {
                         );
 
                         if is_agent {
-                            self.new_identity_draft
-                                .render_fields(ui, "new_agent", true);
+                            self.new_identity_draft.render_fields(ui, "new_agent", true);
                         }
                     });
 
@@ -702,9 +705,11 @@ impl RelayPodApp {
                             format!("    {}: {}", created.identity.handle, created.token);
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("Add under watcher.agent_tokens in ~/.relaypod/config.yaml:")
-                                    .size(11.5)
-                                    .color(ui.visuals().weak_text_color()),
+                                egui::RichText::new(
+                                    "Add under watcher.agent_tokens in ~/.relaypod/config.yaml:",
+                                )
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
                             );
                         });
                         ui.horizontal(|ui| {
@@ -815,23 +820,24 @@ impl RelayPodApp {
         if let Some(identity) = &self.pending_delete_identity {
             let mut confirm = false;
             let mut cancel = false;
-            let modal = egui::Modal::new(egui::Id::new("confirm_delete_identity")).show(ctx, |ui| {
-                ui.set_width(360.0);
-                ui.heading(format!("Delete @{}?", identity.handle));
-                ui.label(
-                    "This revokes the identity's token and removes it from the workspace. \
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm_delete_identity")).show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.heading(format!("Delete @{}?", identity.handle));
+                    ui.label(
+                        "This revokes the identity's token and removes it from the workspace. \
                      Existing messages and mentions are preserved.",
-                );
-                ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let delete =
-                        egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
-                            .fill(Color32::from_rgb(220, 38, 38))
-                            .corner_radius(CornerRadius::same(8));
-                    confirm = ui.add(delete).clicked();
-                    cancel = ui.button("Cancel").clicked();
+                    );
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete =
+                            egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(220, 38, 38))
+                                .corner_radius(CornerRadius::same(8));
+                        confirm = ui.add(delete).clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
                 });
-            });
             if confirm {
                 self.runtime.send(ClientCommand::DeleteIdentity {
                     identity_id: identity.id.clone(),
@@ -1126,7 +1132,10 @@ impl eframe::App for RelayPodApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("+").on_hover_text("New channel").clicked()
+                                        if ui
+                                            .small_button("+")
+                                            .on_hover_text("New channel")
+                                            .clicked()
                                         {
                                             self.show_new_channel_modal = true;
                                         }
@@ -1217,7 +1226,8 @@ impl eframe::App for RelayPodApp {
                             if can_edit || can_regen || can_delete {
                                 row.context_menu(|ui| {
                                     if can_edit && ui.button("Edit agent").clicked() {
-                                        self.identity_edit = Some(AgentEditDraft::from_identity(id));
+                                        self.identity_edit =
+                                            Some(AgentEditDraft::from_identity(id));
                                         ui.close_menu();
                                     }
                                     if can_regen && ui.button("Regenerate token").clicked() {
@@ -1338,116 +1348,115 @@ impl eframe::App for RelayPodApp {
             .min_width(min_thread_w)
             .max_width(max_thread_w)
             .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Thread");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Close").clicked() {
-                                self.state.active_thread = None;
-                                self.prefilled_thread_id = None;
-                                self.thread_composer.clear();
-                                self.thread_panel_open_seq =
-                                    self.thread_panel_open_seq.wrapping_add(1);
-                            }
-                        });
+                ui.horizontal(|ui| {
+                    ui.heading("Thread");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Close").clicked() {
+                            self.state.active_thread = None;
+                            self.prefilled_thread_id = None;
+                            self.thread_composer.clear();
+                            self.thread_panel_open_seq = self.thread_panel_open_seq.wrapping_add(1);
+                        }
                     });
-                    ui.separator();
+                });
+                ui.separator();
 
-                    let identities = self.state.identities.clone();
-                    egui::TopBottomPanel::bottom("thread_composer")
-                        .frame(egui::Frame::new().inner_margin(Margin {
-                            left: 4,
-                            right: 4,
-                            top: 8,
-                            bottom: 4,
-                        }))
-                        .show_inside(ui, |ui| {
-                            if !self
-                                .state
-                                .channels
-                                .iter()
-                                .any(|ch| ch.id == thread.parent.channel_id && !ch.archived)
-                            {
-                                ui.label("This channel is archived.");
-                                return;
-                            }
-                            if render_composer(
-                                ui,
-                                "thread_composer_input",
-                                &mut self.thread_composer,
-                                &mut self.thread_mention,
-                                "Reply in thread... (@ to mention, Shift+Enter for newline)",
+                let identities = self.state.identities.clone();
+                egui::TopBottomPanel::bottom("thread_composer")
+                    .frame(egui::Frame::new().inner_margin(Margin {
+                        left: 4,
+                        right: 4,
+                        top: 8,
+                        bottom: 4,
+                    }))
+                    .show_inside(ui, |ui| {
+                        if !self
+                            .state
+                            .channels
+                            .iter()
+                            .any(|ch| ch.id == thread.parent.channel_id && !ch.archived)
+                        {
+                            ui.label("This channel is archived.");
+                            return;
+                        }
+                        if render_composer(
+                            ui,
+                            "thread_composer_input",
+                            &mut self.thread_composer,
+                            &mut self.thread_mention,
+                            "Reply in thread... (@ to mention, Shift+Enter for newline)",
+                            &identities,
+                        ) {
+                            let body = std::mem::take(&mut self.thread_composer);
+                            let next_prefill = last_mentioned_handle_in_text(
+                                &body,
                                 &identities,
-                            ) {
-                                let body = std::mem::take(&mut self.thread_composer);
-                                let next_prefill = last_mentioned_handle_in_text(
-                                    &body,
+                                my_handle.as_deref(),
+                            )
+                            .or_else(|| {
+                                last_mentioned_handle_in_thread(
+                                    &thread,
                                     &identities,
                                     my_handle.as_deref(),
                                 )
-                                .or_else(|| {
-                                    last_mentioned_handle_in_thread(
-                                        &thread,
-                                        &identities,
-                                        my_handle.as_deref(),
-                                    )
-                                });
-                                if let Some(h) = next_prefill {
-                                    self.thread_composer = format!("@{h} ");
-                                }
-                                self.runtime.send(ClientCommand::PostMessage {
-                                    channel_id: thread.parent.channel_id.clone(),
-                                    body,
-                                    parent_id: Some(thread.parent.id.clone()),
-                                });
-                            }
-                        });
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("thread_messages_scroll")
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add_space(4.0);
-                            let parent_is_me =
-                                my_id.as_deref() == Some(thread.parent.author_id.as_str());
-                            render_thread_bubble(ui, &thread.parent, parent_is_me);
-
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{} {}",
-                                        thread.replies.len(),
-                                        if thread.replies.len() == 1 {
-                                            "reply"
-                                        } else {
-                                            "replies"
-                                        }
-                                    ))
-                                    .size(11.5)
-                                    .color(ui.visuals().weak_text_color()),
-                                ));
-                                ui.separator();
                             });
-                            ui.add_space(6.0);
-
-                            for reply in &thread.replies {
-                                let is_me = my_id.as_deref() == Some(reply.author_id.as_str());
-                                render_thread_bubble(ui, reply, is_me);
-                                ui.add_space(8.0);
+                            if let Some(h) = next_prefill {
+                                self.thread_composer = format!("@{h} ");
                             }
+                            self.runtime.send(ClientCommand::PostMessage {
+                                channel_id: thread.parent.channel_id.clone(),
+                                body,
+                                parent_id: Some(thread.parent.id.clone()),
+                            });
+                        }
+                    });
 
-                            let thread_workers: Vec<String> = self
-                                .state
-                                .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
-                                .into_iter()
-                                .map(|w| w.handle.clone())
-                                .collect();
-                            if !thread_workers.is_empty() {
-                                render_working_banner(ui, &thread_workers);
-                                ui.add_space(6.0);
-                            }
+                egui::ScrollArea::vertical()
+                    .id_salt("thread_messages_scroll")
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let parent_is_me =
+                            my_id.as_deref() == Some(thread.parent.author_id.as_str());
+                        render_thread_bubble(ui, &thread.parent, parent_is_me);
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    thread.replies.len(),
+                                    if thread.replies.len() == 1 {
+                                        "reply"
+                                    } else {
+                                        "replies"
+                                    }
+                                ))
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
+                            ));
+                            ui.separator();
                         });
-                });
+                        ui.add_space(6.0);
+
+                        for reply in &thread.replies {
+                            let is_me = my_id.as_deref() == Some(reply.author_id.as_str());
+                            render_thread_bubble(ui, reply, is_me);
+                            ui.add_space(8.0);
+                        }
+
+                        let thread_workers: Vec<String> = self
+                            .state
+                            .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
+                            .into_iter()
+                            .map(|w| w.handle.clone())
+                            .collect();
+                        if !thread_workers.is_empty() {
+                            render_working_banner(ui, &thread_workers);
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
         }
 
         // Center panel: Channel feed + composer
@@ -2007,8 +2016,7 @@ fn render_composer(
                 }
             }
         }
-    } else if has_focus
-        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    } else if has_focus && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
     {
         send_triggered = true;
     }
@@ -2545,7 +2553,10 @@ mod tests {
 
         let all = filter_channels(&channels, "   ");
         assert_eq!(
-            all.active.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            all.active
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Alpha", "general", "relaypod"]
         );
         assert_eq!(

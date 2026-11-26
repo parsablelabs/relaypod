@@ -179,7 +179,8 @@ impl RelayPodClient {
     /// Lists channels including those with read-only history.
     pub async fn list_channels_including_archived(&self) -> Result<Vec<Channel>> {
         let mut url = self.endpoint_url(&["api", "channels"])?;
-        url.query_pairs_mut().append_pair("include_archived", "true");
+        url.query_pairs_mut()
+            .append_pair("include_archived", "true");
         let resp = self.http.get(url).bearer_auth(&self.token).send().await?;
         Self::parse_json(resp).await
     }
@@ -331,9 +332,15 @@ mod tests {
             reqwest::StatusCode::FORBIDDEN,
             r#"{"error":"only admin humans can add human identities"}"#,
         );
-        assert_eq!(err.to_string(), "only admin humans can add human identities");
+        assert_eq!(
+            err.to_string(),
+            "only admin humans can add human identities"
+        );
 
         let plain = format_http_error(reqwest::StatusCode::BAD_GATEWAY, "upstream unavailable");
-        assert_eq!(plain.to_string(), "server returned 502 Bad Gateway: upstream unavailable");
+        assert_eq!(
+            plain.to_string(),
+            "server returned 502 Bad Gateway: upstream unavailable"
+        );
     }
 }

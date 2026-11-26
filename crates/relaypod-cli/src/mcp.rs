@@ -169,7 +169,9 @@ fn tool_definitions() -> Value {
 fn require_str_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, String> {
     match args.get(key).and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => Ok(s),
-        _ => Err(format!("missing or invalid required string parameter '{key}'")),
+        _ => Err(format!(
+            "missing or invalid required string parameter '{key}'"
+        )),
     }
 }
 

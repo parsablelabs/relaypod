@@ -41,8 +41,8 @@ pub async fn run_live_ws_loop_with_outgoing<OnStatus, OnEvent>(
     OnStatus: FnMut(bool),
     OnEvent: FnMut(WsEvent),
 {
-    let ping_payload =
-        serde_json::to_string(&WsClientMessage::Ping).unwrap_or_else(|_| r#"{"type":"ping"}"#.into());
+    let ping_payload = serde_json::to_string(&WsClientMessage::Ping)
+        .unwrap_or_else(|_| r#"{"type":"ping"}"#.into());
 
     loop {
         let request = match build_ws_request(&ws_url, &token) {

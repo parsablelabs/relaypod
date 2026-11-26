@@ -39,9 +39,15 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
 
     // Agent itself cannot rename
     assert_eq!(
-        request(&app, &agent.token, "PATCH", &agent_path, json!({"handle": "codex"}))
-            .await
-            .status(),
+        request(
+            &app,
+            &agent.token,
+            "PATCH",
+            &agent_path,
+            json!({"handle": "codex"})
+        )
+        .await
+        .status(),
         StatusCode::FORBIDDEN
     );
 
@@ -75,9 +81,15 @@ async fn only_owning_human_can_rename_agent_and_history_persists() {
 
     // Duplicate handle is rejected with 409
     assert_eq!(
-        request(&app, &owner.token, "PATCH", &agent_path, json!({"handle": "@alice"}))
-            .await
-            .status(),
+        request(
+            &app,
+            &owner.token,
+            "PATCH",
+            &agent_path,
+            json!({"handle": "@alice"})
+        )
+        .await
+        .status(),
         StatusCode::CONFLICT
     );
 
@@ -148,7 +160,12 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
         .unwrap();
     let general = store.get_channel("general").unwrap().unwrap();
     store
-        .post_message(&general.id, &owner.identity, "Hey @mentioned-bot check this", None)
+        .post_message(
+            &general.id,
+            &owner.identity,
+            "Hey @mentioned-bot check this",
+            None,
+        )
         .unwrap();
 
     let state = AppState::new(Arc::clone(&store));
@@ -160,15 +177,27 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
 
     // Non-owner, agent, and human target are forbidden
     assert_eq!(
-        request(&app, &other_human.token, "DELETE", &unused_path, Value::Null)
-            .await
-            .status(),
+        request(
+            &app,
+            &other_human.token,
+            "DELETE",
+            &unused_path,
+            Value::Null
+        )
+        .await
+        .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        request(&app, &unused_agent.token, "DELETE", &unused_path, Value::Null)
-            .await
-            .status(),
+        request(
+            &app,
+            &unused_agent.token,
+            "DELETE",
+            &unused_path,
+            Value::Null
+        )
+        .await
+        .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -224,7 +253,9 @@ async fn deletes_agent_hard_without_mentions_and_soft_with_messages_or_mentions(
         StatusCode::UNAUTHORIZED
     );
     let active_ids = store.list_identities().unwrap();
-    assert!(!active_ids.iter().any(|i| i.id == mentioned_agent.identity.id));
+    assert!(!active_ids
+        .iter()
+        .any(|i| i.id == mentioned_agent.identity.id));
     // Re-creating the same handle conflicts because the soft-deleted identity preserves mention history
     assert!(store
         .create_identity(CreateIdentityRequest {
@@ -265,7 +296,11 @@ async fn updates_agent_config_json_and_broadcasts_ws_event() {
     )
     .await;
     let _ = events.try_recv();
-    let cfg = created.identity.agent_config.as_ref().expect("agent_config");
+    let cfg = created
+        .identity
+        .agent_config
+        .as_ref()
+        .expect("agent_config");
     assert_eq!(cfg.harness.as_deref(), Some("claude"));
     assert_eq!(cfg.args.as_deref(), Some("--model claude-sonnet-4-6"));
 
@@ -314,7 +349,10 @@ async fn updates_agent_config_json_and_broadcasts_ws_event() {
         .find(|i| i.id == created.identity.id)
         .expect("agent in list");
     assert_eq!(
-        found.agent_config.as_ref().and_then(|c| c.description.as_deref()),
+        found
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.description.as_deref()),
         Some("Deep debugging")
     );
 
