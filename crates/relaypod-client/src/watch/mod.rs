@@ -18,10 +18,15 @@ use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
 pub use self::config::{
-    append_watcher_token_to_config, remove_watcher_token_from_config,
-    update_watcher_token_in_config, upsert_watcher_token_in_config, AgentType, RunnerKind,
+    append_watcher_token_to_config, ensure_default_config, ensure_default_server_config,
+    remove_watcher_token_from_config, update_client_token_in_config,
+    update_watcher_token_in_config, upsert_client_connection_in_config,
+    upsert_watcher_token_in_config, AgentType, RunnerKind, ServerConfig, DEFAULT_SERVER_HOST,
+    DEFAULT_SERVER_PORT, DEFAULT_SERVER_URL,
 };
-use self::config::{load_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
+use self::config::{
+    load_config_file, load_server_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
+};
 use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
 use self::supervisor::{resolved_subprocess_path, WatcherReporter};
@@ -31,6 +36,12 @@ pub fn default_config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
     Ok(PathBuf::from(home).join(".relaypod").join("config.yaml"))
+}
+
+pub fn default_server_config_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
+    Ok(PathBuf::from(home).join(".relaypod").join("server.yaml"))
 }
 
 pub fn default_config_candidates() -> Vec<PathBuf> {
@@ -50,7 +61,21 @@ pub(crate) fn resolve_config_path(
     Ok(default_config_candidates().into_iter().find(|p| p.exists()))
 }
 
-fn expand_tilde(path: &str) -> String {
+fn resolve_server_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+    if let Some(p) = explicit_path {
+        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
+        if !expanded.exists() {
+            return Err(anyhow!(
+                "server config file not found: {}",
+                expanded.display()
+            ));
+        }
+        return Ok(Some(expanded));
+    }
+    Ok(default_server_config_path().ok().filter(|p| p.exists()))
+}
+
+pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
@@ -307,6 +332,18 @@ pub fn load_optional_config(
     }
 }
 
+pub fn load_optional_server_config(
+    explicit_path: Option<&std::path::Path>,
+) -> Result<Option<(PathBuf, ServerConfig)>> {
+    match resolve_server_config_path(explicit_path)? {
+        Some(path) => {
+            let cfg = load_server_config_file(&path)?;
+            Ok(Some((path, cfg)))
+        }
+        None => Ok(None),
+    }
+}
+
 fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -365,7 +402,9 @@ pub(crate) fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>
     })?;
 
     info!("Loading watch config from {}", cfg_path.display());
-    let cfg = load_config_file(&cfg_path)?.watcher;
+    let full_cfg = load_config_file(&cfg_path)?;
+    let root_url = full_cfg.url;
+    let cfg = full_cfg.watcher;
 
     let selected: Vec<(String, String)> = if let Some(ref wanted) = opts.handle_filter {
         let key = wanted.trim_start_matches('@');
@@ -398,7 +437,7 @@ pub(crate) fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>
         }
     }
 
-    let url = cfg.url.unwrap_or_else(|| opts.default_url.clone());
+    let url = root_url.unwrap_or_else(|| opts.default_url.clone());
     let mut targets = Vec::new();
     for (name, token) in selected {
         let exec = opts.exec_override.clone().unwrap_or_default();

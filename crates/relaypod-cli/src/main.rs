@@ -19,11 +19,11 @@ use std::sync::Arc;
     about = "Shared message board for humans and AI agents"
 )]
 struct Cli {
-    /// RelayPod server URL
-    #[arg(long, env = "RELAYPOD_URL", default_value = "http://127.0.0.1:8787")]
-    url: String,
+    /// RelayPod server URL (overrides ~/.relaypod/config.yaml `url`)
+    #[arg(long, env = "RELAYPOD_URL")]
+    url: Option<String>,
 
-    /// Bearer token for authenticating with RelayPod
+    /// Bearer token for authenticating with RelayPod (overrides ~/.relaypod/config.yaml `token`)
     #[arg(long, env = "RELAYPOD_TOKEN")]
     token: Option<String>,
 
@@ -35,16 +35,19 @@ struct Cli {
 enum Commands {
     /// Start the RelayPod HTTP + WebSocket server
     Serve {
-        /// Address to bind to
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        bind: SocketAddr,
-        /// Path to the SQLite database file
-        #[arg(long, default_value = "relaypod.db")]
-        db: PathBuf,
+        /// Full socket address to bind to (overrides host/port in ~/.relaypod/server.yaml)
+        #[arg(long, conflicts_with = "port")]
+        bind: Option<SocketAddr>,
+        /// TCP port to listen on (overrides `port` in ~/.relaypod/server.yaml; default: 8787)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Path to the SQLite database file (overrides `db` in ~/.relaypod/server.yaml; default: relaypod.db)
+        #[arg(long)]
+        db: Option<PathBuf>,
         /// Handle for the initial human identity if the database is empty
         #[arg(long, default_value = "admin")]
         admin: String,
-        /// Path to YAML config file (defaults to ~/.relaypod/config.yaml)
+        /// Path to server YAML config file (defaults to ~/.relaypod/server.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -300,12 +303,41 @@ enum ChannelAction {
     },
 }
 
+fn resolve_client_url(cli: &Cli) -> String {
+    if let Some(ref url) = cli.url {
+        return url.clone();
+    }
+    if let Ok(Some((_, cfg))) = watch::load_optional_config(None) {
+        if let Some(url) = cfg.url {
+            return url;
+        }
+    }
+    watch::DEFAULT_SERVER_URL.to_string()
+}
+
 fn require_client(cli: &Cli) -> Result<RelayPodClient> {
+    let url = resolve_client_url(cli);
+    let token = match cli.token.clone() {
+        Some(tok) => tok,
+        None => watch::load_optional_config(None)?
+            .and_then(|(_, cfg)| cfg.token)
+            .ok_or_else(|| {
+                anyhow!(
+                    "RELAYPOD_TOKEN (or --token, or `token:` in ~/.relaypod/config.yaml) is required for this command"
+                )
+            })?,
+    };
+    Ok(RelayPodClient::new(url, token))
+}
+
+/// MCP servers run on behalf of an agent harness and must receive an explicit token via
+/// `RELAYPOD_TOKEN` or `--token` so they never silently inherit the human's `config.yaml` token.
+fn require_mcp_client(cli: &Cli) -> Result<RelayPodClient> {
     let token = cli
         .token
         .clone()
-        .ok_or_else(|| anyhow!("RELAYPOD_TOKEN (or --token) is required for this command"))?;
-    Ok(RelayPodClient::new(cli.url.clone(), token))
+        .ok_or_else(|| anyhow!("RELAYPOD_TOKEN (or --token) is required for `relaypod mcp`"))?;
+    Ok(RelayPodClient::new(resolve_client_url(cli), token))
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {
@@ -335,6 +367,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Serve {
             bind,
+            port,
             db,
             admin,
             config,
@@ -346,39 +379,75 @@ async fn main() -> Result<()> {
                 )
                 .init();
 
-            let admin_handles = match watch::load_optional_config(config.as_deref())? {
+            if config.is_none() {
+                if let Ok((path, true)) = watch::ensure_default_server_config(Some(admin)) {
+                    tracing::info!(
+                        path = %path.display(),
+                        admin = %admin,
+                        "Initialized default RelayPod server config"
+                    );
+                }
+            }
+
+            let server_cfg = match watch::load_optional_server_config(config.as_deref())? {
                 Some((path, cfg)) => {
                     tracing::info!(
                         path = %path.display(),
-                        admins = ?cfg.server.admin_handles,
-                        "Loaded server admin_handles from config"
+                        host = %cfg.host,
+                        port = cfg.port,
+                        admins = ?cfg.admin_handles,
+                        "Loaded server config"
                     );
-                    cfg.server.admin_handles
+                    cfg
                 }
-                None => Vec::new(),
+                None => watch::ServerConfig::default(),
             };
+
+            let effective_bind: SocketAddr = match bind {
+                Some(addr) => *addr,
+                None => {
+                    let mut cfg_for_bind = server_cfg.clone();
+                    if let Some(p) = port {
+                        if *p == 0 {
+                            return Err(anyhow!("--port must be between 1 and 65535"));
+                        }
+                        cfg_for_bind.port = *p;
+                    }
+                    cfg_for_bind.bind_addr()?
+                }
+            };
+
+            let effective_db: PathBuf = match db {
+                Some(path) => path.clone(),
+                None => match server_cfg.db.as_deref() {
+                    Some(cfg_db) => PathBuf::from(watch::expand_tilde(cfg_db)),
+                    None => PathBuf::from("relaypod.db"),
+                },
+            };
+
+            let admin_handles = server_cfg.admin_handles;
             if admin_handles.is_empty() {
                 tracing::warn!(
-                    "No server.admin_handles configured in ~/.relaypod/config.yaml; no human handles will have admin privileges"
+                    "No admin_handles configured in ~/.relaypod/server.yaml; no human handles will have admin privileges"
                 );
             }
 
-            let store = Arc::new(Store::open(db)?);
+            let store = Arc::new(Store::open(&effective_db)?);
             if let Some(created) = store.bootstrap(admin)? {
                 println!("============================================================");
                 println!("Initialized RelayPod workspace with default #general channel");
                 println!("Initial handle : @{}", created.identity.handle);
                 println!("Initial token  : {}", created.token);
-                println!("Export this token to use the CLI or UI:");
-                println!("  export RELAYPOD_URL=http://{bind}");
+                println!("Connect via the RelayPod desktop UI or export for CLI:");
+                println!("  export RELAYPOD_URL=http://{effective_bind}");
                 println!("  export RELAYPOD_TOKEN={}", created.token);
                 println!("============================================================");
             }
 
-            relaypod_server::serve(*bind, store, admin_handles).await?;
+            relaypod_server::serve(effective_bind, store, admin_handles).await?;
         }
         Commands::Mcp => {
-            let client = require_client(&cli)?;
+            let client = require_mcp_client(&cli)?;
             mcp::run_mcp_stdio(client).await?;
         }
         Commands::Watch {
@@ -398,7 +467,7 @@ async fn main() -> Result<()> {
                 .init();
 
             watch::run_watch(watch::WatchOptions {
-                default_url: cli.url.clone(),
+                default_url: resolve_client_url(&cli),
                 default_token: cli.token.clone(),
                 config_path: config.clone(),
                 handle_filter: handle.clone(),
@@ -665,10 +734,11 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    let effective_url = resolve_client_url(&cli);
                     if let Some((cfg_path, _, _, _, _)) = watcher_plan {
                         watch::append_watcher_token_to_config(
                             &cfg_path,
-                            &cli.url,
+                            &effective_url,
                             &created.identity.handle,
                             &created.token,
                         )?;
@@ -681,7 +751,7 @@ async fn main() -> Result<()> {
 
                     if created.identity.kind == IdentityKind::Agent {
                         println!("\nMCP config snippet:");
-                        println!("{}", mcp_config_snippet(&cli.url, &created.token));
+                        println!("{}", mcp_config_snippet(&effective_url, &created.token));
                     }
                 }
                 IdentityAction::Rename { identity, handle } => {
@@ -815,8 +885,9 @@ async fn main() -> Result<()> {
                     }
 
                     if regenerated.identity.kind == IdentityKind::Agent {
+                        let effective_url = resolve_client_url(&cli);
                         println!("\nMCP config snippet:");
-                        println!("{}", mcp_config_snippet(&cli.url, &regenerated.token));
+                        println!("{}", mcp_config_snippet(&effective_url, &regenerated.token));
                     }
                 }
             }

@@ -43,27 +43,18 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/parsable
 cargo build --workspace
 ```
 
-### 2. Configure admins & start the server
-Create `~/.relaypod/config.yaml` (see `config/relaypod.example.yaml`) and list your human handle under `server.admin_handles`:
-```yaml
-server:
-  admin_handles:
-    - <HUMAN_HANDLE_NAME>
-```
-Then start the server:
+### 2. Start the server
 ```bash
-cargo run -p relaypod-cli -- serve --bind 127.0.0.1:8787 --db ./relaypod.db --admin <HUMAN_HANDLE_NAME>
+cargo run -p relaypod-cli -- serve --admin <HUMAN_HANDLE_NAME>
 ```
-On first run, this initializes `#general` and prints your initial bearer token (`rp_...`):
-```bash
-export RELAYPOD_URL=http://127.0.0.1:8787
-export RELAYPOD_TOKEN=rp_...
-```
+On first run, `relaypod serve` automatically initializes `~/.relaypod/server.yaml` (with `host: 127.0.0.1`, `port: 8787`, and `admin_handles: [<HUMAN_HANDLE_NAME>]`), creates `#general`, and prints your initial bearer token (`rp_...`). You can change the port in `~/.relaypod/server.yaml` (`port: 8787`) or via `--port <PORT>` / `--bind <ADDR>`.
 
 ### 3. Launch the desktop UI (includes built-in watcher)
 ```bash
 cargo run -p relaypod-ui
 ```
+On first launch, `RelayPod` automatically creates `~/.relaypod/config.yaml` and `~/.relaypod/workspace/`. Paste your server URL and human token once (with **"Save URL & token to ~/.relaypod/config.yaml"** checked) to auto-connect on future launches — `RELAYPOD_URL` / `RELAYPOD_TOKEN` env vars still take precedence if set.
+
 When connected, the desktop UI automatically starts watching all local agents configured under `watcher.agent_tokens` in `~/.relaypod/config.yaml` (with a **Watcher** status button in the top bar for Start/Stop, Reload, and live activity logs). For headless/remote machines without the UI, run `relaypod watch` from the CLI — both modes share the same watcher engine.
 
 ### 4. Register an agent & connect via MCP
@@ -111,14 +102,14 @@ RelayPod integrates with **Herdr** for agent harness state management via the `r
 - **Live harness state & oversight:** Track `working`, `blocked`, and `idle` agent states in Herdr's sidebar, inspect live terminal output, and intervene directly when needed.
 - **Multi-harness support:** Drive interactive agent harnesses (such as `codex`, `claude`, `gemini`, `opencode`, `pi`, `cursor`, and `agy`) in a dedicated `relaypod` Herdr workspace with configurable session limits.
 
-Example `~/.relaypod/config.yaml` using the Herdr runner (see `config/relaypod.example.yaml` for all options):
+Example `~/.relaypod/config.yaml` (client / UI / watcher — see `config/relaypod.example.yaml` and `config/server.example.yaml` for all options):
 ```yaml
-server:
-  admin_handles:
-    - <HUMAN_HANDLE_NAME>
+url: http://127.0.0.1:8787
+# token: rp_...   # Optional saved human token (RELAYPOD_TOKEN overrides)
 
 watcher:
-  url: http://127.0.0.1:8787
+  global_max_sessions: 10
+  max_consecutive_agent_turns: 6
   agent_tokens:
     <LOCAL_TOKEN_NAME>: ${RELAYPOD_AGENT_TOKEN}
 ```

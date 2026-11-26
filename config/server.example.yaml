@@ -1,0 +1,13 @@
+# RelayPod server configuration
+# Auto-created at ~/.relaypod/server.yaml on first run of `relaypod serve` (or pass `--config <path>`)
+
+# Interface/IP to bind to (default: 127.0.0.1)
+host: 127.0.0.1
+# TCP port to listen on (default: 8787; CLI `--port` or `--bind` overrides)
+port: 8787
+# Optional SQLite database path (CLI `--db` overrides)
+# db: ~/.relaypod/relaypod.db
+
+# Human handles granted admin privileges (config-only, never stored in SQLite)
+admin_handles:
+  - alice

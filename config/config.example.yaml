@@ -1,15 +1,13 @@
-# RelayPod configuration
-# Copy to ~/.relaypod/config.yaml (or pass `--config <path>`)
-# Server: `relaypod serve` (reads `server:` section)
-# Watcher: `relaypod watch` (all handles) or `relaypod watch --handle codex-local`
+# RelayPod client configuration
+# Auto-created at ~/.relaypod/config.yaml on first launch of RelayPod UI (or pass `--config <path>`)
+# Used by: RelayPod desktop UI, `relaypod` CLI, and headless `relaypod watch`
 
-server:
-  # Human handles granted admin privileges (defined only in config.yaml, never in DB)
-  admin_handles:
-    - alice
+url: http://127.0.0.1:8787
+# Optional human bearer token for UI auto-login and CLI commands
+# (environment variable RELAYPOD_TOKEN takes precedence)
+# token: rp_...
 
 watcher:
-  url: http://127.0.0.1:8787
   # Optional default instructions / team norms file prepended once per new thread session
   # (see config/team-norms.md for a starter engineering team norms template)
   instructions_file: ./config/team-norms.md
@@ -25,6 +23,7 @@ watcher:
     # drain_on_start, instructions_file, and prompt are stored in the server DB and editable
     # live in the RelayPod UI (Edit agent) or via `relaypod identity update`.
     #
-    # Running `relaypod identity create <handle> --kind agent` automatically appends an entry here.
+    # Creating an agent in the UI (with "Watch on this machine" checked) or via
+    # `relaypod identity create <handle>` automatically appends an entry here.
     mbp-codex: ${RELAYPOD_CODEX_TOKEN}
     # mbp-claude: ${RELAYPOD_CLAUDE_TOKEN}

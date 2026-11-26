@@ -58,22 +58,58 @@ impl AgentType {
 }
 
 pub const DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS: usize = 6;
+pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_SERVER_PORT: u16 = 8787;
+pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 
+/// Client configuration stored at `~/.relaypod/config.yaml`.
+/// Shared by the desktop UI (`relaypod-ui`), CLI (`relaypod`), and watcher (`relaypod watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelayPodConfig {
-    pub server: ServerConfig,
+    /// RelayPod server URL (e.g. `http://127.0.0.1:8787`).
+    pub url: Option<String>,
+    /// Optional human bearer token (for UI auto-login and CLI commands; `RELAYPOD_TOKEN` overrides).
+    pub token: Option<String>,
+    /// Local agent watcher settings and agent tokens.
     pub watcher: WatchConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Server configuration stored at `~/.relaypod/server.yaml` (used only by `relaypod serve`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// Human handles granted admin privileges by the server (defined only in config.yaml, never in DB).
+    /// Interface/IP to bind to (defaults to `127.0.0.1`).
+    pub host: String,
+    /// TCP port to listen on (defaults to `8787`).
+    pub port: u16,
+    /// Optional SQLite database path override.
+    pub db: Option<String>,
+    /// Human handles granted admin privileges by the server (defined only in server.yaml, never in DB).
     pub admin_handles: Vec<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_SERVER_HOST.to_string(),
+            port: DEFAULT_SERVER_PORT,
+            db: None,
+            admin_handles: Vec::new(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn bind_addr(&self) -> Result<std::net::SocketAddr> {
+        let ip: std::net::IpAddr = self
+            .host
+            .parse()
+            .with_context(|| format!("invalid server host IP `{}` in server.yaml", self.host))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchConfig {
-    pub url: Option<String>,
     pub instructions_file: Option<String>,
     pub global_max_sessions: Option<usize>,
     /// Maximum consecutive agent-authored messages in a thread before pausing
@@ -86,7 +122,6 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
-            url: None,
             instructions_file: None,
             global_max_sessions: None,
             max_consecutive_agent_turns: Some(DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS),
@@ -102,23 +137,132 @@ pub fn load_config_file(path: &Path) -> Result<RelayPodConfig> {
         .with_context(|| format!("failed to parse config file {}", path.display()))
 }
 
-/// Lightweight, dependency-free YAML parser for `~/.relaypod/config.yaml`.
-/// Supports top-level `server:` (`admin_handles:`) and `watcher:` (`url`, `instructions_file`,
-/// `global_max_sessions`, `max_consecutive_agent_turns`, `agent_tokens:` flat `name: token` map),
+pub fn load_server_config_file(path: &Path) -> Result<ServerConfig> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read server config file {}", path.display()))?;
+    parse_server_config_yaml(&raw)
+        .with_context(|| format!("failed to parse server config file {}", path.display()))
+}
+
+/// Lightweight, dependency-free YAML parser for `~/.relaypod/server.yaml`.
+/// Supports top-level `host`, `port`, `db`, and `admin_handles` (`- handle` list or `[a, b]`),
 /// single/double quoted strings, `#` comments, and `${ENV_VAR}` expansion.
+pub fn parse_server_config_yaml(input: &str) -> Result<ServerConfig> {
+    let mut cfg = ServerConfig::default();
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Section {
+        Root,
+        AdminHandles { key_indent: usize },
+    }
+
+    let mut section = Section::Root;
+
+    for (line_idx, raw_line) in input.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let stripped = strip_yaml_comment(raw_line);
+        if stripped.trim().is_empty() {
+            continue;
+        }
+
+        let (_, indent) = leading_whitespace(stripped);
+        let trimmed = stripped.trim();
+
+        if let Section::AdminHandles { key_indent } = section {
+            if !(trimmed.starts_with('-') && indent >= key_indent) && indent <= key_indent {
+                section = Section::Root;
+            }
+        }
+
+        if matches!(section, Section::AdminHandles { .. }) {
+            let item = trimmed.strip_prefix('-').ok_or_else(|| {
+                anyhow!(
+                    "invalid YAML at line {line_no}: expected `- <handle>` under `admin_handles:`"
+                )
+            })?;
+            let handle = normalize_admin_handle(&expand_env_vars(&unquote_yaml(item)));
+            if handle.is_empty() {
+                return Err(anyhow!(
+                    "line {line_no}: empty handle entry under `admin_handles:`"
+                ));
+            }
+            if !cfg.admin_handles.contains(&handle) {
+                cfg.admin_handles.push(handle);
+            }
+            continue;
+        }
+
+        let (key, raw_val) = split_key_value(trimmed)
+            .ok_or_else(|| anyhow!("invalid YAML at line {line_no}: expected `key: value`"))?;
+        let key = unquote_yaml(key);
+        let val = raw_val.trim();
+
+        match key.as_str() {
+            "host" => {
+                let host = expand_env_vars(&unquote_yaml(val));
+                if host.is_empty() {
+                    return Err(anyhow!("line {line_no}: `host` cannot be empty"));
+                }
+                cfg.host = host;
+            }
+            "port" => {
+                let raw_port = expand_env_vars(&unquote_yaml(val));
+                let parsed = raw_port.parse::<u16>().map_err(|_| {
+                    anyhow!("line {line_no}: invalid port `{raw_port}` (expected 1-65535)")
+                })?;
+                if parsed == 0 {
+                    return Err(anyhow!("line {line_no}: port must be between 1 and 65535"));
+                }
+                cfg.port = parsed;
+            }
+            "db" => {
+                let db = expand_env_vars(&unquote_yaml(val));
+                if !db.is_empty() {
+                    cfg.db = Some(db);
+                }
+            }
+            "admin_handles" => {
+                if val.is_empty() {
+                    section = Section::AdminHandles { key_indent: indent };
+                } else if let Some(inner) = val.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                {
+                    for part in inner.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        let handle = normalize_admin_handle(&expand_env_vars(&unquote_yaml(part)));
+                        if !handle.is_empty() && !cfg.admin_handles.contains(&handle) {
+                            cfg.admin_handles.push(handle);
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "line {line_no}: `admin_handles:` must be a YAML list (`- handle` items or `[a, b]`)"
+                    ));
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "line {line_no}: unknown top-level key `{other}` in server.yaml (expected `host`, `port`, `db`, or `admin_handles`)"
+                ));
+            }
+        }
+    }
+
+    Ok(cfg)
+}
+
+/// Lightweight, dependency-free YAML parser for `~/.relaypod/config.yaml` (client / UI / watcher).
+/// Supports top-level `url`, `token`, and `watcher:` (`instructions_file`, `global_max_sessions`,
+/// `max_consecutive_agent_turns`, `agent_tokens:` flat `name: token` map), single/double quoted
+/// strings, `#` comments, and `${ENV_VAR}` expansion.
 pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
     let mut cfg = RelayPodConfig::default();
 
     #[derive(Debug, PartialEq, Eq)]
     enum Section {
         Root,
-        Server {
-            indent: usize,
-        },
-        ServerAdminHandles {
-            server_indent: usize,
-            key_indent: usize,
-        },
         Watcher {
             indent: usize,
         },
@@ -137,11 +281,7 @@ pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
             continue;
         }
 
-        let indent: usize = stripped
-            .bytes()
-            .take_while(|&b| b == b' ' || b == b'\t')
-            .map(|b| if b == b'\t' { 4 } else { 1 })
-            .sum();
+        let (_, indent) = leading_whitespace(stripped);
         let trimmed = stripped.trim();
 
         // Unwind nested sections based on indentation
@@ -154,41 +294,12 @@ pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
                     indent: *watcher_indent,
                 }),
                 Section::Watcher { indent: w_indent } if indent <= *w_indent => Some(Section::Root),
-                Section::ServerAdminHandles {
-                    server_indent,
-                    key_indent,
-                } if !(trimmed.starts_with('-') && indent >= *key_indent)
-                    && indent <= *key_indent =>
-                {
-                    Some(Section::Server {
-                        indent: *server_indent,
-                    })
-                }
-                Section::Server { indent: s_indent } if indent <= *s_indent => Some(Section::Root),
                 _ => None,
             };
             match next {
                 Some(popped) => section = popped,
                 None => break,
             }
-        }
-
-        if matches!(section, Section::ServerAdminHandles { .. }) {
-            let item = trimmed.strip_prefix('-').ok_or_else(|| {
-                anyhow!(
-                    "invalid YAML at line {line_no}: expected `- <handle>` under `admin_handles:`"
-                )
-            })?;
-            let handle = normalize_admin_handle(&expand_env_vars(&unquote_yaml(item)));
-            if handle.is_empty() {
-                return Err(anyhow!(
-                    "line {line_no}: empty handle entry under `admin_handles:`"
-                ));
-            }
-            if !cfg.server.admin_handles.contains(&handle) {
-                cfg.server.admin_handles.push(handle);
-            }
-            continue;
         }
 
         let (key, raw_val) = split_key_value(trimmed)
@@ -198,13 +309,17 @@ pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
 
         match &section {
             Section::Root => match key.as_str() {
-                "server" => {
-                    if !val.is_empty() {
-                        return Err(anyhow!(
-                            "line {line_no}: `server:` must be followed by indented keys"
-                        ));
+                "url" => {
+                    let resolved = expand_env_vars(&unquote_yaml(val));
+                    if !resolved.is_empty() {
+                        cfg.url = Some(resolved);
                     }
-                    section = Section::Server { indent };
+                }
+                "token" => {
+                    let resolved = expand_env_vars(&unquote_yaml(val));
+                    if !resolved.is_empty() {
+                        cfg.token = Some(resolved);
+                    }
                 }
                 "watcher" => {
                     if !val.is_empty() {
@@ -216,58 +331,15 @@ pub fn parse_yaml_config(input: &str) -> Result<RelayPodConfig> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "line {line_no}: unknown top-level key `{other}` (expected `server` or `watcher`)"
+                        "line {line_no}: unknown top-level key `{other}` in config.yaml (expected `url`, `token`, or `watcher`; server settings belong in server.yaml)"
                     ));
                 }
             },
-            Section::Server {
-                indent: server_indent,
-            } => {
-                let server_indent = *server_indent;
-                match key.as_str() {
-                    "admin_handles" => {
-                        if val.is_empty() {
-                            section = Section::ServerAdminHandles {
-                                server_indent,
-                                key_indent: indent,
-                            };
-                        } else if let Some(inner) =
-                            val.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-                        {
-                            for part in inner.split(',') {
-                                let part = part.trim();
-                                if part.is_empty() {
-                                    continue;
-                                }
-                                let handle =
-                                    normalize_admin_handle(&expand_env_vars(&unquote_yaml(part)));
-                                if !handle.is_empty() && !cfg.server.admin_handles.contains(&handle)
-                                {
-                                    cfg.server.admin_handles.push(handle);
-                                }
-                            }
-                        } else {
-                            return Err(anyhow!(
-                                "line {line_no}: `admin_handles:` must be a YAML list (`- handle` items or `[a, b]`)"
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(anyhow!(
-                            "line {line_no}: unknown key `{other}` under `server:`"
-                        ));
-                    }
-                }
-            }
-            Section::ServerAdminHandles { .. } => unreachable!("handled above"),
             Section::Watcher {
                 indent: watcher_indent,
             } => {
                 let watcher_indent = *watcher_indent;
                 match key.as_str() {
-                    "url" => {
-                        cfg.watcher.url = Some(expand_env_vars(&unquote_yaml(val)));
-                    }
                     "instructions_file" => {
                         cfg.watcher.instructions_file = Some(expand_env_vars(&unquote_yaml(val)));
                     }
@@ -495,7 +567,8 @@ pub fn insert_watcher_token_yaml(
         existing.lines().map(ToString::to_string).collect()
     };
 
-    // Locate top-level `watcher:` section and its bounds.
+    // Locate top-level `watcher:` section and check whether top-level `url:` is already set.
+    let mut has_root_url = false;
     let mut watcher_start: Option<usize> = None;
     let mut watcher_end: usize = lines.len();
     for (idx, raw) in lines.iter().enumerate() {
@@ -506,6 +579,9 @@ pub fn insert_watcher_token_yaml(
         let (_, cols) = leading_whitespace(stripped);
         if cols == 0 {
             if let Some((key, _)) = split_key_value(stripped.trim()) {
+                if unquote_yaml(key) == "url" {
+                    has_root_url = true;
+                }
                 if watcher_start.is_some() {
                     watcher_end = idx;
                     break;
@@ -519,11 +595,16 @@ pub fn insert_watcher_token_yaml(
 
     match watcher_start {
         None => {
+            if !has_root_url && !url.trim().is_empty() {
+                if !lines.is_empty() && !lines.last().is_some_and(|l| l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(format!("url: {}", yaml_scalar(url)));
+            }
             if !lines.is_empty() && !lines.last().is_some_and(|l| l.trim().is_empty()) {
                 lines.push(String::new());
             }
             lines.push("watcher:".to_string());
-            lines.push(format!("  url: {}", yaml_scalar(url)));
             lines.push("  agent_tokens:".to_string());
             lines.push(format!("    {name}: {}", yaml_scalar(token)));
         }
@@ -893,20 +974,275 @@ pub fn remove_watcher_token_from_config(path: &Path, name: &str) -> Result<bool>
     Ok(true)
 }
 
+/// Updates or inserts root-level `url:` and (optionally) `token:` in a client `config.yaml` string,
+/// preserving comments and the `watcher:` section.
+pub fn upsert_client_connection_yaml(
+    existing: &str,
+    url: &str,
+    token: Option<&str>,
+) -> Result<String> {
+    if !existing.trim().is_empty() {
+        let _ = parse_yaml_config(existing)?;
+    }
+
+    let mut lines: Vec<String> = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(ToString::to_string).collect()
+    };
+
+    let mut url_idx: Option<usize> = None;
+    let mut token_idx: Option<usize> = None;
+    let mut watcher_idx: Option<usize> = None;
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let stripped = strip_yaml_comment(raw);
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (_, cols) = leading_whitespace(stripped);
+        if cols == 0 {
+            if let Some((key, _)) = split_key_value(trimmed) {
+                match unquote_yaml(key).as_str() {
+                    "url" => url_idx = Some(idx),
+                    "token" => token_idx = Some(idx),
+                    "watcher" if watcher_idx.is_none() => watcher_idx = Some(idx),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let url_line = format!("url: {}", yaml_scalar(url.trim()));
+    if let Some(idx) = url_idx {
+        lines[idx] = url_line;
+    } else {
+        let insert_at = watcher_idx.unwrap_or(lines.len());
+        lines.insert(insert_at, url_line);
+        url_idx = Some(insert_at);
+        if let Some(ref mut t_idx) = token_idx {
+            if *t_idx >= insert_at {
+                *t_idx += 1;
+            }
+        }
+        if let Some(ref mut w_idx) = watcher_idx {
+            if *w_idx >= insert_at {
+                *w_idx += 1;
+            }
+        }
+    }
+
+    if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+        let token_line = format!("token: {}", yaml_scalar(tok));
+        if let Some(idx) = token_idx {
+            lines[idx] = token_line;
+        } else {
+            let insert_at = url_idx
+                .map(|i| i + 1)
+                .or(watcher_idx)
+                .unwrap_or(lines.len());
+            lines.insert(insert_at, token_line);
+        }
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+
+    let reparsed =
+        parse_yaml_config(&out).context("internal error: updated config.yaml failed validation")?;
+    if reparsed.url.as_deref() != Some(url.trim()) {
+        return Err(anyhow!(
+            "internal error: updated url did not match after validation"
+        ));
+    }
+    if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+        if reparsed.token.as_deref() != Some(tok) {
+            return Err(anyhow!(
+                "internal error: updated token did not match after validation"
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+/// Saves the client's server `url` and optional human `token` to `~/.relaypod/config.yaml`.
+pub fn upsert_client_connection_in_config(
+    path: &Path,
+    url: &str,
+    token: Option<&str>,
+) -> Result<()> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?
+    } else {
+        render_starter_config_yaml()
+    };
+
+    let updated = upsert_client_connection_yaml(&existing, url, token)?;
+    write_config_atomic(path, &updated)
+}
+
+/// Updates root `token:` in `config.yaml` ONLY if a root `token:` is already configured.
+/// Returns `Ok(true)` if updated, `Ok(false)` otherwise.
+pub fn update_client_token_in_config(path: &Path, new_token: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let parsed = parse_yaml_config(&existing)?;
+    if parsed.token.is_none() {
+        return Ok(false);
+    }
+    let url = parsed.url.as_deref().unwrap_or(DEFAULT_SERVER_URL);
+    let updated = upsert_client_connection_yaml(&existing, url, Some(new_token))?;
+    write_config_atomic(path, &updated)?;
+    Ok(true)
+}
+
+/// Renders the starter client `~/.relaypod/config.yaml` for first-time initialization.
+pub fn render_starter_config_yaml() -> String {
+    format!(
+        "# RelayPod client configuration\n\
+         # Used by: RelayPod desktop UI, `relaypod` CLI, and `relaypod watch`\n\
+         \n\
+         url: {DEFAULT_SERVER_URL}\n\
+         # Human bearer token (env RELAYPOD_TOKEN takes precedence)\n\
+         # token: rp_...\n\
+         \n\
+         watcher:\n\
+         \x20\x20global_max_sessions: 10\n\
+         \x20\x20max_consecutive_agent_turns: 6\n\
+         \x20\x20# instructions_file: ~/.relaypod/agent-instructions.md\n\
+         \n\
+         \x20\x20# Agent tokens (added automatically when creating an agent in the UI or CLI).\n\
+         \x20\x20# All other agent settings (runner, harness, args, cwd, cooldown_secs, etc.)\n\
+         \x20\x20# are stored in the server DB and editable live in the RelayPod UI.\n\
+         \x20\x20# agent_tokens:\n\
+         \x20\x20#   mbp-codex: ${{RELAYPOD_CODEX_TOKEN}}\n"
+    )
+}
+
+/// Renders the starter server `~/.relaypod/server.yaml` for first-time `relaypod serve` initialization.
+pub fn render_starter_server_config_yaml(admin_handle: &str) -> String {
+    let normalized = normalize_admin_handle(admin_handle);
+    let admin = if normalized.is_empty() {
+        "admin".to_string()
+    } else {
+        normalized
+    };
+    format!(
+        "# RelayPod server configuration\n\
+         # Used by: relaypod serve\n\
+         \n\
+         host: {DEFAULT_SERVER_HOST}\n\
+         port: {DEFAULT_SERVER_PORT}\n\
+         # db: ~/.relaypod/relaypod.db\n\
+         \n\
+         # Human handles granted admin privileges (config-only, never stored in SQLite)\n\
+         admin_handles:\n\
+         \x20\x20- {}\n",
+        yaml_scalar(&admin)
+    )
+}
+
+/// Ensures `base_dir` (0700), `base_dir/workspace`, and a starter client `base_dir/config.yaml` (0600)
+/// exist. Existing `config.yaml` files are never overwritten.
+/// Returns `(config_path, created_config)`.
+pub fn ensure_relaypod_home_in(base_dir: &Path) -> Result<(std::path::PathBuf, bool)> {
+    std::fs::create_dir_all(base_dir)
+        .with_context(|| format!("failed to create RelayPod dir {}", base_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let workspace_dir = base_dir.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).with_context(|| {
+        format!(
+            "failed to create RelayPod workspace dir {}",
+            workspace_dir.display()
+        )
+    })?;
+
+    let config_path = base_dir.join("config.yaml");
+    if config_path.exists() {
+        return Ok((config_path, false));
+    }
+
+    let starter = render_starter_config_yaml();
+    write_config_atomic(&config_path, &starter)?;
+    Ok((config_path, true))
+}
+
+/// Ensures `~/.relaypod/`, `~/.relaypod/workspace/`, and a starter client `~/.relaypod/config.yaml`
+/// exist on disk without overwriting an existing config.
+pub fn ensure_default_config() -> Result<(std::path::PathBuf, bool)> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
+    let base_dir = Path::new(&home).join(".relaypod");
+    ensure_relaypod_home_in(&base_dir)
+}
+
+/// Ensures `base_dir` (0700) and a starter `base_dir/server.yaml` (0600) exist without overwriting
+/// an existing `server.yaml`. Returns `(server_config_path, created)`.
+pub fn ensure_server_config_in(
+    base_dir: &Path,
+    admin_handle: Option<&str>,
+) -> Result<(std::path::PathBuf, bool)> {
+    std::fs::create_dir_all(base_dir)
+        .with_context(|| format!("failed to create RelayPod dir {}", base_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let server_path = base_dir.join("server.yaml");
+    if server_path.exists() {
+        return Ok((server_path, false));
+    }
+
+    let env_user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let admin = admin_handle
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(env_user.as_deref())
+        .unwrap_or("admin");
+
+    let starter = render_starter_server_config_yaml(admin);
+    write_config_atomic(&server_path, &starter)?;
+    Ok((server_path, true))
+}
+
+/// Ensures `~/.relaypod/` and a starter `~/.relaypod/server.yaml` exist on disk without overwriting
+/// an existing `server.yaml`.
+pub fn ensure_default_server_config(
+    admin_handle: Option<&str>,
+) -> Result<(std::path::PathBuf, bool)> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
+    let base_dir = Path::new(&home).join(".relaypod");
+    ensure_server_config_in(&base_dir, admin_handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_multi_token_yaml_config() {
+    fn parses_client_yaml_config() {
         let yaml = r#"
-server:
-  admin_handles:
-    - admin
-    - "@Alice"
+url: http://127.0.0.1:8787
+token: rp_human_secret
 
 watcher:
-  url: http://127.0.0.1:8787
   global_max_sessions: 4
   instructions_file: ~/.relaypod/team-norms.md
   agent_tokens:
@@ -914,8 +1250,8 @@ watcher:
     mbp-claude: rp_456
 "#;
         let cfg = parse_yaml_config(yaml).unwrap();
-        assert_eq!(cfg.server.admin_handles, vec!["admin", "alice"]);
-        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.token.as_deref(), Some("rp_human_secret"));
         assert_eq!(cfg.watcher.global_max_sessions, Some(4));
         assert_eq!(
             cfg.watcher.instructions_file.as_deref(),
@@ -943,11 +1279,38 @@ watcher:
     }
 
     #[test]
+    fn parses_server_yaml_config_with_port_host_db_and_admins() {
+        let yaml = r#"
+host: 0.0.0.0
+port: 9090
+db: ~/.relaypod/relaypod.db
+admin_handles:
+  - admin
+  - "@Alice"
+"#;
+        let cfg = parse_server_config_yaml(yaml).unwrap();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 9090);
+        assert_eq!(cfg.db.as_deref(), Some("~/.relaypod/relaypod.db"));
+        assert_eq!(cfg.admin_handles, vec!["admin", "alice"]);
+        assert_eq!(cfg.bind_addr().unwrap().to_string(), "0.0.0.0:9090");
+
+        // Defaults when omitted
+        let defaults = parse_server_config_yaml("admin_handles: [bob]\n").unwrap();
+        assert_eq!(defaults.host, "127.0.0.1");
+        assert_eq!(defaults.port, 8787);
+        assert_eq!(defaults.admin_handles, vec!["bob"]);
+
+        // Port 0 rejected
+        assert!(parse_server_config_yaml("port: 0\n").is_err());
+    }
+
+    #[test]
     fn expands_env_vars_in_values() {
         std::env::set_var("RELAYPOD_TEST_TOKEN_VAR", "rp_from_env");
         let yaml = r#"
+url: http://127.0.0.1:8787
 watcher:
-  url: http://127.0.0.1:8787
   agent_tokens:
     bot: ${RELAYPOD_TEST_TOKEN_VAR}
 "#;
@@ -975,10 +1338,9 @@ watcher:
 
     #[test]
     fn parses_tab_indented_config() {
-        let yaml = "server:\n\tadmin_handles:\n\t- alice\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\tagent_tokens:\n\t  bot: rp_123\n";
+        let yaml = "url: http://127.0.0.1:8787\n\nwatcher:\n\tagent_tokens:\n\t  bot: rp_123\n";
         let cfg = parse_yaml_config(yaml).expect("tab-indented config should parse");
-        assert_eq!(cfg.server.admin_handles, vec!["alice"]);
-        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(
             cfg.watcher.agent_tokens.get("bot").map(String::as_str),
             Some("rp_123")
@@ -992,7 +1354,7 @@ watcher:
             insert_watcher_token_yaml("", "http://127.0.0.1:8787", "claude-local", "rp_secret_123")
                 .unwrap();
         let cfg = parse_yaml_config(&from_empty).unwrap();
-        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(
             cfg.watcher
                 .agent_tokens
@@ -1002,16 +1364,16 @@ watcher:
         );
 
         // 2. Starter config with commented-out `# agent_tokens:`
-        let starter = "server:\n  admin_handles:\n    - alice\n\nwatcher:\n  url: http://127.0.0.1:8787\n  # agent_tokens:\n  #   example: rp_...\n";
+        let starter = render_starter_config_yaml();
         let from_starter = insert_watcher_token_yaml(
-            starter,
+            &starter,
             "http://127.0.0.1:8787",
             "claude-local",
             "rp_secret_123",
         )
         .unwrap();
         let cfg = parse_yaml_config(&from_starter).unwrap();
-        assert_eq!(cfg.server.admin_handles, vec!["alice"]);
+        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(
             cfg.watcher
                 .agent_tokens
@@ -1039,7 +1401,7 @@ watcher:
         );
 
         // 4. Tab-indented config
-        let tabbed = "server:\n\tadmin_handles:\n\t- alice\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\tagent_tokens:\n\t  bot: rp_123\n";
+        let tabbed = "url: http://127.0.0.1:8787\n\nwatcher:\n\tagent_tokens:\n\t  bot: rp_123\n";
         let from_tabbed = insert_watcher_token_yaml(
             tabbed,
             "http://127.0.0.1:8787",
@@ -1068,13 +1430,27 @@ watcher:
     }
 
     #[test]
+    fn upserts_client_url_and_token_preserving_watcher() {
+        let starter = render_starter_config_yaml();
+        let saved =
+            upsert_client_connection_yaml(&starter, "http://127.0.0.1:9000", Some("rp_human_1"))
+                .unwrap();
+        let cfg = parse_yaml_config(&saved).unwrap();
+        assert_eq!(cfg.url.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(cfg.token.as_deref(), Some("rp_human_1"));
+
+        let rotated =
+            upsert_client_connection_yaml(&saved, "http://127.0.0.1:9000", Some("rp_human_2"))
+                .unwrap();
+        let cfg2 = parse_yaml_config(&rotated).unwrap();
+        assert_eq!(cfg2.token.as_deref(), Some("rp_human_2"));
+    }
+
+    #[test]
     fn updates_watcher_token_in_yaml() {
-        let yaml = r#"server:
-  admin_handles:
-    - alice
+        let yaml = r#"url: http://127.0.0.1:8787
 
 watcher:
-  url: http://127.0.0.1:8787
   agent_tokens:
     claude-local: rp_old_token
     codex-local: rp_other_token
@@ -1107,12 +1483,9 @@ watcher:
 
     #[test]
     fn removes_watcher_token_from_yaml() {
-        let yaml = r#"server:
-  admin_handles:
-    - alice
+        let yaml = r#"url: http://127.0.0.1:8787
 
 watcher:
-  url: http://127.0.0.1:8787
   agent_tokens:
     claude-local: rp_old_token
     codex-local: rp_other_token
@@ -1140,5 +1513,51 @@ watcher:
         assert!(remove_watcher_token_yaml(yaml, "missing-bot")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn initializes_client_and_server_configs_idempotently() {
+        let base =
+            std::env::temp_dir().join(format!("relaypod-home-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Client config.yaml
+        let (cfg_path, created) = ensure_relaypod_home_in(&base).unwrap();
+        assert!(created);
+        assert!(cfg_path.is_file());
+        assert!(base.join("workspace").is_dir());
+
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed = parse_yaml_config(&raw).unwrap();
+        assert_eq!(parsed.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert!(parsed.token.is_none());
+        assert!(parsed.watcher.agent_tokens.is_empty());
+
+        let with_tok =
+            insert_watcher_token_yaml(&raw, "http://127.0.0.1:8787", "claude", "rp_abc").unwrap();
+        std::fs::write(&cfg_path, &with_tok).unwrap();
+        let (_, created_again) = ensure_relaypod_home_in(&base).unwrap();
+        assert!(!created_again);
+        let after = parse_yaml_config(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            after.watcher.agent_tokens.get("claude").map(String::as_str),
+            Some("rp_abc")
+        );
+
+        // Server server.yaml
+        let (srv_path, srv_created) = ensure_server_config_in(&base, Some("alice")).unwrap();
+        assert!(srv_created);
+        assert!(srv_path.is_file());
+        let srv = load_server_config_file(&srv_path).unwrap();
+        assert_eq!(srv.host, "127.0.0.1");
+        assert_eq!(srv.port, 8787);
+        assert_eq!(srv.admin_handles, vec!["alice"]);
+
+        let (_, srv_created_again) = ensure_server_config_in(&base, Some("bob")).unwrap();
+        assert!(!srv_created_again);
+        let srv_after = load_server_config_file(&srv_path).unwrap();
+        assert_eq!(srv_after.admin_handles, vec!["alice"]);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

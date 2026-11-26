@@ -35,6 +35,16 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
+    match watch::ensure_default_config() {
+        Ok((path, true)) => {
+            tracing::info!(path = %path.display(), "Initialized default RelayPod config");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to initialize default ~/.relaypod directory");
+        }
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 760.0])
         .with_title("RelayPod");
@@ -319,6 +329,8 @@ struct RelayPodApp {
 
     show_watcher_modal: bool,
     watcher_auto_start: bool,
+    remember_connection: bool,
+    save_connection_on_connect: bool,
 
     channel_search: String,
     channels_section: CollapsibleSection,
@@ -333,9 +345,25 @@ impl RelayPodApp {
         let egui_ctx = cc.egui_ctx.clone();
         let runtime = spawn_runtime(move || egui_ctx.request_repaint());
 
-        let server_url =
-            std::env::var("RELAYPOD_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
-        let token = std::env::var("RELAYPOD_TOKEN").unwrap_or_default();
+        let file_cfg = match watch::load_optional_config(None) {
+            Ok(Some((_, cfg))) => Some(cfg),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to read ~/.relaypod/config.yaml on startup");
+                None
+            }
+        };
+
+        let server_url = std::env::var("RELAYPOD_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.url.clone()))
+            .unwrap_or_else(|| watch::DEFAULT_SERVER_URL.to_string());
+        let token = std::env::var("RELAYPOD_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.token.clone()))
+            .unwrap_or_default();
 
         if !token.is_empty() {
             runtime.send(ClientCommand::Connect {
@@ -377,6 +405,8 @@ impl RelayPodApp {
             identity_edit: None,
             show_watcher_modal: false,
             watcher_auto_start: true,
+            remember_connection: true,
+            save_connection_on_connect: false,
             channel_search: String::new(),
             channels_section: CollapsibleSection::new(true),
             archived_channels_section: CollapsibleSection::new(false),
@@ -389,11 +419,25 @@ impl RelayPodApp {
             for cmd in effects.commands {
                 self.runtime.send(cmd);
             }
-            if effects.just_connected && self.watcher_auto_start {
-                self.runtime.send(ClientCommand::StartWatcher {
-                    default_url: self.server_url.clone(),
-                    config_path: None,
-                });
+            if effects.just_connected {
+                if self.save_connection_on_connect {
+                    self.save_connection_on_connect = false;
+                    if let Err(err) = watch::default_config_path().and_then(|path| {
+                        watch::upsert_client_connection_in_config(
+                            &path,
+                            &self.server_url,
+                            Some(&self.token),
+                        )
+                    }) {
+                        tracing::warn!(error = %err, "Failed to save connection to ~/.relaypod/config.yaml");
+                    }
+                }
+                if self.watcher_auto_start {
+                    self.runtime.send(ClientCommand::StartWatcher {
+                        default_url: self.server_url.clone(),
+                        config_path: None,
+                    });
+                }
             }
             if effects.channel_just_created {
                 self.show_new_channel_modal = false;
@@ -435,12 +479,12 @@ impl RelayPodApp {
                 self.new_identity_draft = AgentEditDraft::new_blank();
             }
             if let Some(regenerated) = effects.token_just_regenerated {
-                if self
+                let rotated_self = self
                     .state
                     .me
                     .as_ref()
-                    .is_some_and(|me| me.id == regenerated.identity.id)
-                {
+                    .is_some_and(|me| me.id == regenerated.identity.id);
+                if rotated_self {
                     self.token = regenerated.token.clone();
                 }
                 if regenerated.identity.kind == IdentityKind::Agent {
@@ -466,6 +510,18 @@ impl RelayPodApp {
                                     "Updated '{key}' in {} and reloaded local watcher.",
                                     path.display()
                                 )))
+                            }
+                            Ok((_, false)) => None,
+                            Err(err) => Some(Err(format!("Failed to update config.yaml: {err}"))),
+                        };
+                } else if rotated_self {
+                    self.regenerated_watcher_note =
+                        match watch::default_config_path().and_then(|path| {
+                            watch::update_client_token_in_config(&path, &regenerated.token)
+                                .map(|updated| (path, updated))
+                        }) {
+                            Ok((path, true)) => {
+                                Some(Ok(format!("Updated saved token in {}.", path.display())))
                             }
                             Ok((_, false)) => None,
                             Err(err) => Some(Err(format!("Failed to update config.yaml: {err}"))),
@@ -630,19 +686,25 @@ impl RelayPodApp {
                             );
                         }
                         ui.add_space(8.0);
-                        ui.label("Bearer Token (RELAYPOD_TOKEN)");
+                        ui.label("Bearer Token");
                         let token_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.token)
                                 .password(true)
                                 .hint_text("rp_..."),
                         );
+                        ui.add_space(6.0);
+                        ui.checkbox(
+                            &mut self.remember_connection,
+                            "Save URL & token to ~/.relaypod/config.yaml",
+                        );
                         let enter_pressed = (url_resp.lost_focus() || token_resp.lost_focus())
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.add_space(12.0);
+                        ui.add_space(10.0);
                         if (ui.button("Connect").clicked() || enter_pressed)
                             && !self.token.trim().is_empty()
                         {
                             self.state.status_error = None;
+                            self.save_connection_on_connect = self.remember_connection;
                             self.runtime.send(ClientCommand::Connect {
                                 base_url: self.server_url.clone(),
                                 token: self.token.clone(),
