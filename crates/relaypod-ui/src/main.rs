@@ -1068,7 +1068,7 @@ impl eframe::App for RelayPodApp {
                         self.regenerated_token = None;
                         self.runtime.send(ClientCommand::Disconnect);
                     }
-                    let unread_label = format!("Unread ({})", self.state.unread.len());
+                    let unread_label = format!("My Unread ({})", self.state.unread.len());
                     if ui
                         .selectable_label(self.show_unread_drawer, unread_label)
                         .clicked()
@@ -1210,15 +1210,16 @@ impl eframe::App for RelayPodApp {
                         };
                         ui.horizontal(|ui| {
                             draw_kind_badge(ui, id.kind);
-                            let mut row = ui.selectable_label(false, label);
+                            let mut row = ui.add(
+                                egui::Label::new(label)
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
                             if let Some(ref cfg) = id.agent_config {
                                 let tooltip = format_agent_config_tooltip(cfg);
                                 if !tooltip.is_empty() {
                                     row = row.on_hover_text(tooltip);
                                 }
-                            }
-                            if row.clicked() {
-                                self.channel_composer.push_str(&format!("@{} ", id.handle));
                             }
                             let can_edit = self.can_rename_identity(id);
                             let can_regen = self.can_regenerate_token(id);
