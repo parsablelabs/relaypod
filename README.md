@@ -24,9 +24,21 @@ crates/
 └── relaypod-ui/      # `relaypod-ui` thin egui desktop renderer
 ```
 
+## Install
+
+Prebuilt binaries are published on [GitHub Releases](https://github.com/parsablelabs/relaypod/releases):
+
+- **CLI / Server / Watcher (`relaypod`) — macOS & Linux:**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/parsablelabs/relaypod/main/scripts/install.sh | sh
+  ```
+  *(Installs `relaypod` to `~/.local/bin/relaypod` with SHA-256 verification. Pass `--version v0.1.0` or `--dir /usr/local/bin` to customize.)*
+- **Desktop UI (`RelayPod`) — macOS:** Download `RelayPod-<version>-macos-arm64.dmg` (Apple Silicon) or `macos-x86_64.dmg` (Intel) from Releases and drag `RelayPod.app` into **Applications**.
+- **Desktop UI (`RelayPod`) — Linux:** Download `RelayPod-<version>-linux-x86_64.AppImage`, or extract `relaypod-<version>-linux-x86_64.tar.gz` and run `./install.sh`.
+
 ## Quick Start
 
-### 1. Build
+### 1. Build from source (optional)
 ```bash
 cargo build --workspace
 ```
@@ -54,10 +66,11 @@ cargo run -p relaypod-ui
 ```
 
 ### 4. Register an agent & connect via MCP
+Agents are registered via the CLI, which automatically appends a watcher entry (defaulting to `runner: herdr` and your current working directory) to `~/.relaypod/config.yaml`:
 ```bash
-cargo run -p relaypod-cli -- identity create <AGENT_HANDLE_NAME> --kind agent
+relaypod identity create <AGENT_HANDLE_NAME> --agent-type claude --cwd ~/projects/my-repo
 ```
-Add the printed MCP snippet to Claude Code, Codex, Antigravity, or any MCP-capable harness:
+Pass `--omit-config` if you only want the token/MCP snippet without editing `~/.relaypod/config.yaml`. Add the printed MCP snippet to Claude Code, Codex, Antigravity, or any MCP-capable harness:
 ```json
 {
   "mcpServers": {

@@ -609,6 +609,330 @@ fn expand_env_vars(input: &str) -> String {
     out
 }
 
+#[derive(Debug, Clone)]
+pub struct NewWatcherHandleEntry {
+    pub runner: RunnerKind,
+    pub agent_type: Option<AgentType>,
+    pub token: String,
+    pub exec: Option<String>,
+    pub args: Option<String>,
+    pub cwd: Option<String>,
+    pub herdr_session: Option<String>,
+    pub herdr_workspace: Option<String>,
+    pub instructions_file: Option<String>,
+    pub max_sessions: Option<usize>,
+    pub auto_ack: bool,
+    pub drain_on_start: bool,
+}
+
+fn yaml_scalar(val: &str) -> String {
+    let needs_quotes = val.is_empty()
+        || val.starts_with(' ')
+        || val.ends_with(' ')
+        || val.contains('\n')
+        || val.contains('#')
+        || val.contains(':')
+        || val.contains('\'')
+        || val.contains('"')
+        || val.starts_with('-')
+        || val.starts_with('[')
+        || val.starts_with('{');
+    if needs_quotes {
+        format!("'{}'", val.replace('\'', "''"))
+    } else {
+        val.to_string()
+    }
+}
+
+fn render_handle_block(
+    handle: &str,
+    entry: &NewWatcherHandleEntry,
+    handle_indent: &str,
+    field_indent: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("{handle_indent}{handle}:"));
+    let runner_str = match entry.runner {
+        RunnerKind::Herdr => "herdr",
+        RunnerKind::Exec => "exec",
+    };
+    lines.push(format!("{field_indent}runner: {runner_str}"));
+    if let Some(ref agent_type) = entry.agent_type {
+        lines.push(format!(
+            "{field_indent}agent_type: {}",
+            agent_type.as_herdr_kind()
+        ));
+    }
+    lines.push(format!(
+        "{field_indent}token: {}",
+        yaml_scalar(&entry.token)
+    ));
+    if let Some(ref exec) = entry.exec {
+        lines.push(format!("{field_indent}exec: {}", yaml_scalar(exec)));
+    }
+    if let Some(ref args) = entry.args {
+        lines.push(format!("{field_indent}args: {}", yaml_scalar(args)));
+    }
+    if let Some(ref cwd) = entry.cwd {
+        lines.push(format!("{field_indent}cwd: {}", yaml_scalar(cwd)));
+    }
+    if let Some(ref session) = entry.herdr_session {
+        lines.push(format!(
+            "{field_indent}herdr_session: {}",
+            yaml_scalar(session)
+        ));
+    }
+    if let Some(ref workspace) = entry.herdr_workspace {
+        lines.push(format!(
+            "{field_indent}herdr_workspace: {}",
+            yaml_scalar(workspace)
+        ));
+    }
+    if let Some(ref instr) = entry.instructions_file {
+        lines.push(format!(
+            "{field_indent}instructions_file: {}",
+            yaml_scalar(instr)
+        ));
+    }
+    if let Some(max_sessions) = entry.max_sessions {
+        lines.push(format!("{field_indent}max_sessions: {max_sessions}"));
+    }
+    lines.push(format!("{field_indent}auto_ack: {}", entry.auto_ack));
+    lines.push(format!(
+        "{field_indent}drain_on_start: {}",
+        entry.drain_on_start
+    ));
+    lines
+}
+
+fn leading_whitespace(line: &str) -> (&str, usize) {
+    let mut byte_len = 0usize;
+    let mut cols = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => {
+                byte_len += 1;
+                cols += 1;
+            }
+            b'\t' => {
+                byte_len += 1;
+                cols += 4;
+            }
+            _ => break,
+        }
+    }
+    (&line[..byte_len], cols)
+}
+
+/// Inserts a new watcher handle block into an existing (or empty) `config.yaml` string,
+/// preserving existing comments, indentation, and sections, and verifies the resulting YAML parses.
+pub fn insert_watcher_handle_yaml(
+    existing: &str,
+    url: &str,
+    handle: &str,
+    entry: &NewWatcherHandleEntry,
+) -> Result<String> {
+    if !existing.trim().is_empty() {
+        let parsed = parse_yaml_config(existing)?;
+        if parsed.watcher.handles.contains_key(handle) {
+            return Err(anyhow!(
+                "watcher handle '{handle}' already exists in config.yaml"
+            ));
+        }
+    }
+
+    let mut lines: Vec<String> = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(ToString::to_string).collect()
+    };
+
+    // Locate top-level `watcher:` section and its bounds.
+    let mut watcher_start: Option<usize> = None;
+    let mut watcher_end: usize = lines.len();
+    for (idx, raw) in lines.iter().enumerate() {
+        let stripped = strip_yaml_comment(raw);
+        if stripped.trim().is_empty() {
+            continue;
+        }
+        let (_, cols) = leading_whitespace(stripped);
+        if cols == 0 {
+            if let Some((key, _)) = split_key_value(stripped.trim()) {
+                if watcher_start.is_none() && key == "watcher" {
+                    watcher_start = Some(idx);
+                } else if watcher_start.is_some() {
+                    watcher_end = idx;
+                    break;
+                }
+            }
+        }
+    }
+
+    match watcher_start {
+        None => {
+            if !lines.is_empty() && !lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("watcher:".to_string());
+            lines.push(format!("  url: {}", yaml_scalar(url)));
+            lines.push("  handles:".to_string());
+            lines.extend(render_handle_block(handle, entry, "    ", "      "));
+        }
+        Some(w_start) => {
+            // Find `handles:` inside `watcher:` and detect child indentation.
+            let mut watcher_child_indent_str: Option<String> = None;
+            let mut watcher_child_cols: Option<usize> = None;
+            let mut handles_idx: Option<usize> = None;
+            let mut handles_indent_str = String::new();
+            let mut handles_cols = 0usize;
+
+            for (idx, raw) in lines.iter().enumerate().take(watcher_end).skip(w_start + 1) {
+                let stripped = strip_yaml_comment(raw);
+                if stripped.trim().is_empty() {
+                    continue;
+                }
+                let (ws, cols) = leading_whitespace(stripped);
+                if watcher_child_cols.is_none() {
+                    watcher_child_cols = Some(cols);
+                    watcher_child_indent_str = Some(ws.to_string());
+                }
+                if Some(cols) == watcher_child_cols {
+                    if let Some((key, _)) = split_key_value(stripped.trim()) {
+                        if key == "handles" {
+                            handles_idx = Some(idx);
+                            handles_indent_str = ws.to_string();
+                            handles_cols = cols;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(h_idx) = handles_idx {
+                let mut h_end = watcher_end;
+                let mut existing_handle_indent: Option<String> = None;
+                let mut existing_handle_cols: Option<usize> = None;
+                let mut existing_field_indent: Option<String> = None;
+
+                for (idx, raw) in lines.iter().enumerate().take(watcher_end).skip(h_idx + 1) {
+                    let stripped = strip_yaml_comment(raw);
+                    if stripped.trim().is_empty() {
+                        continue;
+                    }
+                    let (ws, cols) = leading_whitespace(stripped);
+                    if cols <= handles_cols {
+                        h_end = idx;
+                        break;
+                    }
+                    if existing_handle_cols.is_none() {
+                        existing_handle_cols = Some(cols);
+                        existing_handle_indent = Some(ws.to_string());
+                    } else if existing_field_indent.is_none()
+                        && Some(cols) > existing_handle_cols
+                    {
+                        existing_field_indent = Some(ws.to_string());
+                    }
+                }
+
+                // Back up past trailing blank lines inside the handles block for clean insertion.
+                let mut insert_at = h_end;
+                while insert_at > h_idx + 1 && lines[insert_at - 1].trim().is_empty() {
+                    insert_at -= 1;
+                }
+
+                let handle_indent = existing_handle_indent
+                    .unwrap_or_else(|| format!("{handles_indent_str}  "));
+                let field_indent =
+                    existing_field_indent.unwrap_or_else(|| format!("{handle_indent}  "));
+                let block = render_handle_block(handle, entry, &handle_indent, &field_indent);
+                lines.splice(insert_at..insert_at, block);
+            } else {
+                // `watcher:` exists without an active `handles:` section.
+                let mut insert_at = watcher_end;
+                while insert_at > w_start + 1 && lines[insert_at - 1].trim().is_empty() {
+                    insert_at -= 1;
+                }
+                let child_indent = watcher_child_indent_str.unwrap_or_else(|| "  ".to_string());
+                let handle_indent = format!("{child_indent}  ");
+                let field_indent = format!("{handle_indent}  ");
+                let mut block = Vec::new();
+                block.push(format!("{child_indent}handles:"));
+                block.extend(render_handle_block(
+                    handle,
+                    entry,
+                    &handle_indent,
+                    &field_indent,
+                ));
+                lines.splice(insert_at..insert_at, block);
+            }
+        }
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+
+    // Verify the updated YAML still parses cleanly and contains the new handle.
+    let reparsed = parse_yaml_config(&out)
+        .context("internal error: generated config.yaml failed validation")?;
+    if !reparsed.watcher.handles.contains_key(handle) {
+        return Err(anyhow!(
+            "internal error: newly added handle '{handle}' missing after config update"
+        ));
+    }
+
+    Ok(out)
+}
+
+pub fn append_watcher_handle_to_config(
+    path: &Path,
+    url: &str,
+    handle: &str,
+    entry: &NewWatcherHandleEntry,
+) -> Result<()> {
+    let existing = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = insert_watcher_handle_yaml(&existing, url, handle, entry)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let tmp_path = path.with_extension("yaml.tmp");
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp_path)
+            .with_context(|| format!("failed to open temp config {}", tmp_path.display()))?;
+        file.write_all(updated.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write updated config {}", path.display())
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +1082,86 @@ watcher:
         assert_eq!(cfg.server.admin_handles, vec!["alice"]);
         assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(cfg.watcher.handles["bot"].token.as_deref(), Some("rp_123"));
+    }
+
+    #[test]
+    fn inserts_watcher_handle_into_empty_starter_existing_and_tab_configs() {
+        let entry = NewWatcherHandleEntry {
+            runner: RunnerKind::Herdr,
+            agent_type: Some(AgentType::Claude),
+            token: "rp_secret_123".into(),
+            exec: None,
+            args: Some("--model sonnet".into()),
+            cwd: Some("/tmp/my-repo".into()),
+            herdr_session: None,
+            herdr_workspace: Some("relaypod".into()),
+            instructions_file: None,
+            max_sessions: Some(5),
+            auto_ack: false,
+            drain_on_start: true,
+        };
+
+        // 1. Empty file
+        let from_empty =
+            insert_watcher_handle_yaml("", "http://127.0.0.1:8787", "claude-local", &entry)
+                .unwrap();
+        let cfg = parse_yaml_config(&from_empty).unwrap();
+        assert_eq!(cfg.watcher.url.as_deref(), Some("http://127.0.0.1:8787"));
+        assert_eq!(
+            cfg.watcher.handles["claude-local"].runner,
+            RunnerKind::Herdr
+        );
+        assert_eq!(
+            cfg.watcher.handles["claude-local"].agent_type,
+            Some(AgentType::Claude)
+        );
+        assert_eq!(
+            cfg.watcher.handles["claude-local"].token.as_deref(),
+            Some("rp_secret_123")
+        );
+
+        // 2. Starter config with commented-out `# handles:`
+        let starter = "server:\n  admin_handles:\n    - alice\n\nwatcher:\n  url: http://127.0.0.1:8787\n  # handles:\n  #   example:\n";
+        let from_starter =
+            insert_watcher_handle_yaml(starter, "http://127.0.0.1:8787", "claude-local", &entry)
+                .unwrap();
+        let cfg = parse_yaml_config(&from_starter).unwrap();
+        assert_eq!(cfg.server.admin_handles, vec!["alice"]);
+        assert!(cfg.watcher.handles.contains_key("claude-local"));
+
+        // 3. Existing `handles:` block (with another handle already present)
+        let second = NewWatcherHandleEntry {
+            agent_type: Some(AgentType::Codex),
+            token: "rp_second".into(),
+            ..entry.clone()
+        };
+        let with_two =
+            insert_watcher_handle_yaml(&from_starter, "http://127.0.0.1:8787", "codex-local", &second)
+                .unwrap();
+        let cfg = parse_yaml_config(&with_two).unwrap();
+        assert_eq!(cfg.watcher.handles.len(), 2);
+        assert!(cfg.watcher.handles.contains_key("claude-local"));
+        assert!(cfg.watcher.handles.contains_key("codex-local"));
+
+        // 4. Tab-indented config
+        let tabbed = "server:\n\tadmin_handles:\n\t- alice\n\nwatcher:\n\turl: http://127.0.0.1:8787\n\thandles:\n\t  bot:\n\t    token: rp_123\n\t    exec: echo hi\n";
+        let from_tabbed =
+            insert_watcher_handle_yaml(tabbed, "http://127.0.0.1:8787", "claude-local", &entry)
+                .unwrap();
+        let cfg = parse_yaml_config(&from_tabbed).unwrap();
+        assert_eq!(cfg.watcher.handles.len(), 2);
+        assert_eq!(
+            cfg.watcher.handles["claude-local"].token.as_deref(),
+            Some("rp_secret_123")
+        );
+
+        // 5. Duplicate handle is rejected
+        assert!(insert_watcher_handle_yaml(
+            &with_two,
+            "http://127.0.0.1:8787",
+            "claude-local",
+            &entry
+        )
+        .is_err());
     }
 }

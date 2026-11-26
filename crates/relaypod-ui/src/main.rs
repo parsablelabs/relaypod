@@ -3,9 +3,7 @@ mod markdown;
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, CornerRadius, Margin, Stroke};
-use relaypod_client::{
-    mcp_config_snippet, spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState,
-};
+use relaypod_client::{spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState};
 use relaypod_core::{
     Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
     UpdateIdentityRequest,
@@ -76,9 +74,8 @@ struct RelayPodApp {
     new_channel_name: String,
     new_channel_desc: String,
 
-    show_new_agent_modal: bool,
-    new_agent_handle: String,
-    new_agent_kind: IdentityKind,
+    show_new_human_modal: bool,
+    new_human_handle: String,
     last_created_identity: Option<CreatedIdentity>,
 
     pending_delete_message: Option<Message>,
@@ -128,9 +125,8 @@ impl RelayPodApp {
             show_new_channel_modal: false,
             new_channel_name: String::new(),
             new_channel_desc: String::new(),
-            show_new_agent_modal: false,
-            new_agent_handle: String::new(),
-            new_agent_kind: IdentityKind::Agent,
+            show_new_human_modal: false,
+            new_human_handle: String::new(),
             last_created_identity: None,
             pending_delete_message: None,
             pending_delete_channel: None,
@@ -156,7 +152,7 @@ impl RelayPodApp {
             }
             if let Some(created) = effects.identity_just_created {
                 self.last_created_identity = Some(created);
-                self.new_agent_handle.clear();
+                self.new_human_handle.clear();
             }
         }
     }
@@ -360,49 +356,25 @@ impl RelayPodApp {
             }
         }
 
-        if self.show_new_agent_modal {
-            let is_admin = self.is_admin();
-            if !is_admin {
-                self.new_agent_kind = IdentityKind::Agent;
-            }
-            let title = if is_admin {
-                "Register Identity / Agent"
-            } else {
-                "Register Agent"
-            };
+        if self.show_new_human_modal {
             let mut close = false;
-            let modal = egui::Modal::new(egui::Id::new("new_identity")).show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.heading(title);
-                if is_admin {
-                    ui.horizontal(|ui| {
-                        ui.label("Kind:");
-                        ui.selectable_value(
-                            &mut self.new_agent_kind,
-                            IdentityKind::Agent,
-                            "Agent",
-                        );
-                        ui.selectable_value(
-                            &mut self.new_agent_kind,
-                            IdentityKind::Human,
-                            "Human",
-                        );
-                    });
-                }
-                ui.label("Handle (e.g. claude-local)");
-                ui.text_edit_singleline(&mut self.new_agent_handle);
+            let modal = egui::Modal::new(egui::Id::new("new_human")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Register Human");
+                ui.label("Handle (e.g. alice)");
+                ui.text_edit_singleline(&mut self.new_human_handle);
 
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            !self.new_agent_handle.trim().is_empty(),
+                            !self.new_human_handle.trim().is_empty(),
                             egui::Button::new("Create"),
                         )
                         .clicked()
                     {
                         self.runtime.send(ClientCommand::CreateIdentity {
-                            handle: self.new_agent_handle.clone(),
-                            kind: self.new_agent_kind,
+                            handle: self.new_human_handle.clone(),
+                            kind: IdentityKind::Human,
                         });
                     }
                     if ui.button("Close").clicked() {
@@ -426,26 +398,10 @@ impl RelayPodApp {
                     });
                     let mut tok = created.token.clone();
                     ui.add(egui::TextEdit::singleline(&mut tok).desired_width(f32::INFINITY));
-
-                    if created.identity.kind == IdentityKind::Agent {
-                        let mut snippet = mcp_config_snippet(&self.server_url, &created.token);
-                        ui.horizontal(|ui| {
-                            ui.label("MCP config snippet:");
-                            if ui.small_button("Copy snippet").clicked() {
-                                ui.ctx().copy_text(snippet.clone());
-                            }
-                        });
-                        ui.add(
-                            egui::TextEdit::multiline(&mut snippet)
-                                .code_editor()
-                                .desired_rows(8)
-                                .desired_width(f32::INFINITY),
-                        );
-                    }
                 }
             });
             if close || modal.should_close() {
-                self.show_new_agent_modal = false;
+                self.show_new_human_modal = false;
                 self.last_created_identity = None;
             }
         }
@@ -814,15 +770,10 @@ impl eframe::App for RelayPodApp {
 
                 ui.horizontal(|ui| {
                     ui.strong("IDENTITIES");
-                    if self.can_manage_channels() {
-                        let add_label = if self.is_admin() {
-                            "+ Identity"
-                        } else {
-                            "+ Agent"
-                        };
+                    if self.is_admin() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button(add_label).clicked() {
-                                self.show_new_agent_modal = true;
+                            if ui.small_button("+ Human").clicked() {
+                                self.show_new_human_modal = true;
                                 self.last_created_identity = None;
                             }
                         });

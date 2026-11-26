@@ -14,7 +14,8 @@ use super::{
 };
 
 /// Adapter that executes headless CLI commands directly:
-/// - Managed `codex exec` / `claude -p` with automatic JSON session ID capture & resume
+/// - Managed `codex exec` / `claude -p` (with JSON session ID capture & resume)
+/// - Managed headless `gemini -p` / `agy -p` / `pi -p`
 /// - Custom shell `exec:` commands when `agent_type` is not set
 pub struct ExecAdapter;
 
@@ -131,14 +132,23 @@ async fn run_managed_agent(
             c.arg(&prompt);
             c
         }
-        AgentType::Other(other) => {
-            error!(
-                handle = %ctx.handle,
-                agent_type = %other,
-                "ExecAdapter only supports `codex` and `claude` (use `runner: herdr` for `{other}`)"
-            );
-            return false;
-        }
+        AgentType::Other(other) => match other.as_str() {
+            "gemini" | "agy" | "pi" => {
+                let mut c = Command::new(other);
+                c.arg("-p");
+                c.args(&extra_args);
+                c.arg(&prompt);
+                c
+            }
+            _ => {
+                error!(
+                    handle = %ctx.handle,
+                    agent_type = %other,
+                    "ExecAdapter does not have a built-in headless command for `{other}` (use `runner: herdr` or omit `agent_type` and set `exec:`)"
+                );
+                return false;
+            }
+        },
     };
 
     apply_common_env(

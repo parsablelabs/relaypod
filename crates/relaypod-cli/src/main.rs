@@ -2,12 +2,13 @@ mod mcp;
 mod watch;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use relaypod_client::{mcp_config_snippet, RelayPodClient};
 use relaypod_core::{
     CreateChannelRequest, CreateIdentityRequest, IdentityKind, Store, UpdateChannelRequest,
     UpdateIdentityRequest,
 };
+use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,18 +119,61 @@ enum Commands {
     },
 }
 
+#[derive(Args)]
+struct IdentityCreateArgs {
+    /// Handle for the new identity (without leading '@')
+    handle: String,
+    /// Identity kind: 'agent' or 'human'
+    #[arg(long, default_value = "agent")]
+    kind: String,
+    /// Do not add a watcher handle entry to ~/.relaypod/config.yaml
+    #[arg(long)]
+    omit_config: bool,
+    /// Path to YAML config file to update (defaults to ~/.relaypod/config.yaml)
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Watcher runner for the agent: 'herdr' or 'exec'
+    #[arg(long, default_value = "herdr")]
+    runner: String,
+    /// Agent harness type (e.g. 'claude', 'codex', 'gemini', 'agy', 'opencode', 'cursor', 'pi', or 'custom')
+    #[arg(long, alias = "harness")]
+    agent_type: Option<String>,
+    /// Custom shell command when using --runner exec without --agent-type
+    #[arg(long)]
+    exec: Option<String>,
+    /// Working directory for the agent (defaults to current directory)
+    #[arg(long)]
+    cwd: Option<String>,
+    /// Extra CLI flags forwarded to the agent
+    #[arg(long)]
+    args: Option<String>,
+    /// Target Herdr session name (for --runner herdr)
+    #[arg(long)]
+    herdr_session: Option<String>,
+    /// Target Herdr workspace label or ID (for --runner herdr)
+    #[arg(long)]
+    herdr_workspace: Option<String>,
+    /// Optional per-handle instructions file path
+    #[arg(long)]
+    instructions_file: Option<String>,
+    /// Optional per-handle max concurrent sessions
+    #[arg(long)]
+    max_sessions: Option<usize>,
+    /// Automatically ack unread items on exit 0 (default: false)
+    #[arg(long)]
+    auto_ack: bool,
+    /// Do not drain existing unacked items on startup/reconnect
+    #[arg(long)]
+    no_drain: bool,
+}
+
 #[derive(Subcommand)]
 enum IdentityAction {
     /// List all active human and agent identities
     List,
-    /// Register a new human (admin only) or agent identity
-    Create {
-        /// Handle for the new identity (without leading '@')
-        handle: String,
-        /// Identity kind: 'agent' or 'human'
-        #[arg(long, default_value = "agent")]
-        kind: String,
-    },
+    /// Register a new human (admin only) or agent identity.
+    /// For agents, automatically adds a watcher entry to ~/.relaypod/config.yaml unless --omit-config is passed.
+    Create(Box<IdentityCreateArgs>),
     /// Rename an agent identity you registered
     Rename {
         /// Current agent handle or ID
@@ -196,6 +240,26 @@ fn require_client(cli: &Cli) -> Result<RelayPodClient> {
         anyhow!("RELAYPOD_TOKEN (or --token) is required for this command")
     })?;
     Ok(RelayPodClient::new(cli.url.clone(), token))
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+fn default_exec_for_harness(harness: &str) -> String {
+    let prompt_msg = "New RelayPod message in #$RELAYPOD_CHANNEL from @$RELAYPOD_AUTHOR (thread $RELAYPOD_THREAD_ID, unread $RELAYPOD_UNREAD_ID). Reply via RelayPod MCP and ack $RELAYPOD_UNREAD_ID.";
+    match harness {
+        "codex" => format!(r#"codex exec "{prompt_msg}""#),
+        "claude" | "claude-code" => format!(r#"claude -p "{prompt_msg}""#),
+        "gemini" => format!(r#"gemini -p "{prompt_msg}""#),
+        "agy" => format!(r#"agy -p "{prompt_msg}""#),
+        "pi" => format!(r#"pi -p "{prompt_msg}""#),
+        other => format!(r#"{other} "{prompt_msg}""#),
+    }
 }
 
 #[tokio::main]
@@ -303,10 +367,151 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                IdentityAction::Create { handle, kind } => {
+                IdentityAction::Create(create_args) => {
+                    let IdentityCreateArgs {
+                        handle,
+                        kind,
+                        omit_config,
+                        config,
+                        runner,
+                        agent_type,
+                        exec,
+                        cwd,
+                        args,
+                        herdr_session,
+                        herdr_workspace,
+                        instructions_file,
+                        max_sessions,
+                        auto_ack,
+                        no_drain,
+                    } = create_args.as_ref();
                     let parsed_kind = kind
                         .parse::<IdentityKind>()
                         .map_err(|e| anyhow!(e))?;
+
+                    // Validate/prompt watcher config inputs before creating the remote identity so
+                    // we never leave an orphaned agent if flags are missing/invalid.
+                    let watcher_plan = if parsed_kind == IdentityKind::Agent && !*omit_config {
+                        let parsed_runner = watch::RunnerKind::parse(runner).ok_or_else(|| {
+                            anyhow!("invalid --runner '{runner}' (expected 'herdr' or 'exec')")
+                        })?;
+
+                        let mut raw_harness = agent_type.clone();
+                        let mut resolved_exec = exec.clone();
+
+                        // If harness/exec weren't passed on the command line, prompt interactively
+                        // when attached to a TTY.
+                        if raw_harness.is_none()
+                            && resolved_exec.is_none()
+                            && io::stdin().is_terminal()
+                        {
+                            let input = prompt_line(
+                                "Harness type (claude, codex, gemini, agy, opencode, cursor, pi, custom): ",
+                            )?;
+                            if !input.is_empty() {
+                                raw_harness = Some(input);
+                            }
+                        }
+
+                        let (parsed_agent_type, final_exec) = match raw_harness
+                            .as_deref()
+                            .map(|s| s.trim().to_lowercase())
+                            .as_deref()
+                        {
+                            Some("custom") => {
+                                if parsed_runner == watch::RunnerKind::Herdr {
+                                    return Err(anyhow!(
+                                        "'custom' harness requires --runner exec (and --exec <cmd>)"
+                                    ));
+                                }
+                                if resolved_exec.is_none() && io::stdin().is_terminal() {
+                                    let cmd = prompt_line("Exec command: ")?;
+                                    if !cmd.is_empty() {
+                                        resolved_exec = Some(cmd);
+                                    }
+                                }
+                                if resolved_exec.is_none() {
+                                    return Err(anyhow!(
+                                        "--exec <cmd> is required for custom harness"
+                                    ));
+                                }
+                                (None, resolved_exec)
+                            }
+                            Some(h) => {
+                                let at = watch::AgentType::parse(h)
+                                    .ok_or_else(|| anyhow!("invalid --agent-type '{h}'"))?;
+                                match parsed_runner {
+                                    watch::RunnerKind::Herdr => (Some(at), resolved_exec),
+                                    watch::RunnerKind::Exec => match at {
+                                        // ExecAdapter natively manages codex, claude, gemini, agy, and pi.
+                                        watch::AgentType::Codex | watch::AgentType::Claude => {
+                                            (Some(at), resolved_exec)
+                                        }
+                                        watch::AgentType::Other(ref other)
+                                            if matches!(other.as_str(), "gemini" | "agy" | "pi") =>
+                                        {
+                                            (Some(at), resolved_exec)
+                                        }
+                                        // Other harnesses run via custom shell `exec:` with a sensible default.
+                                        watch::AgentType::Other(ref other) => {
+                                            let default_cmd = default_exec_for_harness(other);
+                                            if resolved_exec.is_none() {
+                                                if io::stdin().is_terminal() {
+                                                    let input = prompt_line(&format!(
+                                                        "Exec command [{default_cmd}]: "
+                                                    ))?;
+                                                    resolved_exec = Some(if input.is_empty() {
+                                                        default_cmd
+                                                    } else {
+                                                        input
+                                                    });
+                                                } else {
+                                                    resolved_exec = Some(default_cmd);
+                                                }
+                                            }
+                                            (None, resolved_exec)
+                                        }
+                                    },
+                                }
+                            }
+                            None => match parsed_runner {
+                                watch::RunnerKind::Herdr => {
+                                    return Err(anyhow!(
+                                        "--agent-type (or --harness) is required for --runner herdr (e.g. claude, codex, gemini, agy), or pass --omit-config"
+                                    ));
+                                }
+                                watch::RunnerKind::Exec => {
+                                    if resolved_exec.is_none() {
+                                        return Err(anyhow!(
+                                            "--agent-type (claude|codex|...) or --exec is required for --runner exec, or pass --omit-config"
+                                        ));
+                                    }
+                                    (None, resolved_exec)
+                                }
+                            },
+                        };
+
+                        let resolved_cwd = match cwd {
+                            Some(c) => Some(c.clone()),
+                            None => std::env::current_dir()
+                                .ok()
+                                .map(|p| p.to_string_lossy().to_string()),
+                        };
+                        let cfg_path = match config {
+                            Some(p) => p.clone(),
+                            None => watch::default_config_path()?,
+                        };
+                        Some((
+                            cfg_path,
+                            parsed_runner,
+                            parsed_agent_type,
+                            final_exec,
+                            resolved_cwd,
+                        ))
+                    } else {
+                        None
+                    };
+
                     let created = client
                         .create_identity(&CreateIdentityRequest {
                             handle: handle.clone(),
@@ -314,8 +519,47 @@ async fn main() -> Result<()> {
                             owner_id: None,
                         })
                         .await?;
-                    println!("Created @{} ({})", created.identity.handle, created.identity.kind);
+                    println!(
+                        "Created @{} ({})",
+                        created.identity.handle, created.identity.kind
+                    );
                     println!("Token: {}", created.token);
+
+                    if let Some((
+                        cfg_path,
+                        parsed_runner,
+                        parsed_agent_type,
+                        final_exec,
+                        resolved_cwd,
+                    )) = watcher_plan
+                    {
+                        let entry = watch::NewWatcherHandleEntry {
+                            runner: parsed_runner,
+                            agent_type: parsed_agent_type,
+                            token: created.token.clone(),
+                            exec: final_exec,
+                            args: args.clone(),
+                            cwd: resolved_cwd,
+                            herdr_session: herdr_session.clone(),
+                            herdr_workspace: herdr_workspace.clone(),
+                            instructions_file: instructions_file.clone(),
+                            max_sessions: *max_sessions,
+                            auto_ack: *auto_ack,
+                            drain_on_start: !*no_drain,
+                        };
+                        watch::append_watcher_handle_to_config(
+                            &cfg_path,
+                            &cli.url,
+                            &created.identity.handle,
+                            &entry,
+                        )?;
+                        println!(
+                            "Added watcher handle '{}' to {}",
+                            created.identity.handle,
+                            cfg_path.display()
+                        );
+                    }
+
                     if created.identity.kind == IdentityKind::Agent {
                         println!("\nMCP config snippet:");
                         println!("{}", mcp_config_snippet(&cli.url, &created.token));

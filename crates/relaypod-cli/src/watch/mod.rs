@@ -17,18 +17,21 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
-use self::config::{
-    load_config_file, AgentType, HandleConfig, RunnerKind, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
+pub use self::config::{
+    append_watcher_handle_to_config, AgentType, NewWatcherHandleEntry, RunnerKind,
 };
+use self::config::{load_config_file, HandleConfig, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
 use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
 
+pub fn default_config_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
+    Ok(PathBuf::from(home).join(".relaypod").join("config.yaml"))
+}
+
 pub fn default_config_candidates() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(PathBuf::from(home).join(".relaypod").join("config.yaml"));
-    }
-    paths
+    default_config_path().into_iter().collect()
 }
 
 fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
