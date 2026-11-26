@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
+use super::supervisor::{resolve_program, resolved_subprocess_path};
 use super::{build_agent_prompt_with_context, common_env_pairs, split_shell_words};
 
 const SESSION_PREFIX: &str = "herdr:";
@@ -33,14 +34,15 @@ impl WatcherAdapter for HerdrAdapter {
             match dispatch_herdr(&ctx).await {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    let msg = format!("{err:#}");
                     error!(
                         handle = %ctx.handle,
                         thread_id = %ctx.thread_id,
                         unread_id = %ctx.item.id,
-                        error = %format!("{err:#}"),
+                        error = %msg,
                         "Herdr adapter dispatch failed"
                     );
-                    DispatchOutcome::failed()
+                    DispatchOutcome::failed_with(msg)
                 }
             }
         })
@@ -481,7 +483,10 @@ fn redact_herdr_args(args: &[&str]) -> String {
 }
 
 async fn run_herdr_json(args: &[&str]) -> Result<Value> {
-    let mut cmd = Command::new("herdr");
+    let mut cmd = Command::new(resolve_program("herdr"));
+    if let Some(path) = resolved_subprocess_path() {
+        cmd.env("PATH", path);
+    }
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

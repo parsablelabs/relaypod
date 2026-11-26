@@ -2,25 +2,35 @@ pub mod adapter;
 pub mod config;
 pub mod exec_adapter;
 pub mod herdr_adapter;
+pub mod supervisor;
 
+use crate::{run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL};
 use anyhow::{anyhow, Context, Result};
-use relaypod_client::{run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL};
 use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch as tokio_watch};
 use tracing::{error, info, warn};
 
 use self::adapter::{DispatchContext, WatcherAdapter};
 pub use self::config::{
-    append_watcher_token_to_config, update_watcher_token_in_config, AgentType, RunnerKind,
+    append_watcher_token_to_config, ensure_default_config, ensure_default_server_config,
+    remove_watcher_token_from_config, update_client_token_in_config,
+    update_watcher_token_in_config, upsert_client_connection_in_config,
+    upsert_watcher_token_in_config, AgentType, RunnerKind, ServerConfig, DEFAULT_SERVER_HOST,
+    DEFAULT_SERVER_PORT, DEFAULT_SERVER_URL,
 };
-use self::config::{load_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS};
+use self::config::{
+    load_config_file, load_server_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
+};
 use self::exec_adapter::ExecAdapter;
 use self::herdr_adapter::HerdrAdapter;
+use self::supervisor::{resolved_subprocess_path, WatcherReporter};
+pub use self::supervisor::{TargetPhase, WatchedTargetState, WatcherSnapshot, WatcherSupervisor};
 
 pub fn default_config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME")
@@ -28,11 +38,19 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".relaypod").join("config.yaml"))
 }
 
+pub fn default_server_config_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
+    Ok(PathBuf::from(home).join(".relaypod").join("server.yaml"))
+}
+
 pub fn default_config_candidates() -> Vec<PathBuf> {
     default_config_path().into_iter().collect()
 }
 
-fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+pub(crate) fn resolve_config_path(
+    explicit_path: Option<&std::path::Path>,
+) -> Result<Option<PathBuf>> {
     if let Some(p) = explicit_path {
         let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
         if !expanded.exists() {
@@ -43,7 +61,21 @@ fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option
     Ok(default_config_candidates().into_iter().find(|p| p.exists()))
 }
 
-fn expand_tilde(path: &str) -> String {
+fn resolve_server_config_path(explicit_path: Option<&std::path::Path>) -> Result<Option<PathBuf>> {
+    if let Some(p) = explicit_path {
+        let expanded = PathBuf::from(expand_tilde(&p.to_string_lossy()));
+        if !expanded.exists() {
+            return Err(anyhow!(
+                "server config file not found: {}",
+                expanded.display()
+            ));
+        }
+        return Ok(Some(expanded));
+    }
+    Ok(default_server_config_path().ok().filter(|p| p.exists()))
+}
+
+pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
@@ -121,7 +153,7 @@ impl SessionStore {
         }
     }
 
-    fn load_default() -> Self {
+    pub(crate) fn load_default() -> Self {
         Self::load_from(Self::default_path())
     }
 
@@ -258,12 +290,16 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
 
     info!("Starting RelayPod watcher for {} target(s)", targets.len());
 
+    let (shutdown_tx, shutdown_rx) = tokio_watch::channel(false);
     let sessions = SessionStore::load_default();
     let mut join_handles = Vec::with_capacity(targets.len());
     for target in targets {
         let sessions_clone = sessions.clone();
+        let rx_clone = shutdown_rx.clone();
         join_handles.push(tokio::spawn(async move {
-            if let Err(err) = watch_single_target(target.clone(), sessions_clone).await {
+            if let Err(err) =
+                watch_single_target(target.clone(), sessions_clone, None, rx_clone).await
+            {
                 error!(target = %target.label, error = %err, "watcher exited with error");
             }
         }));
@@ -272,6 +308,7 @@ pub async fn run_watch(opts: WatchOptions) -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down watcher...");
+            let _ = shutdown_tx.send(true);
         }
         _ = async {
             for h in join_handles {
@@ -295,6 +332,18 @@ pub fn load_optional_config(
     }
 }
 
+pub fn load_optional_server_config(
+    explicit_path: Option<&std::path::Path>,
+) -> Result<Option<(PathBuf, ServerConfig)>> {
+    match resolve_server_config_path(explicit_path)? {
+        Some(path) => {
+            let cfg = load_server_config_file(&path)?;
+            Ok(Some((path, cfg)))
+        }
+        None => Ok(None),
+    }
+}
+
 fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -309,7 +358,7 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     file.sync_all()
 }
 
-fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
+pub(crate) fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     let discovered_config = resolve_config_path(opts.config_path.as_deref())?;
 
     // Direct CLI mode: `--exec` provided and no `--handle` selected from config
@@ -353,7 +402,9 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
     })?;
 
     info!("Loading watch config from {}", cfg_path.display());
-    let cfg = load_config_file(&cfg_path)?.watcher;
+    let full_cfg = load_config_file(&cfg_path)?;
+    let root_url = full_cfg.url;
+    let cfg = full_cfg.watcher;
 
     let selected: Vec<(String, String)> = if let Some(ref wanted) = opts.handle_filter {
         let key = wanted.trim_start_matches('@');
@@ -386,7 +437,7 @@ fn resolve_targets(opts: &WatchOptions) -> Result<Vec<ResolvedTarget>> {
         }
     }
 
-    let url = cfg.url.unwrap_or_else(|| opts.default_url.clone());
+    let url = root_url.unwrap_or_else(|| opts.default_url.clone());
     let mut targets = Vec::new();
     for (name, token) in selected {
         let exec = opts.exec_override.clone().unwrap_or_default();
@@ -469,12 +520,43 @@ fn apply_server_agent_config(
     effective
 }
 
-async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> Result<()> {
+async fn wait_for_shutdown(shutdown_rx: &mut tokio_watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
+fn format_runner_and_harness(target: &ResolvedTarget) -> (Option<String>, Option<String>) {
+    let runner = match target.runner {
+        RunnerKind::Exec => "exec",
+        RunnerKind::Herdr => "herdr",
+    };
+    let harness = target
+        .agent_type
+        .as_ref()
+        .map(|at| at.as_herdr_kind().to_string());
+    (Some(runner.to_string()), harness)
+}
+
+pub(crate) async fn watch_single_target(
+    target: ResolvedTarget,
+    sessions: SessionStore,
+    reporter: Option<WatcherReporter>,
+    mut shutdown_rx: tokio_watch::Receiver<bool>,
+) -> Result<()> {
+    let token_name = target.label.clone();
     let client = RelayPodClient::new(target.url.clone(), target.token.clone());
-    let me = client
-        .me()
-        .await
-        .with_context(|| format!("failed to authenticate {} at {}", target.label, target.url))?;
+    let me = tokio::select! {
+        _ = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+        res = client.me() => {
+            res.with_context(|| format!("failed to authenticate {} at {}", target.label, target.url))?
+        }
+    };
 
     let base_target = target;
     let effective_target = apply_server_agent_config(&base_target, me.agent_config.as_ref());
@@ -500,8 +582,29 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
         "Authenticated watcher"
     );
 
+    if let Some(ref rep) = reporter {
+        let (runner_name, harness_name) = format_runner_and_harness(&effective_target);
+        rep.update_target_meta(
+            &token_name,
+            Some(me.id.clone()),
+            Some(me.handle.clone()),
+            runner_name.clone(),
+            harness_name.clone(),
+        );
+        rep.push_log(format!(
+            "[@{}] authenticated ({}{})",
+            me.handle,
+            runner_name.as_deref().unwrap_or("herdr"),
+            harness_name
+                .as_deref()
+                .map(|h| format!("/{h}"))
+                .unwrap_or_default()
+        ));
+    }
+
     let live_handle = Arc::new(Mutex::new(me.handle.clone()));
     let live_target = Arc::new(Mutex::new(effective_target));
+    let ws_live_flag = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = mpsc::unbounded_channel::<UnreadItem>();
     let (ws_out_tx, ws_out_rx) = mpsc::unbounded_channel::<WsClientMessage>();
 
@@ -512,8 +615,15 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let worker_handle = Arc::clone(&live_handle);
     let worker_sessions = sessions.clone();
     let worker_ws_tx = ws_out_tx.clone();
+    let worker_reporter = reporter.clone();
+    let worker_token_name = token_name.clone();
+    let worker_ws_live = Arc::clone(&ws_live_flag);
+    let mut worker_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
+            if *worker_shutdown_rx.borrow() {
+                break;
+            }
             let current_handle = worker_handle
                 .lock()
                 .expect("live_handle lock poisoned")
@@ -523,7 +633,21 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 .expect("live_target lock poisoned")
                 .clone();
             let adapter = build_adapter(current_target.runner);
-            dispatch_unread_item(
+
+            if let Some(ref rep) = worker_reporter {
+                rep.set_target_phase(
+                    &worker_token_name,
+                    TargetPhase::Working {
+                        channel: item.channel_name.clone(),
+                    },
+                );
+                rep.push_log(format!(
+                    "[@{}] dispatching #{} from @{}",
+                    current_handle, item.channel_name, item.author_handle
+                ));
+            }
+
+            let outcome = dispatch_unread_item(
                 &DispatchEnv {
                     adapter: adapter.as_ref(),
                     client: &worker_client,
@@ -536,8 +660,29 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
                 &item,
             )
             .await;
+
+            if let Some(ref rep) = worker_reporter {
+                let next_phase = if worker_ws_live.load(Ordering::Relaxed) {
+                    TargetPhase::Connected
+                } else {
+                    TargetPhase::Reconnecting
+                };
+                rep.set_target_phase(&worker_token_name, next_phase);
+                let status_label = match outcome {
+                    DispatchStatus::Succeeded => "dispatch succeeded".to_string(),
+                    DispatchStatus::Blocked => "dispatch blocked (waiting for input)".to_string(),
+                    DispatchStatus::Failed(Some(detail)) => format!("dispatch failed: {detail}"),
+                    DispatchStatus::Failed(None) => "dispatch failed".to_string(),
+                    DispatchStatus::CircuitBreakerPaused => "paused by circuit breaker".to_string(),
+                };
+                rep.push_log(format!("[@{}] {status_label}", current_handle));
+            }
+
             if current_target.cooldown_secs > 0 {
-                tokio::time::sleep(Duration::from_secs(current_target.cooldown_secs)).await;
+                tokio::select! {
+                    _ = wait_for_shutdown(&mut worker_shutdown_rx) => break,
+                    _ = tokio::time::sleep(Duration::from_secs(current_target.cooldown_secs)) => {}
+                }
             }
         }
     });
@@ -551,6 +696,9 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let status_client = client.clone();
     let status_tx = tx.clone();
     let status_seen = Arc::clone(&seen_unread);
+    let status_reporter = reporter.clone();
+    let status_token_name = token_name.clone();
+    let status_ws_live = Arc::clone(&ws_live_flag);
 
     let event_handle = Arc::clone(&live_handle);
     let event_target = Arc::clone(&live_target);
@@ -558,99 +706,127 @@ async fn watch_single_target(target: ResolvedTarget, sessions: SessionStore) -> 
     let event_me_id = me.id.clone();
     let event_tx = tx.clone();
     let event_seen = Arc::clone(&seen_unread);
+    let event_reporter = reporter;
+    let event_token_name = token_name;
 
-    run_live_ws_loop_with_outgoing(
-        ws_url,
-        ws_token,
-        DEFAULT_PING_INTERVAL,
-        ws_out_rx,
-        move |live| {
-            let h = status_handle
-                .lock()
-                .expect("live_handle lock poisoned")
-                .clone();
-            let drain_on_start = status_target
-                .lock()
-                .expect("live_target lock poisoned")
-                .drain_on_start;
-            if live {
-                info!(handle = %h, "WebSocket connected (live pings active) — waiting for unread events");
-                if drain_on_start {
-                    let c = status_client.clone();
-                    let tx = status_tx.clone();
-                    let seen = Arc::clone(&status_seen);
-                    tokio::spawn(async move {
-                        match c.list_unread().await {
-                            Ok(items) => {
-                                let mut guard = seen.lock().expect("seen_unread lock poisoned");
-                                for item in items {
-                                    if guard.insert(item.id.clone()) {
-                                        let _ = tx.send(item);
+    tokio::select! {
+        _ = wait_for_shutdown(&mut shutdown_rx) => {}
+        _ = run_live_ws_loop_with_outgoing(
+            ws_url,
+            ws_token,
+            DEFAULT_PING_INTERVAL,
+            ws_out_rx,
+            move |live| {
+                status_ws_live.store(live, Ordering::Relaxed);
+                let h = status_handle
+                    .lock()
+                    .expect("live_handle lock poisoned")
+                    .clone();
+                let drain_on_start = status_target
+                    .lock()
+                    .expect("live_target lock poisoned")
+                    .drain_on_start;
+                if let Some(ref rep) = status_reporter {
+                    rep.set_target_ws_live(&status_token_name, live);
+                }
+                if live {
+                    info!(handle = %h, "WebSocket connected (live pings active) — waiting for unread events");
+                    if let Some(ref rep) = status_reporter {
+                        rep.push_log(format!("[@{h}] connected"));
+                    }
+                    if drain_on_start {
+                        let c = status_client.clone();
+                        let tx = status_tx.clone();
+                        let seen = Arc::clone(&status_seen);
+                        tokio::spawn(async move {
+                            match c.list_unread().await {
+                                Ok(items) => {
+                                    let mut guard = seen.lock().expect("seen_unread lock poisoned");
+                                    for item in items {
+                                        if guard.insert(item.id.clone()) {
+                                            let _ = tx.send(item);
+                                        }
                                     }
                                 }
+                                Err(err) => {
+                                    warn!(handle = %h, error = %err, "failed to drain unread queue");
+                                }
                             }
-                            Err(err) => {
-                                warn!(handle = %h, error = %err, "failed to drain unread queue");
-                            }
-                        }
-                    });
-                }
-            } else {
-                warn!(handle = %h, "WebSocket disconnected — reconnecting...");
-            }
-        },
-        move |ev| match ev {
-            WsEvent::IdentityUpdated(updated) if updated.id == event_me_id => {
-                {
-                    let mut guard = event_handle.lock().expect("live_handle lock poisoned");
-                    if *guard != updated.handle {
-                        info!(
-                            old_handle = %*guard,
-                            new_handle = %updated.handle,
-                            "Watcher identity renamed"
-                        );
-                        *guard = updated.handle.clone();
+                        });
+                    }
+                } else {
+                    warn!(handle = %h, "WebSocket disconnected — reconnecting...");
+                    if let Some(ref rep) = status_reporter {
+                        rep.push_log(format!("[@{h}] disconnected — reconnecting..."));
                     }
                 }
-                let next_target =
-                    apply_server_agent_config(&event_base_target, updated.agent_config.as_ref());
-                let mut tguard = event_target.lock().expect("live_target lock poisoned");
-                if *tguard != next_target {
-                    info!(
-                        handle = %updated.handle,
-                        runner = ?next_target.runner,
-                        agent_type = ?next_target.agent_type,
-                        args = ?next_target.args,
-                        cooldown_secs = next_target.cooldown_secs,
-                        "Reloaded agent config from server (applies to new sessions)"
-                    );
-                    *tguard = next_target;
+            },
+            move |ev| match ev {
+                WsEvent::IdentityUpdated(updated) if updated.id == event_me_id => {
+                    {
+                        let mut guard = event_handle.lock().expect("live_handle lock poisoned");
+                        if *guard != updated.handle {
+                            info!(
+                                old_handle = %*guard,
+                                new_handle = %updated.handle,
+                                "Watcher identity renamed"
+                            );
+                            *guard = updated.handle.clone();
+                        }
+                    }
+                    let next_target =
+                        apply_server_agent_config(&event_base_target, updated.agent_config.as_ref());
+                    let mut tguard = event_target.lock().expect("live_target lock poisoned");
+                    let changed = *tguard != next_target;
+                    if changed {
+                        info!(
+                            handle = %updated.handle,
+                            runner = ?next_target.runner,
+                            agent_type = ?next_target.agent_type,
+                            args = ?next_target.args,
+                            cooldown_secs = next_target.cooldown_secs,
+                            "Reloaded agent config from server (applies to new sessions)"
+                        );
+                        *tguard = next_target.clone();
+                    }
+                    if let Some(ref rep) = event_reporter {
+                        let (runner_name, harness_name) = format_runner_and_harness(&next_target);
+                        rep.update_target_meta(
+                            &event_token_name,
+                            None,
+                            Some(updated.handle.clone()),
+                            runner_name,
+                            harness_name,
+                        );
+                        if changed {
+                            rep.push_log(format!("[@{}] reloaded agent config", updated.handle));
+                        }
+                    }
                 }
-            }
-            WsEvent::UnreadCreated(item) if item.identity_id == event_me_id => {
-                let is_new = event_seen
-                    .lock()
-                    .expect("seen_unread lock poisoned")
-                    .insert(item.id.clone());
-                if is_new {
-                    let h = event_handle
+                WsEvent::UnreadCreated(item) if item.identity_id == event_me_id => {
+                    let is_new = event_seen
                         .lock()
-                        .expect("live_handle lock poisoned")
-                        .clone();
-                    info!(
-                        handle = %h,
-                        unread_id = %item.id,
-                        channel = %item.channel_name,
-                        author = %item.author_handle,
-                        "New unread item received"
-                    );
-                    let _ = event_tx.send(item);
+                        .expect("seen_unread lock poisoned")
+                        .insert(item.id.clone());
+                    if is_new {
+                        let h = event_handle
+                            .lock()
+                            .expect("live_handle lock poisoned")
+                            .clone();
+                        info!(
+                            handle = %h,
+                            unread_id = %item.id,
+                            channel = %item.channel_name,
+                            author = %item.author_handle,
+                            "New unread item received"
+                        );
+                        let _ = event_tx.send(item);
+                    }
                 }
-            }
-            _ => {}
-        },
-    )
-    .await;
+                _ => {}
+            },
+        ) => {}
+    }
 
     Ok(())
 }
@@ -709,7 +885,18 @@ struct DispatchEnv<'a> {
     ws_out_tx: &'a mpsc::UnboundedSender<WsClientMessage>,
 }
 
-async fn dispatch_unread_item(env: &DispatchEnv<'_>, handle: &str, item: &UnreadItem) {
+enum DispatchStatus {
+    Succeeded,
+    Blocked,
+    Failed(Option<String>),
+    CircuitBreakerPaused,
+}
+
+async fn dispatch_unread_item(
+    env: &DispatchEnv<'_>,
+    handle: &str,
+    item: &UnreadItem,
+) -> DispatchStatus {
     let adapter = env.adapter;
     let client = env.client;
     let target = env.target;
@@ -765,7 +952,7 @@ async fn dispatch_unread_item(env: &DispatchEnv<'_>, handle: &str, item: &Unread
                                 "Failed to ack unread item after circuit breaker tripped"
                             );
                         }
-                        return;
+                        return DispatchStatus::CircuitBreakerPaused;
                     }
                 }
                 Err(err) => {
@@ -824,6 +1011,13 @@ async fn dispatch_unread_item(env: &DispatchEnv<'_>, handle: &str, item: &Unread
                 ),
             }
         }
+        if outcome.allow_auto_ack {
+            DispatchStatus::Succeeded
+        } else {
+            DispatchStatus::Blocked
+        }
+    } else {
+        DispatchStatus::Failed(outcome.detail)
     }
 }
 
@@ -866,6 +1060,9 @@ pub(crate) fn apply_common_env(
 ) {
     if let Some(ref cwd) = target.cwd {
         cmd.current_dir(cwd);
+    }
+    if let Some(path) = resolved_subprocess_path() {
+        cmd.env("PATH", path);
     }
     for (k, v) in common_env_pairs(target, handle, item, thread_id, existing_session) {
         cmd.env(k, v);

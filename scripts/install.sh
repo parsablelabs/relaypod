@@ -117,43 +117,8 @@ fi
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$BIN_SRC" "${INSTALL_DIR}/relaypod"
 
-CONFIG_DIR="${RELAYPOD_CONFIG_DIR:-$HOME/.relaypod}"
-CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-DEFAULT_ADMIN="${USER:-admin}"
-
-mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/workspace"
-chmod 700 "$CONFIG_DIR"
-
-if [ ! -f "$CONFIG_FILE" ]; then
-  cat > "$CONFIG_FILE" <<EOF
-# RelayPod configuration
-# Server:  relaypod serve
-# Watcher: relaypod watch
-
-server:
-  # Human handles granted admin privileges (config-only, never stored in SQLite)
-  admin_handles:
-    - ${DEFAULT_ADMIN}
-
-watcher:
-  url: http://127.0.0.1:8787
-  global_max_sessions: 10
-  max_consecutive_agent_turns: 6
-  # instructions_file: ~/.relaypod/agent-instructions.md
-
-  # Agent tokens (added automatically by \`relaypod identity create <handle>\`).
-  # All other agent settings (runner, harness, args, cwd, cooldown_secs, etc.)
-  # are stored in the server DB and editable live in the RelayPod UI.
-  # agent_tokens:
-  #   mbp-codex: \${RELAYPOD_CODEX_TOKEN}
-EOF
-  chmod 600 "$CONFIG_FILE"
-  echo "Created starter config at ${CONFIG_FILE} (admin: ${DEFAULT_ADMIN})"
-else
-  echo "Keeping existing config at ${CONFIG_FILE}"
-fi
-
 echo "Installed relaypod ${VERSION} to ${INSTALL_DIR}/relaypod"
+echo "Run 'relaypod serve' to initialize ~/.relaypod/server.yaml, or launch the RelayPod desktop app for ~/.relaypod/config.yaml."
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)

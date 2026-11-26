@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
 use super::config::AgentType;
+use super::supervisor::resolve_program;
 use super::{
     apply_common_env, build_agent_prompt_with_context, render_shell_exec_template,
     split_shell_words,
@@ -36,23 +37,25 @@ impl WatcherAdapter for ExecAdapter {
                 // or malformed values that could be parsed as CLI flags.
                 .filter(|s| !s.starts_with("herdr:") && is_safe_session_id(s));
 
-            let succeeded = match &ctx.target.agent_type {
+            let result = match &ctx.target.agent_type {
                 Some(agent_type) => {
                     run_managed_agent(agent_type, &ctx, existing_session.as_deref()).await
                 }
                 None => run_custom_shell(&ctx, existing_session.as_deref()).await,
             };
 
-            if succeeded {
-                DispatchOutcome::ok()
-            } else {
-                DispatchOutcome::failed()
+            match result {
+                Ok(()) => DispatchOutcome::ok(),
+                Err(msg) => DispatchOutcome::failed_with(msg),
             }
         })
     }
 }
 
-async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&str>) -> bool {
+async fn run_custom_shell(
+    ctx: &DispatchContext<'_>,
+    existing_session: Option<&str>,
+) -> Result<(), String> {
     let rendered_cmd =
         render_shell_exec_template(&ctx.target.exec, ctx.handle, ctx.item, ctx.thread_id);
     info!(
@@ -62,7 +65,7 @@ async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&s
         "Executing watcher shell command"
     );
 
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new(resolve_program("sh"));
     cmd.arg("-c").arg(&rendered_cmd);
     apply_common_env(
         &mut cmd,
@@ -74,7 +77,7 @@ async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&s
     );
 
     match cmd.status().await {
-        Ok(status) if status.success() => true,
+        Ok(status) if status.success() => Ok(()),
         Ok(status) => {
             warn!(
                 handle = %ctx.handle,
@@ -82,7 +85,7 @@ async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&s
                 code = ?status.code(),
                 "Watcher command exited non-zero"
             );
-            false
+            Err(format!("command exited with {:?}", status.code()))
         }
         Err(err) => {
             error!(
@@ -91,7 +94,7 @@ async fn run_custom_shell(ctx: &DispatchContext<'_>, existing_session: Option<&s
                 error = %err,
                 "Failed to spawn watcher command"
             );
-            false
+            Err(format!("failed to spawn command: {err}"))
         }
     }
 }
@@ -100,7 +103,7 @@ async fn run_managed_agent(
     agent_type: &AgentType,
     ctx: &DispatchContext<'_>,
     existing_session: Option<&str>,
-) -> bool {
+) -> Result<(), String> {
     let is_resume = existing_session.is_some();
     let prompt = build_agent_prompt_with_context(ctx, is_resume).await;
     let extra_args = ctx
@@ -112,7 +115,7 @@ async fn run_managed_agent(
 
     let mut cmd = match agent_type {
         AgentType::Codex => {
-            let mut c = Command::new("codex");
+            let mut c = Command::new(resolve_program("codex"));
             c.arg("exec");
             if let Some(sid) = existing_session {
                 c.arg("resume").arg(sid);
@@ -123,7 +126,7 @@ async fn run_managed_agent(
             c
         }
         AgentType::Claude => {
-            let mut c = Command::new("claude");
+            let mut c = Command::new(resolve_program("claude"));
             c.arg("-p").arg("--output-format").arg("json");
             if let Some(sid) = existing_session {
                 c.arg("--resume").arg(sid);
@@ -134,19 +137,22 @@ async fn run_managed_agent(
         }
         AgentType::Other(other) => match other.as_str() {
             "gemini" | "agy" | "pi" => {
-                let mut c = Command::new(other);
+                let mut c = Command::new(resolve_program(other));
                 c.arg("-p");
                 c.args(&extra_args);
                 c.arg(&prompt);
                 c
             }
             _ => {
+                let msg = format!(
+                    "exec adapter has no built-in command for `{other}` (use runner `herdr` or custom `exec`)"
+                );
                 error!(
                     handle = %ctx.handle,
                     agent_type = %other,
                     "ExecAdapter does not have a built-in headless command for `{other}` (use `runner: herdr` or omit `agent_type` and set `exec:`)"
                 );
-                return false;
+                return Err(msg);
             }
         },
     };
@@ -180,7 +186,7 @@ async fn run_managed_agent(
                 error = %err,
                 "Failed to spawn managed agent"
             );
-            return false;
+            return Err(format!("failed to spawn {:?}: {err}", agent_type));
         }
     };
 
@@ -206,7 +212,7 @@ async fn run_managed_agent(
     }
 
     match child.wait().await {
-        Ok(status) if status.success() => true,
+        Ok(status) if status.success() => Ok(()),
         Ok(status) => {
             warn!(
                 handle = %ctx.handle,
@@ -215,7 +221,7 @@ async fn run_managed_agent(
                 code = ?status.code(),
                 "Managed agent exited non-zero"
             );
-            false
+            Err(format!("{:?} exited with {:?}", agent_type, status.code()))
         }
         Err(err) => {
             error!(
@@ -224,7 +230,7 @@ async fn run_managed_agent(
                 error = %err,
                 "Failed waiting on managed agent"
             );
-            false
+            Err(format!("failed waiting on {:?}: {err}", agent_type))
         }
     }
 }

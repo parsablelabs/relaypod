@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use relaypod_client::RelayPodClient;
+use crate::RelayPodClient;
 use relaypod_core::UnreadItem;
 
 use super::{ResolvedTarget, SessionStore};
@@ -18,12 +18,14 @@ pub struct DispatchContext<'a> {
 }
 
 /// Result of dispatching one unread item through an adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchOutcome {
     /// Whether the dispatch itself succeeded without error.
     pub succeeded: bool,
     /// Whether `auto_ack` is safe to run (false e.g. if an interactive agent is `blocked`).
     pub allow_auto_ack: bool,
+    /// Optional human-readable error or status detail (surfaced in UI watcher logs).
+    pub detail: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -31,6 +33,7 @@ impl DispatchOutcome {
         Self {
             succeeded: true,
             allow_auto_ack: true,
+            detail: None,
         }
     }
 
@@ -38,13 +41,15 @@ impl DispatchOutcome {
         Self {
             succeeded: true,
             allow_auto_ack: false,
+            detail: None,
         }
     }
 
-    pub fn failed() -> Self {
+    pub fn failed_with(detail: impl Into<String>) -> Self {
         Self {
             succeeded: false,
             allow_auto_ack: false,
+            detail: Some(detail.into()),
         }
     }
 }

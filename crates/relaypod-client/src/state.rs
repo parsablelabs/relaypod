@@ -1,10 +1,12 @@
 use crate::runtime::{ClientCommand, ClientEvent};
+use crate::watch::WatcherSnapshot;
 use relaypod_core::{Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent};
 
 /// Follow-up commands or UI signals produced by reducing a `ClientEvent`.
 #[derive(Debug, Default)]
 pub struct StateEffects {
     pub commands: Vec<ClientCommand>,
+    pub just_connected: bool,
     pub channel_just_created: bool,
     pub identity_just_created: Option<CreatedIdentity>,
     pub token_just_regenerated: Option<CreatedIdentity>,
@@ -36,6 +38,7 @@ pub struct WorkspaceState {
     pub messages: Vec<Message>,
     pub active_thread: Option<ThreadView>,
     pub active_workers: Vec<ActiveWorker>,
+    pub watcher: WatcherSnapshot,
 }
 
 impl WorkspaceState {
@@ -84,6 +87,7 @@ impl WorkspaceState {
                 self.sort_channels();
                 self.identities = identities;
                 self.unread = unread;
+                effects.just_connected = true;
 
                 if self.selected_channel_id.is_none() {
                     if let Some(first) = self.channels.iter().find(|ch| !ch.archived) {
@@ -157,6 +161,9 @@ impl WorkspaceState {
             }
             ClientEvent::WsStatus(live) => {
                 self.ws_live = live;
+            }
+            ClientEvent::WatcherState(snapshot) => {
+                self.watcher = snapshot;
             }
             ClientEvent::Error(msg) => {
                 self.status_error = Some(msg);
