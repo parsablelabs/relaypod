@@ -7,7 +7,7 @@ pub mod supervisor;
 use crate::{run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL};
 use anyhow::{anyhow, Context, Result};
 use relaypod_core::{
-    AgentConfig, Channel, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD,
+    ActivityState, AgentConfig, Channel, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch as tokio_watch};
 use tracing::{error, info, warn};
 
-use self::adapter::{DispatchContext, WatcherAdapter};
+use self::adapter::{ActivityUpdate, DispatchContext, WatcherAdapter};
 pub use self::config::{
     append_watcher_token_to_config, ensure_default_config, ensure_default_server_config,
     remove_watcher_token_from_config, update_client_token_in_config,
@@ -30,6 +30,7 @@ use self::config::{
     load_config_file, load_server_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
 };
 use self::exec_adapter::ExecAdapter;
+pub use self::herdr_adapter::focus_herdr_pane;
 use self::herdr_adapter::HerdrAdapter;
 use self::supervisor::{resolved_subprocess_path, WatcherReporter};
 pub use self::supervisor::{TargetPhase, WatchedTargetState, WatcherSnapshot, WatcherSupervisor};
@@ -649,19 +650,43 @@ pub(crate) async fn watch_single_target(
                 ));
             }
 
-            let outcome = dispatch_unread_item(
-                &DispatchEnv {
-                    adapter: adapter.as_ref(),
-                    client: &worker_client,
-                    target: &current_target,
-                    identity_id: &worker_identity_id,
-                    sessions: &worker_sessions,
-                    ws_out_tx: &worker_ws_tx,
-                },
-                &current_handle,
-                &item,
-            )
-            .await;
+            let on_phase = |state: ActivityState| {
+                if let Some(ref rep) = worker_reporter {
+                    let phase = match state {
+                        ActivityState::Working => TargetPhase::Working {
+                            channel: item.channel_name.clone(),
+                        },
+                        ActivityState::Blocked => TargetPhase::Blocked {
+                            channel: item.channel_name.clone(),
+                        },
+                    };
+                    rep.set_target_phase(&worker_token_name, phase);
+                    let note = match state {
+                        ActivityState::Working => {
+                            format!("unblocked in #{} — working", item.channel_name)
+                        }
+                        ActivityState::Blocked => {
+                            format!("blocked in #{} (waiting for input)", item.channel_name)
+                        }
+                    };
+                    rep.push_log(format!("[@{}] {note}", current_handle));
+                }
+            };
+
+            let dispatch_env = DispatchEnv {
+                adapter: adapter.as_ref(),
+                client: &worker_client,
+                target: &current_target,
+                identity_id: &worker_identity_id,
+                sessions: &worker_sessions,
+                ws_out_tx: &worker_ws_tx,
+                on_activity_change: &on_phase,
+            };
+
+            let outcome = tokio::select! {
+                _ = wait_for_shutdown(&mut worker_shutdown_rx) => break,
+                res = dispatch_unread_item(&dispatch_env, &current_handle, &item) => res,
+            };
 
             if let Some(ref rep) = worker_reporter {
                 let next_phase = if worker_ws_live.load(Ordering::Relaxed) {
@@ -885,6 +910,7 @@ struct DispatchEnv<'a> {
     identity_id: &'a str,
     sessions: &'a SessionStore,
     ws_out_tx: &'a mpsc::UnboundedSender<WsClientMessage>,
+    on_activity_change: &'a (dyn Fn(ActivityState) + Send + Sync),
 }
 
 enum DispatchStatus {
@@ -973,7 +999,22 @@ async fn dispatch_unread_item(
         channel_id: item.channel_id.clone(),
         thread_id: Some(thread_id.clone()),
         active: true,
+        state: ActivityState::Working,
+        pane_id: None,
+        detail: None,
     });
+
+    let on_activity = |update: ActivityUpdate| {
+        let _ = ws_out_tx.send(WsClientMessage::Activity {
+            channel_id: item.channel_id.clone(),
+            thread_id: Some(thread_id.clone()),
+            active: true,
+            state: update.state,
+            pane_id: update.pane_id,
+            detail: update.detail,
+        });
+        (env.on_activity_change)(update.state);
+    };
 
     let ctx = DispatchContext {
         client,
@@ -983,6 +1024,7 @@ async fn dispatch_unread_item(
         item,
         thread_id: &thread_id,
         sessions,
+        on_activity: &on_activity,
     };
 
     let outcome = adapter.dispatch(ctx).await;
@@ -991,6 +1033,9 @@ async fn dispatch_unread_item(
         channel_id: item.channel_id.clone(),
         thread_id: Some(thread_id.clone()),
         active: false,
+        state: ActivityState::Working,
+        pane_id: None,
+        detail: None,
     });
 
     if outcome.succeeded {

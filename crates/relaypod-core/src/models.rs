@@ -267,6 +267,14 @@ pub struct DeletedMessage {
     pub affected_unread: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    #[default]
+    Working,
+    Blocked,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WsEvent {
@@ -309,6 +317,12 @@ pub enum WsEvent {
         channel_id: String,
         thread_id: Option<String>,
         active: bool,
+        #[serde(default)]
+        state: ActivityState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -320,5 +334,58 @@ pub enum WsClientMessage {
         channel_id: String,
         thread_id: Option<String>,
         active: bool,
+        #[serde(default)]
+        state: ActivityState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_state_defaults_to_working_when_omitted() {
+        let client_msg: WsClientMessage = serde_json::from_str(
+            r#"{"type":"activity","channel_id":"c1","thread_id":"t1","active":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            client_msg,
+            WsClientMessage::Activity {
+                active: true,
+                state: ActivityState::Working,
+                ..
+            }
+        ));
+
+        let blocked_msg: WsClientMessage = serde_json::from_str(
+            r#"{"type":"activity","channel_id":"c1","thread_id":"t1","active":true,"state":"blocked"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            blocked_msg,
+            WsClientMessage::Activity {
+                active: true,
+                state: ActivityState::Blocked,
+                ..
+            }
+        ));
+
+        let event: WsEvent = serde_json::from_str(
+            r#"{"type":"activity.changed","data":{"identity_id":"i1","handle":"codex","channel_id":"c1","thread_id":"t1","active":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            WsEvent::ActivityChanged {
+                active: true,
+                state: ActivityState::Working,
+                ..
+            }
+        ));
+    }
 }

@@ -10,8 +10,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use relaypod_core::{
-    auth::normalize_handle, CoreError, CreateChannelRequest, CreateIdentityRequest, Identity,
-    IdentityKind, PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage, WsEvent,
+    auth::normalize_handle, ActivityState, CoreError, CreateChannelRequest, CreateIdentityRequest,
+    Identity, IdentityKind, PostMessageRequest, Store, UpdateChannelRequest, WsClientMessage,
+    WsEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -26,8 +27,17 @@ const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_ACTIVITY_PER_IDENTITY: usize = 16;
 const MAX_ACTIVITY_ID_LEN: usize = 128;
+const MAX_ACTIVITY_DETAIL_LEN: usize = 2048;
 
 type ActivityKey = (String, String, Option<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityEntry {
+    handle: String,
+    state: ActivityState,
+    pane_id: Option<String>,
+    detail: Option<String>,
+}
 
 struct PresenceEntry {
     connections: usize,
@@ -42,8 +52,8 @@ pub struct AppState {
     /// Lowercased human handles granted admin privileges via `config.yaml` (`admin_handles`).
     admin_handles: HashSet<String>,
     presence: Mutex<HashMap<String, PresenceEntry>>,
-    /// Active working/typing indicators keyed by `(identity_id, channel_id, thread_id) -> handle`.
-    activity: Mutex<HashMap<ActivityKey, String>>,
+    /// Active working/blocked indicators keyed by `(identity_id, channel_id, thread_id)`.
+    activity: Mutex<HashMap<ActivityKey, ActivityEntry>>,
     // Keep board events in the same order as their committed writes.
     board_writes: Mutex<()>,
 }
@@ -200,6 +210,7 @@ impl AppState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_activity(
         &self,
         identity_id: &str,
@@ -207,6 +218,9 @@ impl AppState {
         channel_id: String,
         thread_id: Option<String>,
         active: bool,
+        state: ActivityState,
+        pane_id: Option<String>,
+        detail: Option<String>,
     ) {
         if channel_id.is_empty()
             || channel_id.len() > MAX_ACTIVITY_ID_LEN
@@ -216,7 +230,26 @@ impl AppState {
         {
             return;
         }
-        let changed = {
+        let pane_id = pane_id
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty() && p.len() <= MAX_ACTIVITY_ID_LEN);
+        let detail = detail.and_then(|d| {
+            let trimmed = d.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if trimmed.len() <= MAX_ACTIVITY_DETAIL_LEN {
+                Some(trimmed.to_string())
+            } else {
+                let mut end = MAX_ACTIVITY_DETAIL_LEN;
+                while !trimmed.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Some(trimmed[..end].to_string())
+            }
+        });
+
+        let emitted = {
             let mut guard = self.activity.lock().expect("activity lock poisoned");
             let key = (
                 identity_id.to_string(),
@@ -230,26 +263,42 @@ impl AppState {
                         return;
                     }
                 }
-                guard.insert(key, handle.to_string());
-                true
+                let next = ActivityEntry {
+                    handle: handle.to_string(),
+                    state,
+                    pane_id,
+                    detail,
+                };
+                if guard.get(&key) == Some(&next) {
+                    None
+                } else {
+                    let out = (next.state, next.pane_id.clone(), next.detail.clone());
+                    guard.insert(key, next);
+                    Some(out)
+                }
             } else {
-                guard.remove(&key).is_some()
+                guard
+                    .remove(&key)
+                    .map(|removed| (removed.state, None, None))
             }
         };
 
-        if changed {
+        if let Some((emitted_state, emitted_pane_id, emitted_detail)) = emitted {
             self.emit(WsEvent::ActivityChanged {
                 identity_id: identity_id.to_string(),
                 handle: handle.to_string(),
                 channel_id,
                 thread_id,
                 active,
+                state: emitted_state,
+                pane_id: emitted_pane_id,
+                detail: emitted_detail,
             });
         }
     }
 
     fn clear_activity_for_identity(&self, identity_id: &str) {
-        let removed: Vec<(String, Option<String>, String)> = {
+        let removed: Vec<(String, Option<String>, ActivityEntry)> = {
             let mut guard = self.activity.lock().expect("activity lock poisoned");
             let keys: Vec<(String, String, Option<String>)> = guard
                 .keys()
@@ -257,17 +306,20 @@ impl AppState {
                 .cloned()
                 .collect();
             keys.into_iter()
-                .filter_map(|k| guard.remove(&k).map(|h| (k.1, k.2, h)))
+                .filter_map(|k| guard.remove(&k).map(|entry| (k.1, k.2, entry)))
                 .collect()
         };
 
-        for (channel_id, thread_id, handle) in removed {
+        for (channel_id, thread_id, entry) in removed {
             self.emit(WsEvent::ActivityChanged {
                 identity_id: identity_id.to_string(),
-                handle,
+                handle: entry.handle,
                 channel_id,
                 thread_id,
                 active: false,
+                state: entry.state,
+                pane_id: None,
+                detail: None,
             });
         }
     }
@@ -279,9 +331,9 @@ impl AppState {
 
     fn rename_activity_handle(&self, identity_id: &str, new_handle: &str) {
         let mut guard = self.activity.lock().expect("activity lock poisoned");
-        for ((id, _, _), handle) in guard.iter_mut() {
+        for ((id, _, _), entry) in guard.iter_mut() {
             if id == identity_id {
-                *handle = new_handle.to_string();
+                entry.handle = new_handle.to_string();
             }
         }
     }
@@ -291,12 +343,15 @@ impl AppState {
         guard
             .iter()
             .map(
-                |((identity_id, channel_id, thread_id), handle)| WsEvent::ActivityChanged {
+                |((identity_id, channel_id, thread_id), entry)| WsEvent::ActivityChanged {
                     identity_id: identity_id.clone(),
-                    handle: handle.clone(),
+                    handle: entry.handle.clone(),
                     channel_id: channel_id.clone(),
                     thread_id: thread_id.clone(),
                     active: true,
+                    state: entry.state,
+                    pane_id: entry.pane_id.clone(),
+                    detail: entry.detail.clone(),
                 },
             )
             .collect()
@@ -783,6 +838,9 @@ async fn post_message(
         res.message.channel_id.clone(),
         res.message.parent_id.clone(),
         false,
+        ActivityState::Working,
+        None,
+        None,
     );
     state.emit(WsEvent::MessageCreated(res.message.clone()));
     for unread in res.created_unread {
@@ -965,6 +1023,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
                                     channel_id,
                                     thread_id,
                                     active,
+                                    state: activity_state,
+                                    pane_id,
+                                    detail,
                                 } => {
                                     state.on_ws_ping(&identity.id);
                                     let current_handle = state
@@ -980,6 +1041,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
                                         channel_id,
                                         thread_id,
                                         active,
+                                        activity_state,
+                                        pane_id,
+                                        detail,
                                     );
                                 }
                             }
@@ -998,4 +1062,105 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
     send_task.abort();
     state.on_ws_disconnect(&identity.id);
     info!("ws disconnected: @{}", identity.handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_state_transitions_emit_and_snapshot_correctly() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let app = AppState::new(store);
+        let mut rx = app.events.subscribe();
+
+        app.set_activity(
+            "a1",
+            "codex",
+            "c1".into(),
+            Some("t1".into()),
+            true,
+            ActivityState::Working,
+            None,
+            None,
+        );
+        let ev1 = rx.try_recv().unwrap();
+        assert!(matches!(
+            ev1,
+            WsEvent::ActivityChanged {
+                active: true,
+                state: ActivityState::Working,
+                pane_id: None,
+                detail: None,
+                ..
+            }
+        ));
+
+        // Duplicate identical state should not re-emit
+        app.set_activity(
+            "a1",
+            "codex",
+            "c1".into(),
+            Some("t1".into()),
+            true,
+            ActivityState::Working,
+            None,
+            None,
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Transition Working -> Blocked emits pane_id & detail and persists in snapshot
+        app.set_activity(
+            "a1",
+            "codex",
+            "c1".into(),
+            Some("t1".into()),
+            true,
+            ActivityState::Blocked,
+            Some("w4:p7".into()),
+            Some("Allow running `rm -rf build`?".into()),
+        );
+        let ev2 = rx.try_recv().unwrap();
+        assert!(matches!(
+            ev2,
+            WsEvent::ActivityChanged {
+                active: true,
+                state: ActivityState::Blocked,
+                pane_id: Some(ref p),
+                detail: Some(ref d),
+                ..
+            } if p == "w4:p7" && d == "Allow running `rm -rf build`?"
+        ));
+
+        let snap = app.snapshot_active_events();
+        assert_eq!(snap.len(), 1);
+        assert!(matches!(
+            snap[0],
+            WsEvent::ActivityChanged {
+                active: true,
+                state: ActivityState::Blocked,
+                pane_id: Some(ref p),
+                detail: Some(ref d),
+                ..
+            } if p == "w4:p7" && d == "Allow running `rm -rf build`?"
+        ));
+
+        // Clearing emits active: false
+        app.set_activity(
+            "a1",
+            "codex",
+            "c1".into(),
+            Some("t1".into()),
+            false,
+            ActivityState::Working,
+            None,
+            None,
+        );
+        let ev3 = rx.try_recv().unwrap();
+        assert!(matches!(
+            ev3,
+            WsEvent::ActivityChanged { active: false, .. }
+        ));
+        assert!(app.snapshot_active_events().is_empty());
+    }
 }

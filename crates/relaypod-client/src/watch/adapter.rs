@@ -2,9 +2,35 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::RelayPodClient;
-use relaypod_core::UnreadItem;
+use relaypod_core::{ActivityState, UnreadItem};
 
 use super::{ResolvedTarget, SessionStore};
+
+/// Live activity update reported by a [`WatcherAdapter`] while a dispatch is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityUpdate {
+    pub state: ActivityState,
+    pub pane_id: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl ActivityUpdate {
+    pub fn working() -> Self {
+        Self {
+            state: ActivityState::Working,
+            pane_id: None,
+            detail: None,
+        }
+    }
+
+    pub fn blocked(pane_id: Option<String>, detail: Option<String>) -> Self {
+        Self {
+            state: ActivityState::Blocked,
+            pane_id,
+            detail,
+        }
+    }
+}
 
 /// Context passed to a [`WatcherAdapter`] for a single unread item.
 pub struct DispatchContext<'a> {
@@ -15,6 +41,7 @@ pub struct DispatchContext<'a> {
     pub item: &'a UnreadItem,
     pub thread_id: &'a str,
     pub sessions: &'a SessionStore,
+    pub on_activity: &'a (dyn Fn(ActivityUpdate) + Send + Sync),
 }
 
 /// Result of dispatching one unread item through an adapter.
