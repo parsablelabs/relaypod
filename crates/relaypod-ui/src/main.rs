@@ -1878,7 +1878,8 @@ impl eframe::App for RelayPodApp {
                             .cloned()
                             .collect();
                         if !thread_workers.is_empty() {
-                            if let Some(pane_id) = render_activity_banners(ui, &thread_workers, true)
+                            if let Some(pane_id) =
+                                render_activity_banners(ui, &thread_workers, true)
                             {
                                 self.runtime.send(ClientCommand::FocusHerdrPane { pane_id });
                             }

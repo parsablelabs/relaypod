@@ -277,7 +277,9 @@ impl AppState {
                     Some(out)
                 }
             } else {
-                guard.remove(&key).map(|removed| (removed.state, None, None))
+                guard
+                    .remove(&key)
+                    .map(|removed| (removed.state, None, None))
             }
         };
 

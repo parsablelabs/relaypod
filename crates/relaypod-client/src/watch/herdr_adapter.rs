@@ -534,17 +534,8 @@ fn redact_herdr_args(args: &[&str]) -> String {
 /// Waits until a blocked Herdr pane leaves `blocked` (into `working`, `idle`, `done`, or `unknown`).
 async fn wait_for_herdr_unblock(pane_id: &str) -> Result<String> {
     let val = run_herdr_json(&[
-        "agent",
-        "wait",
-        pane_id,
-        "--until",
-        "working",
-        "--until",
-        "idle",
-        "--until",
-        "done",
-        "--until",
-        "unknown",
+        "agent", "wait", pane_id, "--until", "working", "--until", "idle", "--until", "done",
+        "--until", "unknown",
     ])
     .await?;
     match extract_agent_status(&val) {
@@ -577,11 +568,23 @@ pub async fn focus_herdr_pane(pane_id: &str) -> Result<()> {
 
 /// Reads a compact, read-only plain-text peek of the prompt/dialog currently blocking a Herdr pane.
 async fn read_herdr_blocked_peek(pane_id: &str) -> Option<String> {
-    let raw = match run_herdr_text(&["agent", "read", pane_id, "--source", "detection", "--lines", "20"]).await {
+    let raw = match run_herdr_text(&[
+        "agent",
+        "read",
+        pane_id,
+        "--source",
+        "detection",
+        "--lines",
+        "20",
+    ])
+    .await
+    {
         Ok(text) if !text.trim().is_empty() => text,
-        _ => run_herdr_text(&["agent", "read", pane_id, "--source", "visible", "--lines", "20"])
-            .await
-            .ok()?,
+        _ => run_herdr_text(&[
+            "agent", "read", pane_id, "--source", "visible", "--lines", "20",
+        ])
+        .await
+        .ok()?,
     };
     format_blocked_peek(&raw)
 }
@@ -650,7 +653,11 @@ async fn run_herdr_text(args: &[&str]) -> Result<String> {
         return Err(anyhow!(
             "`herdr {redacted}` exited with {:?}: {}",
             output.status.code(),
-            if !stderr.is_empty() { stderr } else { trimmed_out.to_string() }
+            if !stderr.is_empty() {
+                stderr
+            } else {
+                trimmed_out.to_string()
+            }
         ));
     }
 

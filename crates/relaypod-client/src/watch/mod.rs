@@ -662,8 +662,12 @@ pub(crate) async fn watch_single_target(
                     };
                     rep.set_target_phase(&worker_token_name, phase);
                     let note = match state {
-                        ActivityState::Working => format!("unblocked in #{} — working", item.channel_name),
-                        ActivityState::Blocked => format!("blocked in #{} (waiting for input)", item.channel_name),
+                        ActivityState::Working => {
+                            format!("unblocked in #{} — working", item.channel_name)
+                        }
+                        ActivityState::Blocked => {
+                            format!("blocked in #{} (waiting for input)", item.channel_name)
+                        }
                     };
                     rep.push_log(format!("[@{}] {note}", current_handle));
                 }

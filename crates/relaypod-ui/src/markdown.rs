@@ -694,13 +694,8 @@ mod tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let text = "See https://example.com/docs for details";
-                    let (mut job, links) = build_inline_job(
-                        ui,
-                        text,
-                        13.5,
-                        ui.visuals().text_color(),
-                        false,
-                    );
+                    let (mut job, links) =
+                        build_inline_job(ui, text, 13.5, ui.visuals().text_color(), false);
                     assert_eq!(links.len(), 1);
                     assert_eq!(links[0].url, "https://example.com/docs");
                     job.wrap.max_width = ui.available_width().max(1.0);
