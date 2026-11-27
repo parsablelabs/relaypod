@@ -19,11 +19,11 @@ use std::sync::Arc;
     about = "Shared message board for humans and AI agents"
 )]
 struct Cli {
-    /// RelayPod server URL (overrides ~/.relaypod/config.yaml `url`)
+    /// RelayPod server URL (overrides ~/.config/relaypod/config.yaml `url`)
     #[arg(long, env = "RELAYPOD_URL")]
     url: Option<String>,
 
-    /// Bearer token for authenticating with RelayPod (overrides ~/.relaypod/config.yaml `token`)
+    /// Bearer token for authenticating with RelayPod (overrides ~/.config/relaypod/config.yaml `token`)
     #[arg(long, env = "RELAYPOD_TOKEN")]
     token: Option<String>,
 
@@ -35,19 +35,19 @@ struct Cli {
 enum Commands {
     /// Start the RelayPod HTTP + WebSocket server
     Serve {
-        /// Full socket address to bind to (overrides host/port in ~/.relaypod/server.yaml)
+        /// Full socket address to bind to (overrides host/port in ~/.config/relaypod/server.yaml)
         #[arg(long, conflicts_with = "port")]
         bind: Option<SocketAddr>,
-        /// TCP port to listen on (overrides `port` in ~/.relaypod/server.yaml; default: 8787)
+        /// TCP port to listen on (overrides `port` in ~/.config/relaypod/server.yaml; default: 8787)
         #[arg(long)]
         port: Option<u16>,
-        /// Path to the SQLite database file (overrides `db` in ~/.relaypod/server.yaml; default: relaypod.db)
+        /// Path to the SQLite database file (overrides `db` in ~/.config/relaypod/server.yaml; default: relaypod.db)
         #[arg(long)]
         db: Option<PathBuf>,
         /// Handle for the initial human identity if the database is empty
         #[arg(long, default_value = "admin")]
         admin: String,
-        /// Path to server YAML config file (defaults to ~/.relaypod/server.yaml)
+        /// Path to server YAML config file (defaults to ~/.config/relaypod/server.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -55,7 +55,7 @@ enum Commands {
     Mcp,
     /// Watch for unread mentions/replies over WebSocket and execute configured commands
     Watch {
-        /// Path to YAML config file (defaults to ~/.relaypod/config.yaml)
+        /// Path to YAML config file (defaults to ~/.config/relaypod/config.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
         /// Only watch a specific handle from the config file
@@ -132,10 +132,10 @@ struct IdentityCreateArgs {
     /// Identity kind: 'agent' or 'human'
     #[arg(long, default_value = "agent")]
     kind: String,
-    /// Do not add a watcher handle entry to ~/.relaypod/config.yaml
+    /// Do not add a watcher handle entry to ~/.config/relaypod/config.yaml
     #[arg(long)]
     omit_config: bool,
-    /// Path to YAML config file to update (defaults to ~/.relaypod/config.yaml)
+    /// Path to YAML config file to update (defaults to ~/.config/relaypod/config.yaml)
     #[arg(long)]
     config: Option<PathBuf>,
     /// Watcher runner for the agent: 'herdr' or 'exec'
@@ -150,7 +150,7 @@ struct IdentityCreateArgs {
     /// Custom shell command when using --runner exec without --agent-type
     #[arg(long)]
     exec: Option<String>,
-    /// Working directory for the agent (defaults to ~/.relaypod/workspace)
+    /// Working directory for the agent (defaults to ~/.config/relaypod/workspace)
     #[arg(long)]
     cwd: Option<String>,
     /// Extra CLI flags forwarded to the agent (stored in DB and applied on new sessions)
@@ -226,7 +226,7 @@ enum IdentityAction {
     /// List all active human and agent identities
     List,
     /// Register a new human (admin only) or agent identity.
-    /// For agents, stores agent config in the server DB and writes only the token to ~/.relaypod/config.yaml unless --omit-config is passed.
+    /// For agents, stores agent config in the server DB and writes only the token to ~/.config/relaypod/config.yaml unless --omit-config is passed.
     Create(Box<IdentityCreateArgs>),
     /// Rename an agent identity you registered
     Rename {
@@ -247,10 +247,10 @@ enum IdentityAction {
     RegenerateToken {
         /// Identity handle or ID
         identity: String,
-        /// Do not update the token in ~/.relaypod/config.yaml if present
+        /// Do not update the token in ~/.config/relaypod/config.yaml if present
         #[arg(long)]
         omit_config: bool,
-        /// Path to YAML config file to update (defaults to ~/.relaypod/config.yaml)
+        /// Path to YAML config file to update (defaults to ~/.config/relaypod/config.yaml)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -323,7 +323,7 @@ fn require_client(cli: &Cli) -> Result<RelayPodClient> {
             .and_then(|(_, cfg)| cfg.token)
             .ok_or_else(|| {
                 anyhow!(
-                    "RELAYPOD_TOKEN (or --token, or `token:` in ~/.relaypod/config.yaml) is required for this command"
+                    "RELAYPOD_TOKEN (or --token, or `token:` in ~/.config/relaypod/config.yaml) is required for this command"
                 )
             })?,
     };
@@ -428,7 +428,7 @@ async fn main() -> Result<()> {
             let admin_handles = server_cfg.admin_handles;
             if admin_handles.is_empty() {
                 tracing::warn!(
-                    "No admin_handles configured in ~/.relaypod/server.yaml; no human handles will have admin privileges"
+                    "No admin_handles configured in ~/.config/relaypod/server.yaml; no human handles will have admin privileges"
                 );
             }
 

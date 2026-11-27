@@ -62,7 +62,7 @@ pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SERVER_PORT: u16 = 8787;
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 
-/// Client configuration stored at `~/.relaypod/config.yaml`.
+/// Client configuration stored at `~/.config/relaypod/config.yaml`.
 /// Shared by the desktop UI (`relaypod-ui`), CLI (`relaypod`), and watcher (`relaypod watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelayPodConfig {
@@ -74,7 +74,7 @@ pub struct RelayPodConfig {
     pub watcher: WatchConfig,
 }
 
-/// Server configuration stored at `~/.relaypod/server.yaml` (used only by `relaypod serve`).
+/// Server configuration stored at `~/.config/relaypod/server.yaml` (used only by `relaypod serve`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Interface/IP to bind to (defaults to `127.0.0.1`).
@@ -144,7 +144,7 @@ pub fn load_server_config_file(path: &Path) -> Result<ServerConfig> {
         .with_context(|| format!("failed to parse server config file {}", path.display()))
 }
 
-/// Lightweight, dependency-free YAML parser for `~/.relaypod/server.yaml`.
+/// Lightweight, dependency-free YAML parser for `~/.config/relaypod/server.yaml`.
 /// Supports top-level `host`, `port`, `db`, and `admin_handles` (`- handle` list or `[a, b]`),
 /// single/double quoted strings, `#` comments, and `${ENV_VAR}` expansion.
 pub fn parse_server_config_yaml(input: &str) -> Result<ServerConfig> {
@@ -253,7 +253,7 @@ pub fn parse_server_config_yaml(input: &str) -> Result<ServerConfig> {
     Ok(cfg)
 }
 
-/// Lightweight, dependency-free YAML parser for `~/.relaypod/config.yaml` (client / UI / watcher).
+/// Lightweight, dependency-free YAML parser for `~/.config/relaypod/config.yaml` (client / UI / watcher).
 /// Supports top-level `url`, `token`, and `watcher:` (`instructions_file`, `global_max_sessions`,
 /// `max_consecutive_agent_turns`, `agent_tokens:` flat `name: token` map), single/double quoted
 /// strings, `#` comments, and `${ENV_VAR}` expansion.
@@ -1067,7 +1067,7 @@ pub fn upsert_client_connection_yaml(
     Ok(out)
 }
 
-/// Saves the client's server `url` and optional human `token` to `~/.relaypod/config.yaml`.
+/// Saves the client's server `url` and optional human `token` to `~/.config/relaypod/config.yaml`.
 pub fn upsert_client_connection_in_config(
     path: &Path,
     url: &str,
@@ -1102,7 +1102,7 @@ pub fn update_client_token_in_config(path: &Path, new_token: &str) -> Result<boo
     Ok(true)
 }
 
-/// Renders the starter client `~/.relaypod/config.yaml` for first-time initialization.
+/// Renders the starter client `~/.config/relaypod/config.yaml` for first-time initialization.
 pub fn render_starter_config_yaml() -> String {
     format!(
         "# RelayPod client configuration\n\
@@ -1115,7 +1115,7 @@ pub fn render_starter_config_yaml() -> String {
          watcher:\n\
          \x20\x20global_max_sessions: 10\n\
          \x20\x20max_consecutive_agent_turns: 6\n\
-         \x20\x20# instructions_file: ~/.relaypod/agent-instructions.md\n\
+         \x20\x20# instructions_file: ~/.config/relaypod/agent-instructions.md\n\
          \n\
          \x20\x20# Agent tokens (added automatically when creating an agent in the UI or CLI).\n\
          \x20\x20# All other agent settings (runner, harness, args, cwd, cooldown_secs, etc.)\n\
@@ -1125,7 +1125,7 @@ pub fn render_starter_config_yaml() -> String {
     )
 }
 
-/// Renders the starter server `~/.relaypod/server.yaml` for first-time `relaypod serve` initialization.
+/// Renders the starter server `~/.config/relaypod/server.yaml` for first-time `relaypod serve` initialization.
 pub fn render_starter_server_config_yaml(admin_handle: &str) -> String {
     let normalized = normalize_admin_handle(admin_handle);
     let admin = if normalized.is_empty() {
@@ -1139,7 +1139,7 @@ pub fn render_starter_server_config_yaml(admin_handle: &str) -> String {
          \n\
          host: {DEFAULT_SERVER_HOST}\n\
          port: {DEFAULT_SERVER_PORT}\n\
-         # db: ~/.relaypod/relaypod.db\n\
+         # db: ~/.config/relaypod/relaypod.db\n\
          \n\
          # Human handles granted admin privileges (config-only, never stored in SQLite)\n\
          admin_handles:\n\
@@ -1178,12 +1178,10 @@ pub fn ensure_relaypod_home_in(base_dir: &Path) -> Result<(std::path::PathBuf, b
     Ok((config_path, true))
 }
 
-/// Ensures `~/.relaypod/`, `~/.relaypod/workspace/`, and a starter client `~/.relaypod/config.yaml`
+/// Ensures `~/.config/relaypod/`, `~/.config/relaypod/workspace/`, and a starter client `~/.config/relaypod/config.yaml`
 /// exist on disk without overwriting an existing config.
 pub fn ensure_default_config() -> Result<(std::path::PathBuf, bool)> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
-    let base_dir = Path::new(&home).join(".relaypod");
+    let base_dir = super::default_config_dir()?;
     ensure_relaypod_home_in(&base_dir)
 }
 
@@ -1221,14 +1219,12 @@ pub fn ensure_server_config_in(
     Ok((server_path, true))
 }
 
-/// Ensures `~/.relaypod/` and a starter `~/.relaypod/server.yaml` exist on disk without overwriting
+/// Ensures `~/.config/relaypod/` and a starter `~/.config/relaypod/server.yaml` exist on disk without overwriting
 /// an existing `server.yaml`.
 pub fn ensure_default_server_config(
     admin_handle: Option<&str>,
 ) -> Result<(std::path::PathBuf, bool)> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
-    let base_dir = Path::new(&home).join(".relaypod");
+    let base_dir = super::default_config_dir()?;
     ensure_server_config_in(&base_dir, admin_handle)
 }
 
@@ -1244,7 +1240,7 @@ token: rp_human_secret
 
 watcher:
   global_max_sessions: 4
-  instructions_file: ~/.relaypod/team-norms.md
+  instructions_file: ~/.config/relaypod/team-norms.md
   agent_tokens:
     mbp-codex: rp_123
     mbp-claude: rp_456
@@ -1255,7 +1251,7 @@ watcher:
         assert_eq!(cfg.watcher.global_max_sessions, Some(4));
         assert_eq!(
             cfg.watcher.instructions_file.as_deref(),
-            Some("~/.relaypod/team-norms.md")
+            Some("~/.config/relaypod/team-norms.md")
         );
         assert_eq!(
             cfg.watcher.max_consecutive_agent_turns,
@@ -1283,7 +1279,7 @@ watcher:
         let yaml = r#"
 host: 0.0.0.0
 port: 9090
-db: ~/.relaypod/relaypod.db
+db: ~/.config/relaypod/relaypod.db
 admin_handles:
   - admin
   - "@Alice"
@@ -1291,7 +1287,7 @@ admin_handles:
         let cfg = parse_server_config_yaml(yaml).unwrap();
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 9090);
-        assert_eq!(cfg.db.as_deref(), Some("~/.relaypod/relaypod.db"));
+        assert_eq!(cfg.db.as_deref(), Some("~/.config/relaypod/relaypod.db"));
         assert_eq!(cfg.admin_handles, vec!["admin", "alice"]);
         assert_eq!(cfg.bind_addr().unwrap().to_string(), "0.0.0.0:9090");
 

@@ -35,16 +35,18 @@ use self::herdr_adapter::HerdrAdapter;
 use self::supervisor::{resolved_subprocess_path, WatcherReporter};
 pub use self::supervisor::{TargetPhase, WatchedTargetState, WatcherSnapshot, WatcherSupervisor};
 
-pub fn default_config_path() -> Result<PathBuf> {
+pub fn default_config_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
-    Ok(PathBuf::from(home).join(".relaypod").join("config.yaml"))
+    Ok(PathBuf::from(home).join(".config").join("relaypod"))
+}
+
+pub fn default_config_path() -> Result<PathBuf> {
+    Ok(default_config_dir()?.join("config.yaml"))
 }
 
 pub fn default_server_config_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow!("HOME environment variable is not set; pass --config <path>"))?;
-    Ok(PathBuf::from(home).join(".relaypod").join("server.yaml"))
+    Ok(default_config_dir()?.join("server.yaml"))
 }
 
 pub fn default_config_candidates() -> Vec<PathBuf> {
@@ -125,7 +127,7 @@ pub struct ResolvedTarget {
 }
 
 /// Persistent mapping of `(identity_id, relaypod_thread_id) -> adapter_session_id`
-/// stored at `~/.relaypod/sessions.json`, plus in-memory LRU counters for session eviction.
+/// stored at `~/.config/relaypod/sessions.json`, plus in-memory LRU counters for session eviction.
 #[derive(Clone)]
 pub struct SessionStore {
     path: PathBuf,
@@ -136,8 +138,8 @@ pub struct SessionStore {
 
 impl SessionStore {
     fn default_path() -> PathBuf {
-        if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".relaypod").join("sessions.json")
+        if let Ok(dir) = default_config_dir() {
+            dir.join("sessions.json")
         } else {
             std::env::temp_dir().join("relaypod-sessions.json")
         }

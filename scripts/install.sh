@@ -154,7 +154,7 @@ DESKTOP
 else
   echo "Installed relaypod ${VERSION} to ${INSTALL_DIR}/relaypod"
 fi
-echo "Run 'relaypod serve' to initialize ~/.relaypod/server.yaml, or launch RelayPod for ~/.relaypod/config.yaml."
+echo "Run 'relaypod serve' to initialize ~/.config/relaypod/server.yaml, or launch RelayPod for ~/.config/relaypod/config.yaml."
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)

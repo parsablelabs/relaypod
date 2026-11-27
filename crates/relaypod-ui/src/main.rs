@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
         }
         Ok(_) => {}
         Err(err) => {
-            tracing::warn!(error = %err, "Failed to initialize default ~/.relaypod directory");
+            tracing::warn!(error = %err, "Failed to initialize default ~/.config/relaypod directory");
         }
     }
 
@@ -274,7 +274,7 @@ impl AgentEditDraft {
                 ui.label("Instructions file");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.instructions_file)
-                        .hint_text("~/.relaypod/instructions.md")
+                        .hint_text("~/.config/relaypod/instructions.md")
                         .desired_width(f32::INFINITY),
                 );
                 ui.label("Custom prompt template");
@@ -349,7 +349,7 @@ impl RelayPodApp {
             Ok(Some((_, cfg))) => Some(cfg),
             Ok(None) => None,
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to read ~/.relaypod/config.yaml on startup");
+                tracing::warn!(error = %err, "Failed to read ~/.config/relaypod/config.yaml on startup");
                 None
             }
         };
@@ -429,7 +429,7 @@ impl RelayPodApp {
                             Some(&self.token),
                         )
                     }) {
-                        tracing::warn!(error = %err, "Failed to save connection to ~/.relaypod/config.yaml");
+                        tracing::warn!(error = %err, "Failed to save connection to ~/.config/relaypod/config.yaml");
                     }
                 }
                 if self.watcher_auto_start {
@@ -695,7 +695,7 @@ impl RelayPodApp {
                         ui.add_space(6.0);
                         ui.checkbox(
                             &mut self.remember_connection,
-                            "Save URL & token to ~/.relaypod/config.yaml",
+                            "Save URL & token to ~/.config/relaypod/config.yaml",
                         );
                         let enter_pressed = (url_resp.lost_focus() || token_resp.lost_focus())
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -809,7 +809,7 @@ impl RelayPodApp {
                             ui.add_space(6.0);
                             ui.checkbox(
                                 &mut self.new_identity_watch_locally,
-                                "Watch on this machine (save to ~/.relaypod/config.yaml)",
+                                "Watch on this machine (save to ~/.config/relaypod/config.yaml)",
                             );
                         }
                     });
@@ -874,7 +874,7 @@ impl RelayPodApp {
                         if self.last_created_watcher_note.is_none() {
                             ui.label(
                                 egui::RichText::new(
-                                    "Add under watcher.agent_tokens in ~/.relaypod/config.yaml:",
+                                    "Add under watcher.agent_tokens in ~/.config/relaypod/config.yaml:",
                                 )
                                 .size(11.5)
                                 .color(ui.visuals().weak_text_color()),
@@ -1249,7 +1249,7 @@ impl RelayPodApp {
                     .config_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "~/.relaypod/config.yaml".to_string());
+                    .unwrap_or_else(|| "~/.config/relaypod/config.yaml".to_string());
                 ui.label(
                     egui::RichText::new(format!("Config: {cfg_label}"))
                         .size(11.5)
@@ -1270,7 +1270,7 @@ impl RelayPodApp {
                         egui::RichText::new(
                             "No local agents are currently running. Click '+' next to IDENTITIES \
                              to create an agent and watch it on this machine, or add entries under \
-                             watcher.agent_tokens in ~/.relaypod/config.yaml and click Reload config.",
+                             watcher.agent_tokens in ~/.config/relaypod/config.yaml and click Reload config.",
                         )
                         .color(ui.visuals().weak_text_color()),
                     );
