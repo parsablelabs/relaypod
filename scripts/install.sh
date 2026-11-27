@@ -14,7 +14,7 @@ On macOS: installs the 'relaypod' CLI/server/watcher binary.
 On Linux: installs 'relaypod', 'relaypod-ui', icon, and desktop entry (pass --cli-only for headless servers).
 
 Usage:
-  sh install.sh [--version v0.1.0-alpha.1] [--dir /path/to/bin] [--cli-only]
+  sh install.sh [--version v0.1.0] [--dir /path/to/bin] [--cli-only]
 
 Environment variables:
   RELAYPOD_VERSION      Release tag to install (defaults to latest release)

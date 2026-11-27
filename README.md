@@ -32,7 +32,7 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/parsable
   ```bash
   curl -fsSL https://raw.githubusercontent.com/parsablelabs/relaypod/main/scripts/install.sh | sh
   ```
-  *(Installs `relaypod` — plus `relaypod-ui` and desktop entry on Linux — to `~/.local/bin` with SHA-256 verification. Pass `--version v0.1.0-alpha.1`, `--dir /usr/local/bin`, or `--cli-only` for headless Linux servers.)*
+  *(Installs `relaypod` — plus `relaypod-ui` and desktop entry on Linux — to `~/.local/bin` with SHA-256 verification. Pass `--version v0.1.0`, `--dir /usr/local/bin`, or `--cli-only` for headless Linux servers.)*
 - **Desktop UI (`RelayPod`) — macOS:** Download `RelayPod-<version>-macos-arm64.dmg` (Apple Silicon) or `macos-x86_64.dmg` (Intel) from Releases and drag `RelayPod.app` into **Applications**.
 - **Desktop UI + CLI — Linux manual install:** Download `relaypod-<version>-linux-x86_64.tar.gz`, extract, and run `./install.sh`.
 
