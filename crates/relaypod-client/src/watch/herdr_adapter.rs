@@ -114,7 +114,11 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         (new_pane, false)
     };
 
-    let prompt = build_agent_prompt_with_context(ctx, is_resume).await;
+    let prompt = if ctx.target.prompt.is_some() {
+        build_agent_prompt_with_context(ctx, is_resume).await
+    } else {
+        build_herdr_trigger_prompt(ctx.target, ctx.handle, ctx.item, ctx.thread_id, is_resume)
+    };
 
     // TODO: come back to this, maybe there is a better way
     // Give a freshly started TUI (e.g. `agy`, `claude`, `codex`) a brief moment to finish
@@ -772,6 +776,50 @@ pub(crate) fn extract_agent_status(val: &Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// Builds a short, single-line, `@`-free trigger prompt for interactive Herdr TUIs.
+///
+/// Interactive agent TUIs (Codex, Claude Code, Gemini CLI, etc.) treat `@` as a file-mention
+/// autocomplete trigger and can misparse leading `/` commands or large multiline pastes.
+/// By sending only metadata and instructing the agent to fetch the thread via RelayPod MCP
+/// `read_thread`, the agent receives the exact unmodified message without TUI input corruption.
+pub(crate) fn build_herdr_trigger_prompt(
+    target: &super::ResolvedTarget,
+    handle: &str,
+    item: &relaypod_core::models::UnreadItem,
+    thread_id: &str,
+    is_resume: bool,
+) -> String {
+    let clean = |s: &str| {
+        s.replace(['\r', '\n'], " ")
+            .replace('@', "")
+            .trim()
+            .to_string()
+    };
+    let handle = clean(handle);
+    let channel = clean(&item.channel_name);
+    let author = clean(&item.author_handle);
+
+    if is_resume {
+        return format!(
+            "Follow-up RelayPod message for {handle} in channel {channel} (thread {thread_id}, unread {unread_id}) from {author}. Call RelayPod MCP read_thread with message_id=\"{thread_id}\" to read the latest reply, respond in-thread using post_message (channel=\"{channel}\", parent_id=\"{thread_id}\"), and acknowledge unread {unread_id} via ack_unread. Use RelayPod MCP tools rather than the relaypod CLI. Do not use interactive user-input tools; ask any clarifying questions in-thread via post_message.",
+            unread_id = item.id,
+        );
+    }
+
+    let instructions_prefix = target
+        .instructions_file
+        .as_ref()
+        .map(|p| clean(&p.display().to_string()))
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("First read your instructions file at {p}. "))
+        .unwrap_or_default();
+
+    format!(
+        "You are {handle}. {instructions_prefix}New RelayPod message in channel {channel} (thread {thread_id}, unread {unread_id}) from {author}. Call RelayPod MCP read_thread with message_id=\"{thread_id}\" to read the full thread and message, reply in-thread using post_message (channel=\"{channel}\", parent_id=\"{thread_id}\"), and acknowledge unread {unread_id} via ack_unread. Use RelayPod MCP tools rather than the relaypod CLI. Do not use interactive user-input tools; ask any clarifying questions in-thread via post_message.",
+        unread_id = item.id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,5 +955,63 @@ mod tests {
         assert_eq!(kept.len(), MAX_PEEK_LINES);
         assert_eq!(kept.first().copied(), Some("line 15"));
         assert_eq!(kept.last().copied(), Some("line 30"));
+    }
+
+    #[test]
+    fn herdr_trigger_prompt_is_single_line_and_free_of_at_signs() {
+        let target = super::super::ResolvedTarget {
+            label: "codex-local".into(),
+            runner: super::super::RunnerKind::Herdr,
+            agent_type: Some(super::super::AgentType::Codex),
+            url: "http://127.0.0.1:8787".into(),
+            token: "rp_test".into(),
+            exec: String::new(),
+            args: None,
+            prompt: None,
+            instructions_file: Some(std::path::PathBuf::from("/home/user/team-norms.md")),
+            cwd: None,
+            global_max_sessions: None,
+            max_sessions: None,
+            max_consecutive_agent_turns: None,
+            auto_ack: false,
+            drain_on_start: true,
+            cooldown_secs: 0,
+            env: Default::default(),
+        };
+        let item = relaypod_core::models::UnreadItem {
+            id: "u1".into(),
+            identity_id: "id1".into(),
+            message_id: "m2".into(),
+            channel_id: "ch1".into(),
+            channel_name: "backend".into(),
+            parent_id: Some("m1".into()),
+            author_handle: "alice".into(),
+            body: "@codex-local check /clear\nline 2 with @file.rs".into(),
+            reason: relaypod_core::models::UnreadReason::Mention,
+            created_at: 0,
+            acked_at: None,
+        };
+
+        let fresh = build_herdr_trigger_prompt(&target, "codex-local", &item, "m1", false);
+        assert!(!fresh.contains('@'), "fresh prompt contained '@': {fresh}");
+        assert!(!fresh.contains('\n'), "fresh prompt had newline: {fresh}");
+        assert!(fresh.contains("First read your instructions file at /home/user/team-norms.md."));
+        assert!(fresh.contains("read_thread with message_id=\"m1\""));
+        assert!(fresh.contains("post_message (channel=\"backend\", parent_id=\"m1\")"));
+        assert!(fresh.contains("acknowledge unread u1 via ack_unread"));
+        assert!(!fresh.contains("/clear"));
+
+        let resume = build_herdr_trigger_prompt(&target, "codex-local", &item, "m1", true);
+        assert!(
+            !resume.contains('@'),
+            "resume prompt contained '@': {resume}"
+        );
+        assert!(
+            !resume.contains('\n'),
+            "resume prompt had newline: {resume}"
+        );
+        assert!(!resume.contains("instructions file"));
+        assert!(resume.contains("read_thread with message_id=\"m1\""));
+        assert!(resume.contains("acknowledge unread u1 via ack_unread"));
     }
 }

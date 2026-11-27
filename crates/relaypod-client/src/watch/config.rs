@@ -1115,7 +1115,7 @@ pub fn render_starter_config_yaml() -> String {
          watcher:\n\
          \x20\x20global_max_sessions: 10\n\
          \x20\x20max_consecutive_agent_turns: 6\n\
-         \x20\x20# instructions_file: ~/.config/relaypod/agent-instructions.md\n\
+         \x20\x20# instructions_file: ~/.local/share/relaypod/agent-instructions.md\n\
          \n\
          \x20\x20# Agent tokens (added automatically when creating an agent in the UI or CLI).\n\
          \x20\x20# All other agent settings (runner, harness, args, cwd, cooldown_secs, etc.)\n\
@@ -1139,7 +1139,7 @@ pub fn render_starter_server_config_yaml(admin_handle: &str) -> String {
          \n\
          host: {DEFAULT_SERVER_HOST}\n\
          port: {DEFAULT_SERVER_PORT}\n\
-         # db: ~/.config/relaypod/relaypod.db\n\
+         # db: ~/.local/share/relaypod/relaypod.db\n\
          \n\
          # Human handles granted admin privileges (config-only, never stored in SQLite)\n\
          admin_handles:\n\
@@ -1148,19 +1148,26 @@ pub fn render_starter_server_config_yaml(admin_handle: &str) -> String {
     )
 }
 
-/// Ensures `base_dir` (0700), `base_dir/workspace`, and a starter client `base_dir/config.yaml` (0600)
-/// exist. Existing `config.yaml` files are never overwritten.
+/// Ensures `config_dir` (0700), `data_dir/workspace`, and a starter client
+/// `config_dir/config.yaml` (0600) exist. Existing `config.yaml` files are never overwritten.
 /// Returns `(config_path, created_config)`.
-pub fn ensure_relaypod_home_in(base_dir: &Path) -> Result<(std::path::PathBuf, bool)> {
-    std::fs::create_dir_all(base_dir)
-        .with_context(|| format!("failed to create RelayPod dir {}", base_dir.display()))?;
+pub fn ensure_relaypod_home_in(
+    config_dir: &Path,
+    data_dir: &Path,
+) -> Result<(std::path::PathBuf, bool)> {
+    std::fs::create_dir_all(config_dir).with_context(|| {
+        format!(
+            "failed to create RelayPod config dir {}",
+            config_dir.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    let workspace_dir = base_dir.join("workspace");
+    let workspace_dir = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace_dir).with_context(|| {
         format!(
             "failed to create RelayPod workspace dir {}",
@@ -1168,7 +1175,7 @@ pub fn ensure_relaypod_home_in(base_dir: &Path) -> Result<(std::path::PathBuf, b
         )
     })?;
 
-    let config_path = base_dir.join("config.yaml");
+    let config_path = config_dir.join("config.yaml");
     if config_path.exists() {
         return Ok((config_path, false));
     }
@@ -1178,11 +1185,12 @@ pub fn ensure_relaypod_home_in(base_dir: &Path) -> Result<(std::path::PathBuf, b
     Ok((config_path, true))
 }
 
-/// Ensures `~/.config/relaypod/`, `~/.config/relaypod/workspace/`, and a starter client `~/.config/relaypod/config.yaml`
-/// exist on disk without overwriting an existing config.
+/// Ensures `~/.config/relaypod/`, `~/.local/share/relaypod/workspace/`, and a starter client
+/// `~/.config/relaypod/config.yaml` exist on disk without overwriting an existing config.
 pub fn ensure_default_config() -> Result<(std::path::PathBuf, bool)> {
-    let base_dir = super::default_config_dir()?;
-    ensure_relaypod_home_in(&base_dir)
+    let config_dir = super::default_config_dir()?;
+    let data_dir = super::default_data_dir()?;
+    ensure_relaypod_home_in(&config_dir, &data_dir)
 }
 
 /// Ensures `base_dir` (0700) and a starter `base_dir/server.yaml` (0600) exist without overwriting
@@ -1240,7 +1248,7 @@ token: rp_human_secret
 
 watcher:
   global_max_sessions: 4
-  instructions_file: ~/.config/relaypod/team-norms.md
+  instructions_file: ~/.local/share/relaypod/team-norms.md
   agent_tokens:
     mbp-codex: rp_123
     mbp-claude: rp_456
@@ -1251,7 +1259,7 @@ watcher:
         assert_eq!(cfg.watcher.global_max_sessions, Some(4));
         assert_eq!(
             cfg.watcher.instructions_file.as_deref(),
-            Some("~/.config/relaypod/team-norms.md")
+            Some("~/.local/share/relaypod/team-norms.md")
         );
         assert_eq!(
             cfg.watcher.max_consecutive_agent_turns,
@@ -1279,7 +1287,7 @@ watcher:
         let yaml = r#"
 host: 0.0.0.0
 port: 9090
-db: ~/.config/relaypod/relaypod.db
+db: ~/.local/share/relaypod/relaypod.db
 admin_handles:
   - admin
   - "@Alice"
@@ -1287,7 +1295,10 @@ admin_handles:
         let cfg = parse_server_config_yaml(yaml).unwrap();
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 9090);
-        assert_eq!(cfg.db.as_deref(), Some("~/.config/relaypod/relaypod.db"));
+        assert_eq!(
+            cfg.db.as_deref(),
+            Some("~/.local/share/relaypod/relaypod.db")
+        );
         assert_eq!(cfg.admin_handles, vec!["admin", "alice"]);
         assert_eq!(cfg.bind_addr().unwrap().to_string(), "0.0.0.0:9090");
 
@@ -1516,12 +1527,14 @@ watcher:
         let base =
             std::env::temp_dir().join(format!("relaypod-home-init-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
+        let cfg_dir = base.join("config");
+        let data_dir = base.join("data");
 
         // Client config.yaml
-        let (cfg_path, created) = ensure_relaypod_home_in(&base).unwrap();
+        let (cfg_path, created) = ensure_relaypod_home_in(&cfg_dir, &data_dir).unwrap();
         assert!(created);
         assert!(cfg_path.is_file());
-        assert!(base.join("workspace").is_dir());
+        assert!(data_dir.join("workspace").is_dir());
 
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
         let parsed = parse_yaml_config(&raw).unwrap();
@@ -1532,7 +1545,7 @@ watcher:
         let with_tok =
             insert_watcher_token_yaml(&raw, "http://127.0.0.1:8787", "claude", "rp_abc").unwrap();
         std::fs::write(&cfg_path, &with_tok).unwrap();
-        let (_, created_again) = ensure_relaypod_home_in(&base).unwrap();
+        let (_, created_again) = ensure_relaypod_home_in(&cfg_dir, &data_dir).unwrap();
         assert!(!created_again);
         let after = parse_yaml_config(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
         assert_eq!(
@@ -1541,7 +1554,7 @@ watcher:
         );
 
         // Server server.yaml
-        let (srv_path, srv_created) = ensure_server_config_in(&base, Some("alice")).unwrap();
+        let (srv_path, srv_created) = ensure_server_config_in(&cfg_dir, Some("alice")).unwrap();
         assert!(srv_created);
         assert!(srv_path.is_file());
         let srv = load_server_config_file(&srv_path).unwrap();
@@ -1549,7 +1562,7 @@ watcher:
         assert_eq!(srv.port, 8787);
         assert_eq!(srv.admin_handles, vec!["alice"]);
 
-        let (_, srv_created_again) = ensure_server_config_in(&base, Some("bob")).unwrap();
+        let (_, srv_created_again) = ensure_server_config_in(&cfg_dir, Some("bob")).unwrap();
         assert!(!srv_created_again);
         let srv_after = load_server_config_file(&srv_path).unwrap();
         assert_eq!(srv_after.admin_handles, vec!["alice"]);

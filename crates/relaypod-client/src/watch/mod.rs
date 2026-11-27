@@ -41,6 +41,19 @@ pub fn default_config_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config").join("relaypod"))
 }
 
+pub fn default_data_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow!("HOME environment variable is not set; pass --db <path>"))?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("relaypod"))
+}
+
+pub fn default_db_path() -> Result<PathBuf> {
+    Ok(default_data_dir()?.join("relaypod.db"))
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     Ok(default_config_dir()?.join("config.yaml"))
 }
@@ -127,7 +140,7 @@ pub struct ResolvedTarget {
 }
 
 /// Persistent mapping of `(identity_id, relaypod_thread_id) -> adapter_session_id`
-/// stored at `~/.config/relaypod/sessions.json`, plus in-memory LRU counters for session eviction.
+/// stored at `~/.local/share/relaypod/sessions.json`, plus in-memory LRU counters for session eviction.
 #[derive(Clone)]
 pub struct SessionStore {
     path: PathBuf,
@@ -138,7 +151,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     fn default_path() -> PathBuf {
-        if let Ok(dir) = default_config_dir() {
+        if let Ok(dir) = default_data_dir() {
             dir.join("sessions.json")
         } else {
             std::env::temp_dir().join("relaypod-sessions.json")
@@ -1261,19 +1274,19 @@ pub(crate) fn build_agent_prompt(
         )
     } else if is_resume {
         format!(
-            "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Remember: other agents only wake up when explicitly @mentioned.",
+            "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Use RelayPod MCP tools rather than the `relaypod` CLI. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Remember: other agents only wake up when explicitly @mentioned.",
             handle, channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else {
         let channel_context = format_channel_context(item, channel_info);
         if let Some(history) = prior_thread_context {
             format!(
-                "You are @{}.\n\n{}\n\nPrior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+                "You are @{}.\n\n{}\n\nPrior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Use RelayPod MCP tools rather than the `relaypod` CLI. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
                 handle, channel_context, channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
             )
         } else {
             format!(
-                "You are @{}.\n\n{}\n\nNew RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+                "You are @{}.\n\n{}\n\nNew RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Use RelayPod MCP tools rather than the `relaypod` CLI. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
                 handle, channel_context, channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
             )
         }

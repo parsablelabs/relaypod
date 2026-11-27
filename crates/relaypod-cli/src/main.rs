@@ -41,7 +41,7 @@ enum Commands {
         /// TCP port to listen on (overrides `port` in ~/.config/relaypod/server.yaml; default: 8787)
         #[arg(long)]
         port: Option<u16>,
-        /// Path to the SQLite database file (overrides `db` in ~/.config/relaypod/server.yaml; default: relaypod.db)
+        /// Path to the SQLite database file (overrides `db` in ~/.config/relaypod/server.yaml; default: ~/.local/share/relaypod/relaypod.db)
         #[arg(long)]
         db: Option<PathBuf>,
         /// Handle for the initial human identity if the database is empty
@@ -150,7 +150,7 @@ struct IdentityCreateArgs {
     /// Custom shell command when using --runner exec without --agent-type
     #[arg(long)]
     exec: Option<String>,
-    /// Working directory for the agent (defaults to ~/.config/relaypod/workspace)
+    /// Working directory for the agent (defaults to ~/.local/share/relaypod/workspace)
     #[arg(long)]
     cwd: Option<String>,
     /// Extra CLI flags forwarded to the agent (stored in DB and applied on new sessions)
@@ -317,17 +317,40 @@ fn resolve_client_url(cli: &Cli) -> String {
 
 fn require_client(cli: &Cli) -> Result<RelayPodClient> {
     let url = resolve_client_url(cli);
-    let token = match cli.token.clone() {
-        Some(tok) => tok,
-        None => watch::load_optional_config(None)?
-            .and_then(|(_, cfg)| cfg.token)
-            .ok_or_else(|| {
-                anyhow!(
-                    "RELAYPOD_TOKEN (or --token, or `token:` in ~/.config/relaypod/config.yaml) is required for this command"
-                )
-            })?,
-    };
+    let token = resolve_cli_token(
+        cli.token.clone(),
+        std::env::var("RELAYPOD_HANDLE").ok(),
+        || Ok(watch::load_optional_config(None)?.and_then(|(_, cfg)| cfg.token)),
+    )?;
     Ok(RelayPodClient::new(url, token))
+}
+
+fn resolve_cli_token<F>(
+    explicit_token: Option<String>,
+    agent_handle_env: Option<String>,
+    load_config_token: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Result<Option<String>>,
+{
+    if let Some(tok) = explicit_token {
+        return Ok(tok);
+    }
+    if let Some(handle) = agent_handle_env
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Err(anyhow!(
+            "RELAYPOD_TOKEN is not set in this agent shell (RELAYPOD_HANDLE=@{handle}); \
+             refusing to fall back to the human token in ~/.config/relaypod/config.yaml. \
+             Use the RelayPod MCP tools (`post_message`, `ack_unread`) or pass --token."
+        ));
+    }
+    load_config_token()?.ok_or_else(|| {
+        anyhow!(
+            "RELAYPOD_TOKEN (or --token, or `token:` in ~/.config/relaypod/config.yaml) is required for this command"
+        )
+    })
 }
 
 /// MCP servers run on behalf of an agent harness and must receive an explicit token via
@@ -421,9 +444,14 @@ async fn main() -> Result<()> {
                 Some(path) => path.clone(),
                 None => match server_cfg.db.as_deref() {
                     Some(cfg_db) => PathBuf::from(watch::expand_tilde(cfg_db)),
-                    None => PathBuf::from("relaypod.db"),
+                    None => {
+                        watch::default_db_path().unwrap_or_else(|_| PathBuf::from("relaypod.db"))
+                    }
                 },
             };
+            if let Some(parent) = effective_db.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
 
             let admin_handles = server_cfg.admin_handles;
             if admin_handles.is_empty() {
@@ -1031,4 +1059,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_refuses_human_config_fallback_inside_agent_shell() {
+        // Explicit token always wins (even when RELAYPOD_HANDLE is set)
+        let explicit =
+            resolve_cli_token(Some("rp_agent".into()), Some("codex-local".into()), || {
+                Ok(Some("rp_human".into()))
+            })
+            .unwrap();
+        assert_eq!(explicit, "rp_agent");
+
+        // Missing token inside an agent shell (RELAYPOD_HANDLE set) must NOT fall back to human token
+        let err = resolve_cli_token(None, Some("codex-local".into()), || {
+            Ok(Some("rp_human".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("RELAYPOD_HANDLE=@codex-local"));
+        assert!(err.to_string().contains("RelayPod MCP"));
+
+        // Normal human shell (no RELAYPOD_HANDLE) falls back to config.yaml token as usual
+        let human = resolve_cli_token(None, None, || Ok(Some("rp_human".into()))).unwrap();
+        assert_eq!(human, "rp_human");
+    }
 }

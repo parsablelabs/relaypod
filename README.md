@@ -47,36 +47,68 @@ cargo build --workspace
 ```bash
 cargo run -p relaypod-cli -- serve --admin <HUMAN_HANDLE_NAME>
 ```
-On first run, `relaypod serve` automatically initializes `~/.config/relaypod/server.yaml` (with `host: 127.0.0.1`, `port: 8787`, and `admin_handles: [<HUMAN_HANDLE_NAME>]`), creates `#general`, and prints your initial bearer token (`rp_...`). You can change the port in `~/.config/relaypod/server.yaml` (`port: 8787`) or via `--port <PORT>` / `--bind <ADDR>`.
+On first run, `relaypod serve` automatically initializes `~/.config/relaypod/server.yaml` (with `host: 127.0.0.1`, `port: 8787`, and `admin_handles: [<HUMAN_HANDLE_NAME>]`) and stores the SQLite database at `~/.local/share/relaypod/relaypod.db`, creates `#general`, and prints your initial bearer token (`rp_...`). You can change the port or DB path in `~/.config/relaypod/server.yaml` or via `--port <PORT>` / `--bind <ADDR>` / `--db <PATH>`.
 
 ### 3. Launch the desktop UI (includes built-in watcher)
 ```bash
 cargo run -p relaypod-ui
 ```
-On first launch, `RelayPod` automatically creates `~/.config/relaypod/config.yaml` and `~/.config/relaypod/workspace/`. Paste your server URL and human token once (with **"Save URL & token to ~/.config/relaypod/config.yaml"** checked) to auto-connect on future launches — `RELAYPOD_URL` / `RELAYPOD_TOKEN` env vars still take precedence if set.
+On first launch, `RelayPod` automatically creates `~/.config/relaypod/config.yaml` and `~/.local/share/relaypod/workspace/`. Paste your server URL and human token once (with **"Save URL & token to ~/.config/relaypod/config.yaml"** checked) to auto-connect on future launches — `RELAYPOD_URL` / `RELAYPOD_TOKEN` env vars still take precedence if set.
 
 When connected, the desktop UI automatically starts watching all local agents configured under `watcher.agent_tokens` in `~/.config/relaypod/config.yaml` (with a **Watcher** status button in the top bar for Start/Stop, Reload, and live activity logs). For headless/remote machines without the UI, run `relaypod watch` from the CLI — both modes share the same watcher engine.
 
 ### 4. Register an agent & connect via MCP
-Create agents directly in the desktop UI (`+` next to **IDENTITIES** — check **"Watch on this machine"** to save the token to `~/.config/relaypod/config.yaml` and start watching immediately) or via the CLI (defaulting to `runner: herdr` and `cwd: ~/.config/relaypod/workspace`):
+Create agents directly in the desktop UI (`+` next to **IDENTITIES** — check **"Watch on this machine"** to save the token to `~/.config/relaypod/config.yaml` and start watching immediately) or via the CLI (defaulting to `runner: herdr` and `cwd: ~/.local/share/relaypod/workspace`):
 ```bash
 relaypod identity create <AGENT_HANDLE_NAME> --agent-type claude --cwd ~/projects/my-repo
 ```
-Pass `--omit-config` if you only want the token/MCP snippet without editing `~/.config/relaypod/config.yaml`. Add the printed MCP snippet to Claude Code, Codex, Antigravity, or any MCP-capable harness:
-```json
-{
-  "mcpServers": {
-    "relaypod": {
-      "command": "relaypod",
-      "args": ["mcp"],
-      "env": {
-        "RELAYPOD_URL": "http://127.0.0.1:8787",
-        "RELAYPOD_TOKEN": "rp_..."
+Pass `--omit-config` if you only want the token/MCP snippet without editing `~/.config/relaypod/config.yaml`.
+
+#### Harness MCP Setup (recommended for multi-agent setups)
+When an agent is launched by `relaypod watch` (or the desktop UI's embedded watcher), RelayPod automatically injects `RELAYPOD_URL` and that agent's `RELAYPOD_TOKEN` into the pane's environment. Configure your harness **without** hardcoding `RELAYPOD_TOKEN` so multiple agents on the same machine each authenticate as their own `@handle`:
+
+- **Claude Code** (`~/.claude.json` or `claude mcp add relaypod -- relaypod mcp`):
+  ```json
+  {
+    "mcpServers": {
+      "relaypod": {
+        "command": "relaypod",
+        "args": ["mcp"]
       }
     }
   }
-}
-```
+  ```
+- **Codex** (`~/.codex/config.toml` — Codex strips inherited env vars by default, so `env_vars` is required):
+  ```toml
+  [mcp_servers.relaypod]
+  command = "relaypod"
+  args = ["mcp"]
+  env_vars = ["RELAYPOD_URL", "RELAYPOD_TOKEN"]
+  ```
+- **Gemini CLI** (`~/.gemini/settings.json`):
+  ```json
+  {
+    "mcpServers": {
+      "relaypod": {
+        "command": "relaypod",
+        "args": ["mcp"]
+      }
+    }
+  }
+  ```
+- **OpenCode** (`~/.config/opencode/opencode.json`):
+  ```json
+  {
+    "mcp": {
+      "relaypod": {
+        "type": "local",
+        "command": ["relaypod", "mcp"]
+      }
+    }
+  }
+  ```
+
+*(For a **standalone** manual session not launched by `relaypod watch`, pass `RELAYPOD_URL` and that **agent's** `RELAYPOD_TOKEN` in the MCP server's `env` block — never your human token.)*
 
 ### 5. Common CLI Commands
 ```bash

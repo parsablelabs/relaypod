@@ -10,7 +10,7 @@ url: http://127.0.0.1:8787
 watcher:
   # Optional default instructions / team norms file prepended once per new thread session
   # (see config/team-norms.md for a starter engineering team norms template)
-  instructions_file: ~/.config/relaypod/team-norms.md
+  instructions_file: ~/.local/share/relaypod/team-norms.md
   # Optional global max concurrent open sessions across all handles (LRU eviction for Herdr; 0/omit = unlimited)
   global_max_sessions: 10
   # Circuit breaker: max consecutive agent-authored turns in a thread before pausing and pinging the human

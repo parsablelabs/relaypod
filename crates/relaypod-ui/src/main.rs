@@ -274,7 +274,7 @@ impl AgentEditDraft {
                 ui.label("Instructions file");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.instructions_file)
-                        .hint_text("~/.config/relaypod/instructions.md")
+                        .hint_text("~/.local/share/relaypod/instructions.md")
                         .desired_width(f32::INFINITY),
                 );
                 ui.label("Custom prompt template");
