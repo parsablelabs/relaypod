@@ -6,7 +6,9 @@ pub mod supervisor;
 
 use crate::{run_live_ws_loop_with_outgoing, RelayPodClient, DEFAULT_PING_INTERVAL};
 use anyhow::{anyhow, Context, Result};
-use relaypod_core::{AgentConfig, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD};
+use relaypod_core::{
+    AgentConfig, Channel, UnreadItem, WsClientMessage, WsEvent, DEFAULT_AGENT_CWD,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1073,32 +1075,98 @@ pub(crate) async fn build_agent_prompt_with_context(
     ctx: &DispatchContext<'_>,
     is_resume: bool,
 ) -> String {
-    let prior_thread = if !is_resume && ctx.target.prompt.is_none() && ctx.item.parent_id.is_some()
-    {
-        match ctx.client.get_thread(ctx.thread_id).await {
-            Ok(thread) => format_prior_thread_context(&thread, &ctx.item.message_id),
-            Err(err) => {
-                warn!(
-                    handle = %ctx.handle,
-                    thread_id = %ctx.thread_id,
-                    error = %err,
-                    "Failed to fetch prior thread context for new session; continuing with single message"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    build_agent_prompt(
+    build_agent_prompt_with_fetchers(
         ctx.target,
         ctx.handle,
         ctx.item,
         ctx.thread_id,
         is_resume,
+        || ctx.client.list_channels_including_archived(),
+        || ctx.client.get_thread(ctx.thread_id),
+    )
+    .await
+}
+
+async fn build_agent_prompt_with_fetchers<FC, FCFut, FT, FTFut>(
+    target: &ResolvedTarget,
+    handle: &str,
+    item: &UnreadItem,
+    thread_id: &str,
+    is_resume: bool,
+    fetch_channels: FC,
+    fetch_thread: FT,
+) -> String
+where
+    FC: FnOnce() -> FCFut,
+    FCFut: std::future::Future<Output = Result<Vec<Channel>>>,
+    FT: FnOnce() -> FTFut,
+    FTFut: std::future::Future<Output = Result<relaypod_core::ThreadView>>,
+{
+    let needs_channel = (!is_resume && target.prompt.is_none())
+        || target
+            .prompt
+            .as_deref()
+            .is_some_and(|p| p.contains("{{channel_description}}"));
+    let needs_prior_thread = !is_resume && target.prompt.is_none() && item.parent_id.is_some();
+
+    let resolve_channel = |res: Result<Vec<Channel>>| match res {
+        Ok(channels) => channels.into_iter().find(|ch| ch.id == item.channel_id),
+        Err(err) => {
+            warn!(
+                handle = %handle,
+                channel_id = %item.channel_id,
+                error = %err,
+                "Failed to fetch channel context for new session; continuing without channel description"
+            );
+            None
+        }
+    };
+    let resolve_thread = |res: Result<relaypod_core::ThreadView>| match res {
+        Ok(thread) => format_prior_thread_context(&thread, &item.message_id),
+        Err(err) => {
+            warn!(
+                handle = %handle,
+                thread_id = %thread_id,
+                error = %err,
+                "Failed to fetch prior thread context for new session; continuing with single message"
+            );
+            None
+        }
+    };
+
+    let (channel_info, prior_thread) = match (needs_channel, needs_prior_thread) {
+        (true, true) => {
+            let (ch_res, th_res) = tokio::join!(fetch_channels(), fetch_thread());
+            (resolve_channel(ch_res), resolve_thread(th_res))
+        }
+        (true, false) => (resolve_channel(fetch_channels().await), None),
+        (false, true) => (None, resolve_thread(fetch_thread().await)),
+        (false, false) => (None, None),
+    };
+
+    build_agent_prompt(
+        target,
+        handle,
+        item,
+        thread_id,
+        is_resume,
+        channel_info.as_ref(),
         prior_thread.as_deref(),
     )
+}
+
+pub(crate) fn format_channel_context(item: &UnreadItem, channel: Option<&Channel>) -> String {
+    let channel_name = channel
+        .map(|ch| ch.name.as_str())
+        .unwrap_or(item.channel_name.as_str());
+    let description = channel
+        .map(|ch| ch.description.trim())
+        .filter(|desc| !desc.is_empty());
+
+    match description {
+        Some(desc) => format!("Channel: #{channel_name}\nChannel description: {desc}"),
+        None => format!("Channel: #{channel_name}"),
+    }
 }
 
 pub(crate) fn format_prior_thread_context(
@@ -1127,25 +1195,41 @@ pub(crate) fn build_agent_prompt(
     item: &UnreadItem,
     thread_id: &str,
     is_resume: bool,
+    channel_info: Option<&Channel>,
     prior_thread_context: Option<&str>,
 ) -> String {
+    let channel_name = channel_info
+        .map(|ch| ch.name.as_str())
+        .unwrap_or(item.channel_name.as_str());
+    let channel_description = channel_info.map(|ch| ch.description.trim()).unwrap_or("");
+
     let base = if let Some(ref custom) = target.prompt {
-        render_exec_template(custom, handle, item, thread_id)
+        render_exec_template(
+            custom,
+            handle,
+            item,
+            thread_id,
+            channel_name,
+            channel_description,
+        )
     } else if is_resume {
         format!(
             "Follow-up reply for @{} in RelayPod channel #{} (thread {}, unread {}) from @{}:\n\n{}\n\nRespond in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Remember: other agents only wake up when explicitly @mentioned.",
-            handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
-        )
-    } else if let Some(history) = prior_thread_context {
-        format!(
-            "You are @{}. Prior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
-            handle, item.channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
+            handle, channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, item.id
         )
     } else {
-        format!(
-            "You are @{}. New RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
-            handle, item.channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
-        )
+        let channel_context = format_channel_context(item, channel_info);
+        if let Some(history) = prior_thread_context {
+            format!(
+                "You are @{}.\n\n{}\n\nPrior messages in RelayPod channel #{} (thread {}):\n\n{}\n\n---\n\nLatest message (unread {}) from @{}:\n\n{}\n\nReply in-thread using RelayPod MCP `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+                handle, channel_context, channel_name, thread_id, history, item.id, item.author_handle, item.body, thread_id, item.id
+            )
+        } else {
+            format!(
+                "You are @{}.\n\n{}\n\nNew RelayPod message in #{} (thread {}, unread {}) from @{}:\n\n{}\n\nIf you need prior context, call RelayPod MCP `read_thread` on `{}`. Reply in-thread using `post_message` (with parent_id=\"{}\") and acknowledge unread item `{}` via `ack_unread`. Do not use interactive questionnaire/user-input tools; ask any clarifying questions in-thread via `post_message` instead. Note: other agents in RelayPod only wake up when explicitly @mentioned (omit agent @mentions when no further agent action is needed).",
+                handle, channel_context, channel_name, thread_id, item.id, item.author_handle, item.body, thread_id, thread_id, item.id
+            )
+        }
     };
 
     if !is_resume {
@@ -1224,6 +1308,8 @@ pub(crate) fn render_exec_template(
     handle: &str,
     item: &UnreadItem,
     thread_id: &str,
+    channel_name: &str,
+    channel_description: &str,
 ) -> String {
     template
         .replace("{{handle}}", handle)
@@ -1231,7 +1317,8 @@ pub(crate) fn render_exec_template(
         .replace("{{message_id}}", &item.message_id)
         .replace("{{thread_id}}", thread_id)
         .replace("{{channel_id}}", &item.channel_id)
-        .replace("{{channel}}", &item.channel_name)
+        .replace("{{channel}}", channel_name)
+        .replace("{{channel_description}}", channel_description)
         .replace("{{author}}", &item.author_handle)
         .replace("{{reason}}", &item.reason.to_string())
         .replace("{{body}}", &item.body)
@@ -1383,5 +1470,253 @@ mod tests {
         ));
         let (_, _, already_paused) = analyze_agent_turns(&paused_thread, "m7");
         assert!(already_paused);
+    }
+
+    fn sample_target(prompt: Option<&str>) -> ResolvedTarget {
+        ResolvedTarget {
+            label: "codex".into(),
+            runner: RunnerKind::Herdr,
+            agent_type: Some(AgentType::Codex),
+            url: "http://127.0.0.1:8787".into(),
+            token: "rp_test".into(),
+            exec: String::new(),
+            args: None,
+            prompt: prompt.map(ToString::to_string),
+            instructions_file: None,
+            cwd: None,
+            global_max_sessions: None,
+            max_sessions: None,
+            max_consecutive_agent_turns: None,
+            auto_ack: false,
+            drain_on_start: true,
+            cooldown_secs: 0,
+            env: BTreeMap::new(),
+        }
+    }
+
+    fn sample_unread_item(parent_id: Option<&str>) -> UnreadItem {
+        UnreadItem {
+            id: "u1".into(),
+            identity_id: "a1".into(),
+            message_id: "m2".into(),
+            channel_id: "c1".into(),
+            channel_name: "backend".into(),
+            parent_id: parent_id.map(ToString::to_string),
+            author_handle: "alice".into(),
+            body: "@codex please review the auth flow".into(),
+            reason: relaypod_core::UnreadReason::Mention,
+            acked_at: None,
+            created_at: 0,
+        }
+    }
+
+    fn sample_channel(name: &str, description: &str) -> Channel {
+        Channel {
+            id: "c1".into(),
+            name: name.into(),
+            description: description.into(),
+            created_at: 0,
+            created_by: Some("h1".into()),
+            archived: false,
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn new_session_prompt_includes_channel_name_and_description() {
+        let target = sample_target(None);
+        let item = sample_unread_item(None);
+        let channel = sample_channel("backend", "  API & auth service (repo: ~/projects/api)  ");
+
+        let prompt = build_agent_prompt(&target, "codex", &item, "m2", false, Some(&channel), None);
+        assert!(prompt.contains(
+            "Channel: #backend\nChannel description: API & auth service (repo: ~/projects/api)"
+        ));
+        assert!(
+            prompt.contains("New RelayPod message in #backend (thread m2, unread u1) from @alice:")
+        );
+        assert!(prompt.contains("@codex please review the auth flow"));
+
+        let prompt_with_history = build_agent_prompt(
+            &target,
+            "codex",
+            &item,
+            "m1",
+            false,
+            Some(&channel),
+            Some("@alice (thread root): Let's audit auth"),
+        );
+        assert!(prompt_with_history.contains(
+            "Channel: #backend\nChannel description: API & auth service (repo: ~/projects/api)"
+        ));
+        assert!(prompt_with_history
+            .contains("Prior messages in RelayPod channel #backend (thread m1):"));
+        assert!(prompt_with_history.contains("@alice (thread root): Let's audit auth"));
+        assert!(prompt_with_history.contains("Latest message (unread u1) from @alice:"));
+    }
+
+    #[test]
+    fn new_session_prompt_omits_blank_channel_description_and_handles_missing_channel() {
+        let target = sample_target(None);
+        let item = sample_unread_item(None);
+        let blank_channel = sample_channel("backend-v2", "   \n  ");
+
+        let prompt_blank = build_agent_prompt(
+            &target,
+            "codex",
+            &item,
+            "m2",
+            false,
+            Some(&blank_channel),
+            None,
+        );
+        assert!(
+            prompt_blank.contains("Channel: #backend-v2\n\nNew RelayPod message in #backend-v2")
+        );
+        assert!(!prompt_blank.contains("Channel description:"));
+
+        let prompt_missing = build_agent_prompt(&target, "codex", &item, "m2", false, None, None);
+        assert!(prompt_missing.contains("Channel: #backend\n\nNew RelayPod message in #backend"));
+        assert!(!prompt_missing.contains("Channel description:"));
+    }
+
+    #[test]
+    fn resume_prompt_skips_channel_context_block_and_custom_prompt_supports_placeholder() {
+        let target = sample_target(None);
+        let item = sample_unread_item(Some("m1"));
+        let channel = sample_channel("backend", "API & auth service");
+
+        let resume_prompt =
+            build_agent_prompt(&target, "codex", &item, "m1", true, Some(&channel), None);
+        assert!(
+            resume_prompt.starts_with("Follow-up reply for @codex in RelayPod channel #backend")
+        );
+        assert!(!resume_prompt.contains("Channel description:"));
+
+        let custom_target =
+            sample_target(Some("In #{{channel}} ({{channel_description}}): {{body}}"));
+        let custom_prompt = build_agent_prompt(
+            &custom_target,
+            "codex",
+            &item,
+            "m1",
+            false,
+            Some(&channel),
+            None,
+        );
+        assert_eq!(
+            custom_prompt,
+            "In #backend (API & auth service): @codex please review the auth flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_agent_prompt_with_fetchers_injects_channel_and_thread_for_new_session() {
+        let target = sample_target(None);
+        let item = sample_unread_item(Some("m1"));
+        let channels = vec![
+            Channel {
+                id: "c-other".into(),
+                name: "general".into(),
+                description: "General chat".into(),
+                created_at: 0,
+                created_by: Some("h1".into()),
+                archived: false,
+                archived_at: None,
+            },
+            sample_channel("backend", "Backend API repo at ~/projects/api"),
+        ];
+        let thread = relaypod_core::ThreadView {
+            parent: relaypod_core::Message {
+                id: "m1".into(),
+                channel_id: "c1".into(),
+                parent_id: None,
+                author_id: "h1".into(),
+                author_handle: "alice".into(),
+                author_kind: relaypod_core::IdentityKind::Human,
+                body: "Investigate login timeout".into(),
+                created_at: 1,
+                reply_count: 1,
+            },
+            replies: vec![relaypod_core::Message {
+                id: "m2".into(),
+                channel_id: "c1".into(),
+                parent_id: Some("m1".into()),
+                author_id: "h1".into(),
+                author_handle: "alice".into(),
+                author_kind: relaypod_core::IdentityKind::Human,
+                body: "@codex please review the auth flow".into(),
+                created_at: 2,
+                reply_count: 0,
+            }],
+        };
+
+        let prompt = build_agent_prompt_with_fetchers(
+            &target,
+            "codex",
+            &item,
+            "m1",
+            false,
+            || async { Ok(channels) },
+            || async { Ok(thread) },
+        )
+        .await;
+
+        assert!(prompt.contains(
+            "Channel: #backend\nChannel description: Backend API repo at ~/projects/api"
+        ));
+        assert!(prompt.contains("@alice (thread root): Investigate login timeout"));
+        assert!(prompt.contains("@codex please review the auth flow"));
+        assert!(!prompt.contains("General chat"));
+    }
+
+    #[tokio::test]
+    async fn build_agent_prompt_with_fetchers_skips_fetches_on_resume_and_handles_errors() {
+        let target = sample_target(None);
+        let item = sample_unread_item(Some("m1"));
+
+        // On resume, neither channel nor thread fetcher should be invoked.
+        let resume_prompt = build_agent_prompt_with_fetchers(
+            &target,
+            "codex",
+            &item,
+            "m1",
+            true,
+            || async {
+                panic!("channels should not be fetched on resume");
+                #[allow(unreachable_code)]
+                Ok(Vec::new())
+            },
+            || async {
+                panic!("thread should not be fetched on resume");
+                #[allow(unreachable_code)]
+                Err(anyhow!("unreachable"))
+            },
+        )
+        .await;
+        assert!(
+            resume_prompt.starts_with("Follow-up reply for @codex in RelayPod channel #backend")
+        );
+        assert!(!resume_prompt.contains("Channel description:"));
+
+        // On new session, fetch errors degrade gracefully without failing prompt construction.
+        let top_level_item = sample_unread_item(None);
+        let fallback_prompt = build_agent_prompt_with_fetchers(
+            &target,
+            "codex",
+            &top_level_item,
+            "m2",
+            false,
+            || async { Err(anyhow!("server unavailable")) },
+            || async {
+                panic!("thread should not be fetched for top-level message");
+                #[allow(unreachable_code)]
+                Err(anyhow!("unreachable"))
+            },
+        )
+        .await;
+        assert!(fallback_prompt.contains("Channel: #backend\n\nNew RelayPod message in #backend"));
+        assert!(!fallback_prompt.contains("Channel description:"));
+        assert!(fallback_prompt.contains("@codex please review the auth flow"));
     }
 }

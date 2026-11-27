@@ -723,16 +723,20 @@ impl RelayPodApp {
         if self.show_new_channel_modal {
             let mut close = false;
             let modal = egui::Modal::new(egui::Id::new("new_channel")).show(ctx, |ui| {
-                ui.set_width(360.0);
+                ui.set_width(460.0);
                 ui.heading("New Channel");
                 ui.label("Channel name (without #)");
-                ui.text_edit_singleline(&mut self.new_channel_name);
-                ui.label("Description");
-                ui.text_edit_singleline(&mut self.new_channel_desc);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_channel_name)
+                        .desired_width(f32::INFINITY),
+                );
+                let desc_valid =
+                    render_channel_description_input(ui, "new_channel", &mut self.new_channel_desc);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            !self.new_channel_name.trim().is_empty(),
+                            !self.new_channel_name.trim().is_empty() && desc_valid,
                             egui::Button::new("Create"),
                         )
                         .clicked()
@@ -901,15 +905,19 @@ impl RelayPodApp {
             let mut save = false;
             let mut cancel = false;
             let modal = egui::Modal::new(egui::Id::new("edit_channel")).show(ctx, |ui| {
-                ui.set_width(360.0);
+                ui.set_width(460.0);
                 ui.heading("Edit channel");
                 ui.label("Name");
-                ui.text_edit_singleline(&mut channel.name);
-                ui.label("Description");
-                ui.text_edit_singleline(&mut channel.description);
+                ui.add(egui::TextEdit::singleline(&mut channel.name).desired_width(f32::INFINITY));
+                let desc_valid =
+                    render_channel_description_input(ui, "edit_channel", &mut channel.description);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     save = ui
-                        .add_enabled(!channel.name.trim().is_empty(), egui::Button::new("Save"))
+                        .add_enabled(
+                            !channel.name.trim().is_empty() && desc_valid,
+                            egui::Button::new("Save"),
+                        )
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
@@ -1877,10 +1885,11 @@ impl eframe::App for RelayPodApp {
                 let archived = ch.archived;
                 ui.horizontal(|ui| {
                     ui.heading(format!("# {}", ch.name));
-                    if !ch.description.is_empty() {
+                    if !ch.description.trim().is_empty() {
+                        let inline_desc = format_inline_channel_description(&ch.description);
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&ch.description)
+                                egui::RichText::new(inline_desc)
                                     .color(ui.visuals().weak_text_color()),
                             )
                             .truncate(),
@@ -2382,6 +2391,64 @@ fn apply_mention_completion(
         state.store(ctx, input_id);
     }
     ctx.memory_mut(|m| m.request_focus(input_id));
+}
+
+fn format_inline_channel_description(description: &str) -> String {
+    description
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Renders a multiline channel description editor with a live character counter.
+/// Returns `true` when the description length is within `MAX_CHANNEL_DESCRIPTION_LEN`.
+fn render_channel_description_input(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    description: &mut String,
+) -> bool {
+    let max_len = relaypod_core::store::MAX_CHANNEL_DESCRIPTION_LEN;
+    let char_count = description.chars().count();
+    let over_limit = char_count > max_len;
+
+    ui.horizontal(|ui| {
+        ui.label("Description");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let color = if over_limit {
+                Color32::LIGHT_RED
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            ui.label(
+                egui::RichText::new(format!("{char_count}/{max_len}"))
+                    .size(11.0)
+                    .color(color),
+            );
+        });
+    });
+
+    egui::ScrollArea::vertical()
+        .id_salt((id_salt, "channel_desc_scroll"))
+        .max_height(200.0)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(description)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Optional channel purpose or context for humans and agents"),
+            );
+        });
+
+    if over_limit {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            format!("Description must be at most {max_len} characters."),
+        );
+    }
+
+    !over_limit
 }
 
 /// Renders a taller, rounded multiline composer with `@mention` autocomplete.
@@ -3353,5 +3420,50 @@ mod tests {
         let (label, _, pulse) = watcher_pill_summary(&working);
         assert_eq!(label, "Watcher (2 • working)");
         assert!(pulse);
+    }
+
+    #[test]
+    fn channel_description_input_is_multiline_and_validates_limit() {
+        let ctx = egui::Context::default();
+        configure_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(520.0, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut desc = "Repo: ~/projects/relaypod\nFocus: watcher & UI".to_string();
+        let mut valid = false;
+        let mut box_height = 0.0_f32;
+        let _ = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(460.0);
+                let top = ui.cursor().top();
+                valid = render_channel_description_input(ui, "test_desc", &mut desc);
+                box_height = ui.cursor().top() - top;
+            });
+        });
+        assert!(valid);
+        assert!(
+            box_height >= 90.0,
+            "expected spacious multiline description editor, got height {box_height}"
+        );
+
+        let mut too_long = "x".repeat(relaypod_core::store::MAX_CHANNEL_DESCRIPTION_LEN + 1);
+        let mut over_valid = true;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(460.0);
+                over_valid = render_channel_description_input(ui, "test_desc_over", &mut too_long);
+            });
+        });
+        assert!(!over_valid);
+
+        assert_eq!(
+            format_inline_channel_description("  Line 1 \n\n  Line 2  "),
+            "Line 1 Line 2"
+        );
     }
 }
