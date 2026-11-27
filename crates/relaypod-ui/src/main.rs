@@ -1878,9 +1878,12 @@ impl eframe::App for RelayPodApp {
                             .cloned()
                             .collect();
                         if !thread_workers.is_empty() {
-                            if let Some(pane_id) =
-                                render_activity_banners(ui, &thread_workers, true)
-                            {
+                            if let Some(pane_id) = render_activity_banners(
+                                ui,
+                                &thread_workers,
+                                true,
+                                &self.state.watcher,
+                            ) {
                                 self.runtime.send(ClientCommand::FocusHerdrPane { pane_id });
                             }
                             ui.add_space(6.0);
@@ -1984,6 +1987,7 @@ impl eframe::App for RelayPodApp {
                                     can_delete,
                                     &workers,
                                     thread_unread_ids.len(),
+                                    &self.state.watcher,
                                 );
                                 match action {
                                     MessageCardAction::OpenThread => {
@@ -2882,10 +2886,17 @@ fn render_activity_banner(ui: &mut egui::Ui, handles: &[String], state: Activity
         });
 }
 
+fn can_focus_worker_in_herdr(watcher: &watch::WatcherSnapshot, worker: &ActiveWorker) -> bool {
+    worker.pane_id.is_some()
+        && watcher.running
+        && watcher.token_name_for_identity(&worker.identity_id).is_some()
+}
+
 fn render_blocked_banner(
     ui: &mut egui::Ui,
     worker: &ActiveWorker,
     default_peek_open: bool,
+    can_focus_locally: bool,
 ) -> Option<String> {
     let dark = ui.visuals().dark_mode;
     let (fill, border, text_color, peek_bg, peek_border, peek_text) = if dark {
@@ -2938,13 +2949,15 @@ fn render_blocked_banner(
                     .color(text_color),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(ref pane_id) = worker.pane_id {
-                        if ui
-                            .small_button("Focus in Herdr")
-                            .on_hover_text(format!("Focus pane {pane_id} in Herdr"))
-                            .clicked()
-                        {
-                            focus_pane = Some(pane_id.clone());
+                    if can_focus_locally {
+                        if let Some(ref pane_id) = worker.pane_id {
+                            if ui
+                                .small_button("Focus in Herdr")
+                                .on_hover_text(format!("Focus pane {pane_id} in Herdr"))
+                                .clicked()
+                            {
+                                focus_pane = Some(pane_id.clone());
+                            }
                         }
                     }
                     if worker.detail.is_some() {
@@ -2998,6 +3011,7 @@ fn render_activity_banners(
     ui: &mut egui::Ui,
     workers: &[ActiveWorker],
     default_peek_open: bool,
+    watcher: &watch::WatcherSnapshot,
 ) -> Option<String> {
     let blocked: Vec<&ActiveWorker> = workers
         .iter()
@@ -3014,7 +3028,8 @@ fn render_activity_banners(
         if idx > 0 {
             ui.add_space(4.0);
         }
-        if let Some(pane_id) = render_blocked_banner(ui, worker, default_peek_open) {
+        let can_focus = can_focus_worker_in_herdr(watcher, worker);
+        if let Some(pane_id) = render_blocked_banner(ui, worker, default_peek_open, can_focus) {
             focus_pane = Some(pane_id);
         }
     }
@@ -3041,6 +3056,7 @@ fn render_message_card(
     can_delete: bool,
     workers: &[ActiveWorker],
     unread_count: usize,
+    watcher: &watch::WatcherSnapshot,
 ) -> MessageCardAction {
     let mut action = MessageCardAction::None;
     let frame_resp = egui::Frame::group(ui.style())
@@ -3087,7 +3103,7 @@ fn render_message_card(
             }
             if !workers.is_empty() {
                 ui.add_space(6.0);
-                if let Some(pane_id) = render_activity_banners(ui, workers, false) {
+                if let Some(pane_id) = render_activity_banners(ui, workers, false, watcher) {
                     action = MessageCardAction::FocusHerdrPane(pane_id);
                 }
             }
@@ -3712,5 +3728,55 @@ mod tests {
             format_inline_channel_description("  Line 1 \n\n  Line 2  "),
             "Line 1 Line 2"
         );
+    }
+
+    #[test]
+    fn focus_in_herdr_only_allowed_for_locally_watched_agents() {
+        let local_worker = ActiveWorker {
+            identity_id: "id-local".into(),
+            handle: "codex-local".into(),
+            channel_id: "ch-1".into(),
+            thread_id: Some("t-1".into()),
+            state: ActivityState::Blocked,
+            pane_id: Some("w1:p1".into()),
+            detail: Some("Approve command?".into()),
+        };
+        let remote_worker = ActiveWorker {
+            identity_id: "id-remote".into(),
+            handle: "claude-docker".into(),
+            channel_id: "ch-1".into(),
+            thread_id: Some("t-1".into()),
+            state: ActivityState::Blocked,
+            pane_id: Some("w2:p9".into()),
+            detail: Some("Approve command?".into()),
+        };
+        let no_pane_worker = ActiveWorker {
+            pane_id: None,
+            ..local_worker.clone()
+        };
+
+        // No local watcher running (pure UI client) -> cannot focus any pane
+        let idle_watcher = watch::WatcherSnapshot::default();
+        assert!(!can_focus_worker_in_herdr(&idle_watcher, &local_worker));
+        assert!(!can_focus_worker_in_herdr(&idle_watcher, &remote_worker));
+
+        // Local watcher running with only id-local -> only id-local with pane_id can focus
+        let local_watcher = watch::WatcherSnapshot {
+            running: true,
+            targets: vec![watch::WatchedTargetState {
+                token_name: "codex-local".into(),
+                identity_id: Some("id-local".into()),
+                handle: Some("codex-local".into()),
+                runner: Some("herdr".into()),
+                harness: Some("codex".into()),
+                phase: watch::TargetPhase::Blocked {
+                    channel: "general".into(),
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(can_focus_worker_in_herdr(&local_watcher, &local_worker));
+        assert!(!can_focus_worker_in_herdr(&local_watcher, &remote_worker));
+        assert!(!can_focus_worker_in_herdr(&local_watcher, &no_pane_worker));
     }
 }
