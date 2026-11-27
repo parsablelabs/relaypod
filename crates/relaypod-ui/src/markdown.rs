@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use eframe::egui;
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextFormat};
@@ -52,8 +54,7 @@ pub fn render_markdown(ui: &mut egui::Ui, text: &str) {
                 _ => 14.5,
             };
             let color = ui.visuals().strong_text_color();
-            let job = build_inline_job(ui, content, size, color, true);
-            ui.add(egui::Label::new(job).wrap());
+            render_inline_text(ui, content, size, color, true);
             ui.add_space(2.0);
             i += 1;
             continue;
@@ -92,8 +93,7 @@ pub fn render_markdown(ui: &mut egui::Ui, text: &str) {
 
         // Regular paragraph line
         let color = ui.visuals().text_color();
-        let job = build_inline_job(ui, line, 13.5, color, false);
-        ui.add(egui::Label::new(job).wrap());
+        render_inline_text(ui, line, 13.5, color, false);
         i += 1;
     }
 }
@@ -200,8 +200,7 @@ fn render_blockquote(ui: &mut egui::Ui, lines: &[&str]) {
             ui.set_width(ui.available_width());
             let color = ui.visuals().weak_text_color();
             for line in lines {
-                let job = build_inline_job(ui, line, 13.0, color, false);
-                ui.add(egui::Label::new(job).wrap());
+                render_inline_text(ui, line, 13.0, color, false);
             }
         });
 
@@ -222,9 +221,164 @@ fn render_list_item(ui: &mut egui::Ui, marker: &str, content: &str) {
                 .color(ui.visuals().weak_text_color()),
         );
         let color = ui.visuals().text_color();
-        let job = build_inline_job(ui, content, 13.5, color, false);
-        ui.add(egui::Label::new(job).wrap());
+        render_inline_text(ui, content, 13.5, color, false);
     });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSpan {
+    section_index: usize,
+    url: String,
+}
+
+fn render_inline_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    base_size: f32,
+    base_color: Color32,
+    strong_default: bool,
+) {
+    let (mut job, links) = build_inline_job(ui, text, base_size, base_color, strong_default);
+    if links.is_empty() {
+        ui.add(egui::Label::new(job).wrap());
+        return;
+    }
+
+    job.wrap.max_width = ui.available_width().max(1.0);
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let resp = ui.add(egui::Label::new(Arc::clone(&galley)).sense(egui::Sense::click()));
+
+    let pointer_pos = resp.hover_pos().or_else(|| resp.interact_pointer_pos());
+    if let Some(pos) = pointer_pos {
+        let local_pos = pos - resp.rect.min;
+        if let Some(url) = hit_test_link(&galley, &links, local_pos) {
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let clicked = resp.clicked() || resp.middle_clicked();
+            resp.on_hover_text(url);
+            if clicked {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+        }
+    }
+}
+
+fn hit_test_link<'a>(
+    galley: &egui::Galley,
+    links: &'a [LinkSpan],
+    local_pos: egui::Vec2,
+) -> Option<&'a str> {
+    let pos = local_pos.to_pos2();
+    for row in &galley.rows {
+        if !row.rect.contains(pos) {
+            continue;
+        }
+        for glyph in &row.glyphs {
+            let left = glyph.pos.x;
+            let right = left + glyph.advance_width;
+            if pos.x >= left && pos.x <= right {
+                let sec = glyph.section_index as usize;
+                return links
+                    .iter()
+                    .find(|link| link.section_index == sec)
+                    .map(|link| link.url.as_str());
+            }
+        }
+    }
+    None
+}
+
+fn is_openable_url(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    let scheme_len = if bytes.len() > 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        8
+    } else if bytes.len() > 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        7
+    } else {
+        return false;
+    };
+    let rest = &url[scheme_len..];
+    !rest.is_empty() && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Parses a Markdown link `[label](url)` starting at byte index 0 of `slice`.
+/// Supports balanced parentheses inside `url` (e.g. Wikipedia links).
+/// Returns `(label, url, total_bytes_consumed)`.
+fn parse_markdown_link(slice: &str) -> Option<(&str, &str, usize)> {
+    let rest = slice.strip_prefix('[')?;
+    let close_bracket = rest.find("](")?;
+    let label = &rest[..close_bracket];
+    if label.is_empty() {
+        return None;
+    }
+    let url_start = 1 + close_bracket + 2;
+    let url_bytes = &slice.as_bytes()[url_start..];
+    let mut depth = 0usize;
+    let mut close_paren = None;
+    for (idx, &b) in url_bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    close_paren = Some(idx);
+                    break;
+                }
+                depth -= 1;
+            }
+            b'\n' | b'\r' => return None,
+            _ => {}
+        }
+    }
+    let end_rel = close_paren?;
+    let url = slice[url_start..url_start + end_rel].trim();
+    Some((label, url, url_start + end_rel + 1))
+}
+
+/// Matches a bare `http://` or `https://` URL starting at byte index 0 of `slice`,
+/// trimming trailing sentence punctuation and unbalanced closing brackets.
+fn match_bare_url(slice: &str) -> Option<&str> {
+    let bytes = slice.as_bytes();
+    let has_scheme = (bytes.len() > 8 && bytes[..8].eq_ignore_ascii_case(b"https://"))
+        || (bytes.len() > 7 && bytes[..7].eq_ignore_ascii_case(b"http://"));
+    if !has_scheme {
+        return None;
+    }
+
+    let mut end = slice.len();
+    for (idx, ch) in slice.char_indices() {
+        if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`') {
+            end = idx;
+            break;
+        }
+    }
+
+    let mut url = &slice[..end];
+    while let Some(last) = url.chars().next_back() {
+        let should_strip = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+            ')' => {
+                url.bytes().filter(|&b| b == b')').count()
+                    > url.bytes().filter(|&b| b == b'(').count()
+            }
+            ']' => {
+                url.bytes().filter(|&b| b == b']').count()
+                    > url.bytes().filter(|&b| b == b'[').count()
+            }
+            '}' => {
+                url.bytes().filter(|&b| b == b'}').count()
+                    > url.bytes().filter(|&b| b == b'{').count()
+            }
+            _ => false,
+        };
+        if should_strip {
+            url = &url[..url.len() - last.len_utf8()];
+        } else {
+            break;
+        }
+    }
+
+    is_openable_url(url).then_some(url)
 }
 
 fn build_inline_job(
@@ -233,8 +387,9 @@ fn build_inline_job(
     base_size: f32,
     base_color: Color32,
     strong_default: bool,
-) -> LayoutJob {
+) -> (LayoutJob, Vec<LinkSpan>) {
     let mut job = LayoutJob::default();
+    let mut links = Vec::new();
     let dark = ui.visuals().dark_mode;
     let strong_color = ui.visuals().strong_text_color();
     let code_bg = if dark {
@@ -266,6 +421,13 @@ fn build_inline_job(
         } else {
             base_color
         },
+        ..Default::default()
+    };
+
+    let link_fmt = TextFormat {
+        font_id: FontId::new(base_size, FontFamily::Proportional),
+        color: link_fg,
+        underline: Stroke::new(1.0_f32, link_fg),
         ..Default::default()
     };
 
@@ -376,24 +538,37 @@ fn build_inline_job(
 
         // Markdown link: [label](url)
         if bytes[i] == b'[' {
-            if let Some(close_bracket) = text[i + 1..].find("](") {
-                let label_start = i + 1;
-                let label_end = label_start + close_bracket;
-                let url_start = label_end + 2;
-                if let Some(close_paren) = text[url_start..].find(')') {
+            if let Some((label, url, consumed)) = parse_markdown_link(&text[i..]) {
+                flush_plain(&mut job, plain_start, i);
+                let section_index = job.sections.len();
+                if is_openable_url(url) {
+                    job.append(label, 0.0, link_fmt.clone());
+                    links.push(LinkSpan {
+                        section_index,
+                        url: url.to_string(),
+                    });
+                } else {
+                    job.append(label, 0.0, default_fmt.clone());
+                }
+                i += consumed;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // Bare URL: https://... or http://...
+        if bytes[i] == b'h' || bytes[i] == b'H' {
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if prev_ok {
+                if let Some(url) = match_bare_url(&text[i..]) {
                     flush_plain(&mut job, plain_start, i);
-                    let label = &text[label_start..label_end];
-                    job.append(
-                        label,
-                        0.0,
-                        TextFormat {
-                            font_id: FontId::new(base_size, FontFamily::Proportional),
-                            color: link_fg,
-                            underline: Stroke::new(1.0_f32, link_fg),
-                            ..Default::default()
-                        },
-                    );
-                    i = url_start + close_paren + 1;
+                    let section_index = job.sections.len();
+                    job.append(url, 0.0, link_fmt.clone());
+                    links.push(LinkSpan {
+                        section_index,
+                        url: url.to_string(),
+                    });
+                    i += url.len();
                     plain_start = i;
                     continue;
                 }
@@ -440,7 +615,7 @@ fn build_inline_job(
     }
 
     flush_plain(&mut job, plain_start, bytes.len());
-    job
+    (job, links)
 }
 
 #[cfg(test)]
@@ -460,5 +635,140 @@ mod tests {
         );
         assert!(is_horizontal_rule("---"));
         assert!(!is_horizontal_rule("--"));
+    }
+
+    #[test]
+    fn matches_bare_urls_and_trims_punctuation() {
+        assert_eq!(
+            match_bare_url("https://example.com/pr/42."),
+            Some("https://example.com/pr/42")
+        );
+        assert_eq!(
+            match_bare_url("https://example.com/foo?a=1&b=2), next"),
+            Some("https://example.com/foo?a=1&b=2")
+        );
+        assert_eq!(
+            match_bare_url("https://en.wikipedia.org/wiki/Rust_(programming_language)."),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+        );
+        assert_eq!(
+            match_bare_url("http://localhost:8787/api/health;"),
+            Some("http://localhost:8787/api/health")
+        );
+        assert_eq!(match_bare_url("https://"), None);
+        assert_eq!(match_bare_url("ftp://example.com"), None);
+        // Regression: multi-byte UTF-8 char straddling byte index 7/8 after 'h' must not panic.
+        assert_eq!(match_bare_url("hello” world"), None);
+        assert!(!is_openable_url("hello” world"));
+    }
+
+    #[test]
+    fn parses_markdown_links_with_balanced_parens_and_scheme_filter() {
+        assert_eq!(
+            parse_markdown_link("[PR #12](https://github.com/org/repo/pull/12) rest"),
+            Some(("PR #12", "https://github.com/org/repo/pull/12", 45))
+        );
+        assert_eq!(
+            parse_markdown_link("[Rust](https://en.wikipedia.org/wiki/Rust_(lang))"),
+            Some(("Rust", "https://en.wikipedia.org/wiki/Rust_(lang)", 49))
+        );
+        assert!(is_openable_url("https://example.com"));
+        assert!(is_openable_url("http://127.0.0.1:8787"));
+        assert!(!is_openable_url("javascript:alert(1)"));
+        assert!(!is_openable_url("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn clicking_embedded_url_emits_open_url_command() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 200.0));
+        let mut link_center: Option<egui::Pos2> = None;
+        let mut plain_pos: Option<egui::Pos2> = None;
+
+        // First frame: measure where the plain text and link glyphs land.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let text = "See https://example.com/docs for details";
+                    let (mut job, links) = build_inline_job(
+                        ui,
+                        text,
+                        13.5,
+                        ui.visuals().text_color(),
+                        false,
+                    );
+                    assert_eq!(links.len(), 1);
+                    assert_eq!(links[0].url, "https://example.com/docs");
+                    job.wrap.max_width = ui.available_width().max(1.0);
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    let resp = ui.add(egui::Label::new(Arc::clone(&galley)));
+                    let row = &galley.rows[0];
+                    if let Some(g) = row
+                        .glyphs
+                        .iter()
+                        .find(|g| g.section_index as usize == links[0].section_index)
+                    {
+                        link_center = Some(egui::pos2(
+                            resp.rect.min.x + g.pos.x + g.advance_width * 0.5,
+                            resp.rect.min.y + row.rect.center().y,
+                        ));
+                    }
+                    if let Some(g) = row.glyphs.first() {
+                        plain_pos = Some(egui::pos2(
+                            resp.rect.min.x + g.pos.x + g.advance_width * 0.5,
+                            resp.rect.min.y + row.rect.center().y,
+                        ));
+                    }
+                });
+            },
+        );
+
+        let click_link = link_center.expect("expected link glyph position");
+        let click_plain = plain_pos.expect("expected plain glyph position");
+
+        let click_at = |pos: egui::Pos2| -> Vec<String> {
+            let mut opened = Vec::new();
+            for pressed in [true, false] {
+                let out = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render_markdown(ui, "See https://example.com/docs for details");
+                        });
+                    },
+                );
+                for cmd in out.platform_output.commands {
+                    if let egui::OutputCommand::OpenUrl(open) = cmd {
+                        opened.push(open.url);
+                    }
+                }
+            }
+            opened
+        };
+
+        assert!(
+            click_at(click_plain).is_empty(),
+            "clicking non-link text should not open a URL"
+        );
+        assert_eq!(
+            click_at(click_link),
+            vec!["https://example.com/docs".to_string()]
+        );
     }
 }
