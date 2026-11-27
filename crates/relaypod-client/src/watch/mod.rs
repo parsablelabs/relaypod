@@ -18,7 +18,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, watch as tokio_watch};
 use tracing::{error, info, warn};
 
-use self::adapter::{DispatchContext, WatcherAdapter};
+use self::adapter::{ActivityUpdate, DispatchContext, WatcherAdapter};
 pub use self::config::{
     append_watcher_token_to_config, ensure_default_config, ensure_default_server_config,
     remove_watcher_token_from_config, update_client_token_in_config,
@@ -30,6 +30,7 @@ use self::config::{
     load_config_file, load_server_config_file, DEFAULT_MAX_CONSECUTIVE_AGENT_TURNS,
 };
 use self::exec_adapter::ExecAdapter;
+pub use self::herdr_adapter::focus_herdr_pane;
 use self::herdr_adapter::HerdrAdapter;
 use self::supervisor::{resolved_subprocess_path, WatcherReporter};
 pub use self::supervisor::{TargetPhase, WatchedTargetState, WatcherSnapshot, WatcherSupervisor};
@@ -995,16 +996,20 @@ async fn dispatch_unread_item(
         thread_id: Some(thread_id.clone()),
         active: true,
         state: ActivityState::Working,
+        pane_id: None,
+        detail: None,
     });
 
-    let on_activity = |state: ActivityState| {
+    let on_activity = |update: ActivityUpdate| {
         let _ = ws_out_tx.send(WsClientMessage::Activity {
             channel_id: item.channel_id.clone(),
             thread_id: Some(thread_id.clone()),
             active: true,
-            state,
+            state: update.state,
+            pane_id: update.pane_id,
+            detail: update.detail,
         });
-        (env.on_activity_change)(state);
+        (env.on_activity_change)(update.state);
     };
 
     let ctx = DispatchContext {
@@ -1025,6 +1030,8 @@ async fn dispatch_unread_item(
         thread_id: Some(thread_id.clone()),
         active: false,
         state: ActivityState::Working,
+        pane_id: None,
+        detail: None,
     });
 
     if outcome.succeeded {

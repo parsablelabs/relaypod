@@ -27,6 +27,7 @@ const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_ACTIVITY_PER_IDENTITY: usize = 16;
 const MAX_ACTIVITY_ID_LEN: usize = 128;
+const MAX_ACTIVITY_DETAIL_LEN: usize = 2048;
 
 type ActivityKey = (String, String, Option<String>);
 
@@ -34,6 +35,8 @@ type ActivityKey = (String, String, Option<String>);
 struct ActivityEntry {
     handle: String,
     state: ActivityState,
+    pane_id: Option<String>,
+    detail: Option<String>,
 }
 
 struct PresenceEntry {
@@ -207,6 +210,7 @@ impl AppState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_activity(
         &self,
         identity_id: &str,
@@ -215,6 +219,8 @@ impl AppState {
         thread_id: Option<String>,
         active: bool,
         state: ActivityState,
+        pane_id: Option<String>,
+        detail: Option<String>,
     ) {
         if channel_id.is_empty()
             || channel_id.len() > MAX_ACTIVITY_ID_LEN
@@ -224,7 +230,26 @@ impl AppState {
         {
             return;
         }
-        let emitted_state = {
+        let pane_id = pane_id
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty() && p.len() <= MAX_ACTIVITY_ID_LEN);
+        let detail = detail.and_then(|d| {
+            let trimmed = d.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if trimmed.len() <= MAX_ACTIVITY_DETAIL_LEN {
+                Some(trimmed.to_string())
+            } else {
+                let mut end = MAX_ACTIVITY_DETAIL_LEN;
+                while !trimmed.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Some(trimmed[..end].to_string())
+            }
+        });
+
+        let emitted = {
             let mut guard = self.activity.lock().expect("activity lock poisoned");
             let key = (
                 identity_id.to_string(),
@@ -241,19 +266,22 @@ impl AppState {
                 let next = ActivityEntry {
                     handle: handle.to_string(),
                     state,
+                    pane_id,
+                    detail,
                 };
                 if guard.get(&key) == Some(&next) {
                     None
                 } else {
+                    let out = (next.state, next.pane_id.clone(), next.detail.clone());
                     guard.insert(key, next);
-                    Some(state)
+                    Some(out)
                 }
             } else {
-                guard.remove(&key).map(|removed| removed.state)
+                guard.remove(&key).map(|removed| (removed.state, None, None))
             }
         };
 
-        if let Some(emitted_state) = emitted_state {
+        if let Some((emitted_state, emitted_pane_id, emitted_detail)) = emitted {
             self.emit(WsEvent::ActivityChanged {
                 identity_id: identity_id.to_string(),
                 handle: handle.to_string(),
@@ -261,6 +289,8 @@ impl AppState {
                 thread_id,
                 active,
                 state: emitted_state,
+                pane_id: emitted_pane_id,
+                detail: emitted_detail,
             });
         }
     }
@@ -286,6 +316,8 @@ impl AppState {
                 thread_id,
                 active: false,
                 state: entry.state,
+                pane_id: None,
+                detail: None,
             });
         }
     }
@@ -316,6 +348,8 @@ impl AppState {
                     thread_id: thread_id.clone(),
                     active: true,
                     state: entry.state,
+                    pane_id: entry.pane_id.clone(),
+                    detail: entry.detail.clone(),
                 },
             )
             .collect()
@@ -803,6 +837,8 @@ async fn post_message(
         res.message.parent_id.clone(),
         false,
         ActivityState::Working,
+        None,
+        None,
     );
     state.emit(WsEvent::MessageCreated(res.message.clone()));
     for unread in res.created_unread {
@@ -986,6 +1022,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
                                     thread_id,
                                     active,
                                     state: activity_state,
+                                    pane_id,
+                                    detail,
                                 } => {
                                     state.on_ws_ping(&identity.id);
                                     let current_handle = state
@@ -1002,6 +1040,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>, identity: Identity) 
                                         thread_id,
                                         active,
                                         activity_state,
+                                        pane_id,
+                                        detail,
                                     );
                                 }
                             }
@@ -1039,6 +1079,8 @@ mod tests {
             Some("t1".into()),
             true,
             ActivityState::Working,
+            None,
+            None,
         );
         let ev1 = rx.try_recv().unwrap();
         assert!(matches!(
@@ -1046,6 +1088,8 @@ mod tests {
             WsEvent::ActivityChanged {
                 active: true,
                 state: ActivityState::Working,
+                pane_id: None,
+                detail: None,
                 ..
             }
         ));
@@ -1058,10 +1102,12 @@ mod tests {
             Some("t1".into()),
             true,
             ActivityState::Working,
+            None,
+            None,
         );
         assert!(rx.try_recv().is_err());
 
-        // Transition Working -> Blocked emits and persists in snapshot
+        // Transition Working -> Blocked emits pane_id & detail and persists in snapshot
         app.set_activity(
             "a1",
             "codex",
@@ -1069,6 +1115,8 @@ mod tests {
             Some("t1".into()),
             true,
             ActivityState::Blocked,
+            Some("w4:p7".into()),
+            Some("Allow running `rm -rf build`?".into()),
         );
         let ev2 = rx.try_recv().unwrap();
         assert!(matches!(
@@ -1076,8 +1124,10 @@ mod tests {
             WsEvent::ActivityChanged {
                 active: true,
                 state: ActivityState::Blocked,
+                pane_id: Some(ref p),
+                detail: Some(ref d),
                 ..
-            }
+            } if p == "w4:p7" && d == "Allow running `rm -rf build`?"
         ));
 
         let snap = app.snapshot_active_events();
@@ -1087,8 +1137,10 @@ mod tests {
             WsEvent::ActivityChanged {
                 active: true,
                 state: ActivityState::Blocked,
+                pane_id: Some(ref p),
+                detail: Some(ref d),
                 ..
-            }
+            } if p == "w4:p7" && d == "Allow running `rm -rf build`?"
         ));
 
         // Clearing emits active: false
@@ -1099,6 +1151,8 @@ mod tests {
             Some("t1".into()),
             false,
             ActivityState::Working,
+            None,
+            None,
         );
         let ev3 = rx.try_recv().unwrap();
         assert!(matches!(

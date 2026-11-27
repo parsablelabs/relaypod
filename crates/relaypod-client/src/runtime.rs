@@ -71,6 +71,9 @@ pub enum ClientCommand {
         default_url: String,
         config_path: Option<PathBuf>,
     },
+    FocusHerdrPane {
+        pane_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -392,6 +395,21 @@ where
                     }
                     ClientCommand::StopWatcher => {
                         watcher.stop();
+                    }
+                    ClientCommand::FocusHerdrPane { pane_id } => {
+                        let tx = event_tx.clone();
+                        let notify = Arc::clone(&notify);
+                        tokio::spawn(async move {
+                            if let Err(err) = crate::watch::focus_herdr_pane(&pane_id).await {
+                                emit(
+                                    &tx,
+                                    &notify,
+                                    ClientEvent::Error(format!(
+                                        "Failed to focus Herdr pane {pane_id}: {err}"
+                                    )),
+                                );
+                            }
+                        });
                     }
                 }
             }

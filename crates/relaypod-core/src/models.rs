@@ -319,6 +319,10 @@ pub enum WsEvent {
         active: bool,
         #[serde(default)]
         state: ActivityState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -332,6 +336,10 @@ pub enum WsClientMessage {
         active: bool,
         #[serde(default)]
         state: ActivityState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 

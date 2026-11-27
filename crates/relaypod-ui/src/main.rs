@@ -1878,7 +1878,10 @@ impl eframe::App for RelayPodApp {
                             .cloned()
                             .collect();
                         if !thread_workers.is_empty() {
-                            render_activity_banners(ui, &thread_workers);
+                            if let Some(pane_id) = render_activity_banners(ui, &thread_workers, true)
+                            {
+                                self.runtime.send(ClientCommand::FocusHerdrPane { pane_id });
+                            }
                             ui.add_space(6.0);
                         }
                     });
@@ -1996,6 +1999,10 @@ impl eframe::App for RelayPodApp {
                                     }
                                     MessageCardAction::Delete => {
                                         self.pending_delete_message = Some(msg.clone());
+                                    }
+                                    MessageCardAction::FocusHerdrPane(pane_id) => {
+                                        self.runtime
+                                            .send(ClientCommand::FocusHerdrPane { pane_id });
                                     }
                                     MessageCardAction::None => {}
                                 }
@@ -2874,11 +2881,126 @@ fn render_activity_banner(ui: &mut egui::Ui, handles: &[String], state: Activity
         });
 }
 
-fn render_activity_banners(ui: &mut egui::Ui, workers: &[ActiveWorker]) {
-    let blocked: Vec<String> = workers
+fn render_blocked_banner(
+    ui: &mut egui::Ui,
+    worker: &ActiveWorker,
+    default_peek_open: bool,
+) -> Option<String> {
+    let dark = ui.visuals().dark_mode;
+    let (fill, border, text_color, peek_bg, peek_border, peek_text) = if dark {
+        (
+            Color32::from_rgb(56, 30, 34),
+            Color32::from_rgb(165, 56, 66),
+            Color32::from_rgb(254, 202, 202),
+            Color32::from_rgb(34, 20, 24),
+            Color32::from_rgb(110, 42, 50),
+            Color32::from_rgb(245, 224, 224),
+        )
+    } else {
+        (
+            Color32::from_rgb(254, 242, 242),
+            Color32::from_rgb(252, 165, 165),
+            Color32::from_rgb(153, 27, 27),
+            Color32::from_rgb(255, 250, 250),
+            Color32::from_rgb(254, 202, 202),
+            Color32::from_rgb(80, 20, 20),
+        )
+    };
+
+    let peek_id = ui.make_persistent_id((
+        "blocked_peek_open",
+        &worker.identity_id,
+        &worker.channel_id,
+        &worker.thread_id,
+        default_peek_open,
+    ));
+    let mut peek_open = ui
+        .data_mut(|d| d.get_temp::<bool>(peek_id))
+        .unwrap_or(default_peek_open);
+    let mut focus_pane: Option<String> = None;
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                draw_activity_dots(ui, ActivityState::Blocked);
+                ui.label(
+                    egui::RichText::new(format_workers_label(
+                        std::slice::from_ref(&worker.handle),
+                        ActivityState::Blocked,
+                    ))
+                    .size(12.0)
+                    .color(text_color),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(ref pane_id) = worker.pane_id {
+                        if ui
+                            .small_button("Focus in Herdr")
+                            .on_hover_text(format!("Focus pane {pane_id} in Herdr"))
+                            .clicked()
+                        {
+                            focus_pane = Some(pane_id.clone());
+                        }
+                    }
+                    if worker.detail.is_some() {
+                        let toggle_label = if peek_open { "Hide peek" } else { "Peek" };
+                        if ui
+                            .small_button(toggle_label)
+                            .on_hover_text("Toggle read-only preview of the blocking prompt")
+                            .clicked()
+                        {
+                            peek_open = !peek_open;
+                            ui.data_mut(|d| d.insert_temp(peek_id, peek_open));
+                        }
+                    }
+                });
+            });
+
+            if peek_open {
+                if let Some(ref detail) = worker.detail {
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(peek_bg)
+                        .stroke(Stroke::new(1.0_f32, peek_border))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::both()
+                                .id_salt(peek_id.with("scroll"))
+                                .max_height(180.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(detail)
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(peek_text),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                        });
+                }
+            }
+        });
+
+    focus_pane
+}
+
+fn render_activity_banners(
+    ui: &mut egui::Ui,
+    workers: &[ActiveWorker],
+    default_peek_open: bool,
+) -> Option<String> {
+    let blocked: Vec<&ActiveWorker> = workers
         .iter()
         .filter(|w| w.state == ActivityState::Blocked)
-        .map(|w| w.handle.clone())
         .collect();
     let working: Vec<String> = workers
         .iter()
@@ -2886,8 +3008,14 @@ fn render_activity_banners(ui: &mut egui::Ui, workers: &[ActiveWorker]) {
         .map(|w| w.handle.clone())
         .collect();
 
-    if !blocked.is_empty() {
-        render_activity_banner(ui, &blocked, ActivityState::Blocked);
+    let mut focus_pane: Option<String> = None;
+    for (idx, worker) in blocked.iter().enumerate() {
+        if idx > 0 {
+            ui.add_space(4.0);
+        }
+        if let Some(pane_id) = render_blocked_banner(ui, worker, default_peek_open) {
+            focus_pane = Some(pane_id);
+        }
     }
     if !working.is_empty() {
         if !blocked.is_empty() {
@@ -2895,6 +3023,7 @@ fn render_activity_banners(ui: &mut egui::Ui, workers: &[ActiveWorker]) {
         }
         render_activity_banner(ui, &working, ActivityState::Working);
     }
+    focus_pane
 }
 
 enum MessageCardAction {
@@ -2902,6 +3031,7 @@ enum MessageCardAction {
     OpenThread,
     AckThread,
     Delete,
+    FocusHerdrPane(String),
 }
 
 fn render_message_card(
@@ -2956,7 +3086,9 @@ fn render_message_card(
             }
             if !workers.is_empty() {
                 ui.add_space(6.0);
-                render_activity_banners(ui, workers);
+                if let Some(pane_id) = render_activity_banners(ui, workers, false) {
+                    action = MessageCardAction::FocusHerdrPane(pane_id);
+                }
             }
         });
 

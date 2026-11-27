@@ -3,12 +3,11 @@ use std::pin::Pin;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
-use relaypod_core::ActivityState;
 use serde_json::Value;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use super::adapter::{DispatchContext, DispatchOutcome, WatcherAdapter};
+use super::adapter::{ActivityUpdate, DispatchContext, DispatchOutcome, WatcherAdapter};
 use super::supervisor::{resolve_program, resolved_subprocess_path};
 use super::{build_agent_prompt_with_context, common_env_pairs, split_shell_words};
 
@@ -165,7 +164,8 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
             pane_id = %pane_id,
             "Herdr agent is blocked waiting for human input/approval in Herdr"
         );
-        (ctx.on_activity)(ActivityState::Blocked);
+        let peek = read_herdr_blocked_peek(&pane_id).await;
+        (ctx.on_activity)(ActivityUpdate::blocked(Some(pane_id.clone()), peek));
 
         let next_status = match wait_for_herdr_unblock(&pane_id).await {
             Ok(status) => status,
@@ -182,7 +182,7 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         };
 
         if next_status == "working" {
-            (ctx.on_activity)(ActivityState::Working);
+            (ctx.on_activity)(ActivityUpdate::working());
             settled_status = match wait_for_herdr_settle(&pane_id).await {
                 Ok(status) => status,
                 Err(err) => {
@@ -562,7 +562,72 @@ async fn wait_for_herdr_settle(pane_id: &str) -> Result<String> {
     }
 }
 
-async fn run_herdr_json(args: &[&str]) -> Result<Value> {
+const MAX_PEEK_LINES: usize = 16;
+const MAX_PEEK_CHARS: usize = 1500;
+
+/// Focuses the given Herdr agent pane so the user can inspect or approve it directly in Herdr.
+pub async fn focus_herdr_pane(pane_id: &str) -> Result<()> {
+    let trimmed = pane_id.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("pane_id is empty"));
+    }
+    run_herdr_text(&["agent", "focus", trimmed]).await?;
+    Ok(())
+}
+
+/// Reads a compact, read-only plain-text peek of the prompt/dialog currently blocking a Herdr pane.
+async fn read_herdr_blocked_peek(pane_id: &str) -> Option<String> {
+    let raw = match run_herdr_text(&["agent", "read", pane_id, "--source", "detection", "--lines", "20"]).await {
+        Ok(text) if !text.trim().is_empty() => text,
+        _ => run_herdr_text(&["agent", "read", pane_id, "--source", "visible", "--lines", "20"])
+            .await
+            .ok()?,
+    };
+    format_blocked_peek(&raw)
+}
+
+pub(crate) fn format_blocked_peek(raw: &str) -> Option<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut last_blank = false;
+    for line in raw.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            if !lines.is_empty() && !last_blank {
+                lines.push("");
+                last_blank = true;
+            }
+        } else {
+            lines.push(trimmed_end);
+            last_blank = false;
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = lines.len().saturating_sub(MAX_PEEK_LINES);
+    let mut joined = lines[start..].join("\n");
+    if joined.len() > MAX_PEEK_CHARS {
+        let mut cut = joined.len() - MAX_PEEK_CHARS;
+        while !joined.is_char_boundary(cut) {
+            cut += 1;
+        }
+        if let Some(nl) = joined[cut..].find('\n') {
+            cut += nl + 1;
+        }
+        joined = joined[cut..].trim_start_matches('\n').to_string();
+    }
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+async fn run_herdr_text(args: &[&str]) -> Result<String> {
     let mut cmd = Command::new(resolve_program("herdr"));
     if let Some(path) = resolved_subprocess_path() {
         cmd.env("PATH", path);
@@ -577,23 +642,31 @@ async fn run_herdr_json(args: &[&str]) -> Result<Value> {
         .await
         .with_context(|| format!("failed to execute `herdr {redacted}`"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if !output.status.success() {
+        let trimmed_out = stdout.trim();
         return Err(anyhow!(
             "`herdr {redacted}` exited with {:?}: {}",
             output.status.code(),
-            if !stderr.is_empty() { stderr } else { stdout }
+            if !stderr.is_empty() { stderr } else { trimmed_out.to_string() }
         ));
     }
 
-    if stdout.is_empty() {
+    Ok(stdout)
+}
+
+async fn run_herdr_json(args: &[&str]) -> Result<Value> {
+    let stdout = run_herdr_text(args).await?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
         return Ok(Value::Null);
     }
 
-    serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse JSON from `herdr {redacted}`: {stdout}"))
+    let redacted = redact_herdr_args(args);
+    serde_json::from_str(trimmed)
+        .with_context(|| format!("failed to parse JSON from `herdr {redacted}`: {trimmed}"))
 }
 
 /// Builds a Herdr-compliant agent name matching `[a-z][a-z0-9_-]{0,31}` with a `relaypod-` prefix.
@@ -808,5 +881,24 @@ mod tests {
         assert!(!redacted.contains("sk-1234"));
         assert!(redacted.contains("RELAYPOD_TOKEN=<redacted>"));
         assert!(redacted.contains("--env=API_KEY=<redacted>"));
+    }
+
+    #[test]
+    fn formats_blocked_peek_cleanly() {
+        let raw = "\n\n  Allow running command?   \n\n\n  $ cargo test  \n  1. Yes\n  2. No\n\n";
+        let peek = format_blocked_peek(raw).unwrap();
+        assert_eq!(
+            peek,
+            "  Allow running command?\n\n  $ cargo test\n  1. Yes\n  2. No"
+        );
+
+        assert_eq!(format_blocked_peek("   \n\n  "), None);
+
+        let many: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let trimmed = format_blocked_peek(&many).unwrap();
+        let kept: Vec<&str> = trimmed.lines().collect();
+        assert_eq!(kept.len(), MAX_PEEK_LINES);
+        assert_eq!(kept.first().copied(), Some("line 15"));
+        assert_eq!(kept.last().copied(), Some("line 30"));
     }
 }
