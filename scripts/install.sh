@@ -4,13 +4,17 @@ set -eu
 REPO="parsablelabs/relaypod"
 INSTALL_DIR="${RELAYPOD_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${RELAYPOD_VERSION:-}"
+CLI_ONLY=0
 
 usage() {
   cat <<EOF
-Install the RelayPod CLI/server binary (relaypod) from GitHub Releases.
+Install RelayPod from GitHub Releases.
+
+On macOS: installs the 'relaypod' CLI/server/watcher binary.
+On Linux: installs 'relaypod', 'relaypod-ui', icon, and desktop entry (pass --cli-only for headless servers).
 
 Usage:
-  sh install.sh [--version v0.1.0] [--dir /path/to/bin]
+  sh install.sh [--version v0.1.0-alpha.1] [--dir /path/to/bin] [--cli-only]
 
 Environment variables:
   RELAYPOD_VERSION      Release tag to install (defaults to latest release)
@@ -27,6 +31,10 @@ while [ $# -gt 0 ]; do
     -d|--dir)
       INSTALL_DIR="${2:-}"
       shift 2
+      ;;
+    --cli-only)
+      CLI_ONLY=1
+      shift 1
       ;;
     -h|--help)
       usage
@@ -68,9 +76,15 @@ fi
 
 if [ -z "$VERSION" ]; then
   echo "Fetching latest RelayPod release..."
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
-    | head -n 1)"
+    | head -n 1 || true)"
+  if [ -z "$VERSION" ]; then
+    # Fall back to the newest published release (including pre-releases such as v0.1.0-alpha.1)
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" \
+      | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+      | head -n 1 || true)"
+  fi
   if [ -z "$VERSION" ]; then
     echo "Failed to determine latest release tag from GitHub API." >&2
     exit 1
@@ -108,7 +122,8 @@ fi
 
 tar -xzf "${TMP_DIR}/${ASSET}" -C "$TMP_DIR"
 
-BIN_SRC="${TMP_DIR}/relaypod-${VERSION}-${OS}-${ARCH}/relaypod"
+EXTRACT_DIR="${TMP_DIR}/relaypod-${VERSION}-${OS}-${ARCH}"
+BIN_SRC="${EXTRACT_DIR}/relaypod"
 if [ ! -f "$BIN_SRC" ]; then
   echo "Expected binary not found in archive: ${BIN_SRC}" >&2
   exit 1
@@ -117,8 +132,29 @@ fi
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$BIN_SRC" "${INSTALL_DIR}/relaypod"
 
-echo "Installed relaypod ${VERSION} to ${INSTALL_DIR}/relaypod"
-echo "Run 'relaypod serve' to initialize ~/.relaypod/server.yaml, or launch the RelayPod desktop app for ~/.relaypod/config.yaml."
+if [ "$OS" = "linux" ] && [ "$CLI_ONLY" -eq 0 ] && [ -f "${EXTRACT_DIR}/relaypod-ui" ]; then
+  APP_DIR="${HOME}/.local/share/applications"
+  ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
+  mkdir -p "$APP_DIR" "$ICON_DIR"
+  install -m 755 "${EXTRACT_DIR}/relaypod-ui" "${INSTALL_DIR}/relaypod-ui"
+  if [ -f "${EXTRACT_DIR}/relaypod.png" ]; then
+    install -m 644 "${EXTRACT_DIR}/relaypod.png" "${ICON_DIR}/relaypod.png"
+  fi
+  cat > "${APP_DIR}/relaypod.desktop" <<DESKTOP
+[Desktop Entry]
+Name=RelayPod
+Comment=Shared message board for humans and AI agents
+Exec=${INSTALL_DIR}/relaypod-ui
+Icon=relaypod
+Terminal=false
+Type=Application
+Categories=Network;Chat;Development;
+DESKTOP
+  echo "Installed relaypod and relaypod-ui ${VERSION} to ${INSTALL_DIR}"
+else
+  echo "Installed relaypod ${VERSION} to ${INSTALL_DIR}/relaypod"
+fi
+echo "Run 'relaypod serve' to initialize ~/.relaypod/server.yaml, or launch RelayPod for ~/.relaypod/config.yaml."
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)

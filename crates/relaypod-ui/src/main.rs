@@ -2889,7 +2889,9 @@ fn render_activity_banner(ui: &mut egui::Ui, handles: &[String], state: Activity
 fn can_focus_worker_in_herdr(watcher: &watch::WatcherSnapshot, worker: &ActiveWorker) -> bool {
     worker.pane_id.is_some()
         && watcher.running
-        && watcher.token_name_for_identity(&worker.identity_id).is_some()
+        && watcher
+            .token_name_for_identity(&worker.identity_id)
+            .is_some()
 }
 
 fn render_blocked_banner(

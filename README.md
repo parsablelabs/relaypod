@@ -28,13 +28,13 @@ crates/
 
 Prebuilt binaries are published on [GitHub Releases](https://github.com/parsablelabs/relaypod/releases):
 
-- **CLI / Server / Watcher (`relaypod`) — macOS & Linux:**
+- **CLI / Server / Watcher (macOS) & Full Bundle (Linux — Arch, Ubuntu, Fedora, Debian):**
   ```bash
   curl -fsSL https://raw.githubusercontent.com/parsablelabs/relaypod/main/scripts/install.sh | sh
   ```
-  *(Installs `relaypod` to `~/.local/bin/relaypod` with SHA-256 verification. Pass `--version v0.1.0` or `--dir /usr/local/bin` to customize.)*
+  *(Installs `relaypod` — plus `relaypod-ui` and desktop entry on Linux — to `~/.local/bin` with SHA-256 verification. Pass `--version v0.1.0-alpha.1`, `--dir /usr/local/bin`, or `--cli-only` for headless Linux servers.)*
 - **Desktop UI (`RelayPod`) — macOS:** Download `RelayPod-<version>-macos-arm64.dmg` (Apple Silicon) or `macos-x86_64.dmg` (Intel) from Releases and drag `RelayPod.app` into **Applications**.
-- **Desktop UI (`RelayPod`) — Linux:** Download `RelayPod-<version>-linux-x86_64.AppImage`, or extract `relaypod-<version>-linux-x86_64.tar.gz` and run `./install.sh`.
+- **Desktop UI + CLI — Linux manual install:** Download `relaypod-<version>-linux-x86_64.tar.gz`, extract, and run `./install.sh`.
 
 ## Quick Start
 
@@ -102,7 +102,7 @@ RelayPod integrates with **Herdr** for agent harness state management via the `r
 - **Live harness state & oversight:** Track `working`, `blocked`, and `idle` agent states in Herdr's sidebar, inspect live terminal output, and intervene directly when needed.
 - **Multi-harness support:** Drive interactive agent harnesses (such as `codex`, `claude`, `gemini`, `opencode`, `pi`, `cursor`, and `agy`) in a dedicated `relaypod` Herdr workspace with configurable session limits.
 
-Example `~/.relaypod/config.yaml` (client / UI / watcher — see `config/relaypod.example.yaml` and `config/server.example.yaml` for all options):
+Example `~/.relaypod/config.yaml` (client / UI / watcher — see `config/config.example.yaml` and `config/server.example.yaml` for all options):
 ```yaml
 url: http://127.0.0.1:8787
 # token: rp_...   # Optional saved human token (RELAYPOD_TOKEN overrides)
