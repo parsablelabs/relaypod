@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
+use relaypod_core::ActivityState;
 use serde_json::Value;
 use tokio::process::Command;
 use tracing::{error, info, warn};
@@ -135,7 +136,9 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
     let prompt_resp =
         submit_herdr_prompt_with_retry(ctx.handle, &pane_id, &prompt, !is_resume).await?;
 
-    let settled_status = extract_agent_status(&prompt_resp).unwrap_or("unknown");
+    let mut settled_status = extract_agent_status(&prompt_resp)
+        .unwrap_or("unknown")
+        .to_string();
     info!(
         handle = %ctx.handle,
         thread_id = %ctx.thread_id,
@@ -144,17 +147,52 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
         "Herdr agent prompt settled"
     );
 
-    if settled_status == "blocked" {
+    while settled_status == "blocked" {
         warn!(
             handle = %ctx.handle,
             thread_id = %ctx.thread_id,
             pane_id = %pane_id,
             "Herdr agent is blocked waiting for human input/approval in Herdr"
         );
-        Ok(DispatchOutcome::blocked())
-    } else {
-        Ok(DispatchOutcome::ok())
+        (ctx.on_activity)(ActivityState::Blocked);
+
+        let next_status = match wait_for_herdr_unblock(&pane_id).await {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(
+                    handle = %ctx.handle,
+                    thread_id = %ctx.thread_id,
+                    pane_id = %pane_id,
+                    error = %err,
+                    "Stopped waiting for blocked Herdr pane"
+                );
+                return Ok(DispatchOutcome::blocked());
+            }
+        };
+
+        if next_status == "working" {
+            (ctx.on_activity)(ActivityState::Working);
+            settled_status = match wait_for_herdr_settle(&pane_id).await {
+                Ok(status) => status,
+                Err(err) => {
+                    warn!(
+                        handle = %ctx.handle,
+                        thread_id = %ctx.thread_id,
+                        pane_id = %pane_id,
+                        error = %err,
+                        "Failed waiting for unblocked Herdr pane to settle"
+                    );
+                    return Ok(DispatchOutcome::blocked());
+                }
+            };
+        } else if next_status == "idle" || next_status == "done" {
+            settled_status = next_status;
+        } else {
+            return Ok(DispatchOutcome::blocked());
+        }
     }
+
+    Ok(DispatchOutcome::ok())
 }
 
 async fn submit_herdr_prompt_with_retry(
@@ -482,12 +520,38 @@ fn redact_herdr_args(args: &[&str]) -> String {
     out.join(" ")
 }
 
+/// Waits until a blocked Herdr pane leaves `blocked` (into `working`, `idle`, `done`, or `unknown`).
+async fn wait_for_herdr_unblock(pane_id: &str) -> Result<String> {
+    let val = run_herdr_json(&[
+        "agent",
+        "wait",
+        pane_id,
+        "--until",
+        "working",
+        "--until",
+        "idle",
+        "--until",
+        "done",
+        "--until",
+        "unknown",
+    ])
+    .await?;
+    Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
+}
+
+/// Waits until a working Herdr pane settles into `idle`, `done`, or `blocked`.
+async fn wait_for_herdr_settle(pane_id: &str) -> Result<String> {
+    let val = run_herdr_json(&["agent", "wait", pane_id]).await?;
+    Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
+}
+
 async fn run_herdr_json(args: &[&str]) -> Result<Value> {
     let mut cmd = Command::new(resolve_program("herdr"));
     if let Some(path) = resolved_subprocess_path() {
         cmd.env("PATH", path);
     }
     cmd.args(args);
+    cmd.kill_on_drop(true);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let redacted = redact_herdr_args(args);

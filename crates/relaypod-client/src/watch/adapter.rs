@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::RelayPodClient;
-use relaypod_core::UnreadItem;
+use relaypod_core::{ActivityState, UnreadItem};
 
 use super::{ResolvedTarget, SessionStore};
 
@@ -15,6 +15,7 @@ pub struct DispatchContext<'a> {
     pub item: &'a UnreadItem,
     pub thread_id: &'a str,
     pub sessions: &'a SessionStore,
+    pub on_activity: &'a (dyn Fn(ActivityState) + Send + Sync),
 }
 
 /// Result of dispatching one unread item through an adapter.

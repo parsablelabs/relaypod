@@ -19,6 +19,7 @@ pub enum TargetPhase {
     Connecting,
     Connected,
     Working { channel: String },
+    Blocked { channel: String },
     Reconnecting,
     Error(String),
 }
@@ -49,7 +50,9 @@ impl WatcherSnapshot {
             .filter(|t| {
                 matches!(
                     t.phase,
-                    TargetPhase::Connected | TargetPhase::Working { .. }
+                    TargetPhase::Connected
+                        | TargetPhase::Working { .. }
+                        | TargetPhase::Blocked { .. }
                 )
             })
             .count()
@@ -59,6 +62,13 @@ impl WatcherSnapshot {
         self.targets
             .iter()
             .filter(|t| matches!(t.phase, TargetPhase::Working { .. }))
+            .count()
+    }
+
+    pub fn blocked_count(&self) -> usize {
+        self.targets
+            .iter()
+            .filter(|t| matches!(t.phase, TargetPhase::Blocked { .. }))
             .count()
     }
 
@@ -197,7 +207,10 @@ impl WatcherReporter {
                 .find(|t| t.token_name == token_name)
             {
                 if live {
-                    if !matches!(t.phase, TargetPhase::Working { .. }) {
+                    if !matches!(
+                        t.phase,
+                        TargetPhase::Working { .. } | TargetPhase::Blocked { .. }
+                    ) {
                         t.phase = TargetPhase::Connected;
                     }
                 } else {

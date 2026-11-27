@@ -1,6 +1,8 @@
 use crate::runtime::{ClientCommand, ClientEvent};
 use crate::watch::WatcherSnapshot;
-use relaypod_core::{Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent};
+use relaypod_core::{
+    ActivityState, Channel, CreatedIdentity, Identity, Message, ThreadView, UnreadItem, WsEvent,
+};
 
 /// Follow-up commands or UI signals produced by reducing a `ClientEvent`.
 #[derive(Debug, Default)]
@@ -12,13 +14,14 @@ pub struct StateEffects {
     pub token_just_regenerated: Option<CreatedIdentity>,
 }
 
-/// Tracks an identity (typically an AI agent) currently working on a response.
+/// Tracks an identity (typically an AI agent) currently working or blocked on a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveWorker {
     pub identity_id: String,
     pub handle: String,
     pub channel_id: String,
     pub thread_id: Option<String>,
+    pub state: ActivityState,
 }
 
 /// Pure, display-framework-agnostic client workspace state.
@@ -389,6 +392,7 @@ impl WorkspaceState {
                 channel_id,
                 thread_id,
                 active,
+                state,
             } => {
                 self.active_workers.retain(|w| {
                     !(w.identity_id == identity_id
@@ -401,6 +405,7 @@ impl WorkspaceState {
                         handle,
                         channel_id,
                         thread_id,
+                        state,
                     });
                 }
             }
@@ -566,5 +571,44 @@ mod tests {
         assert!(
             matches!(&effects.commands[..], [ClientCommand::LoadChannelMessages { channel_id }] if channel_id == "c2")
         );
+    }
+
+    #[test]
+    fn tracks_working_and_blocked_activity_states() {
+        let mut state = WorkspaceState::default();
+
+        state.apply(ClientEvent::Ws(WsEvent::ActivityChanged {
+            identity_id: "a1".into(),
+            handle: "codex".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("t1".into()),
+            active: true,
+            state: ActivityState::Working,
+        }));
+        let workers = state.workers_for_thread("c1", "t1");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].state, ActivityState::Working);
+
+        state.apply(ClientEvent::Ws(WsEvent::ActivityChanged {
+            identity_id: "a1".into(),
+            handle: "codex".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("t1".into()),
+            active: true,
+            state: ActivityState::Blocked,
+        }));
+        let workers = state.workers_for_thread("c1", "t1");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].state, ActivityState::Blocked);
+
+        state.apply(ClientEvent::Ws(WsEvent::ActivityChanged {
+            identity_id: "a1".into(),
+            handle: "codex".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("t1".into()),
+            active: false,
+            state: ActivityState::Blocked,
+        }));
+        assert!(state.workers_for_thread("c1", "t1").is_empty());
     }
 }

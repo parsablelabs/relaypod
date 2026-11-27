@@ -5,11 +5,11 @@ use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, CornerRadius, Margin, Stroke};
 use relaypod_client::watch::{self, TargetPhase};
 use relaypod_client::{
-    mcp_config_snippet, spawn_runtime, ClientCommand, ClientRuntime, WorkspaceState,
+    mcp_config_snippet, spawn_runtime, ActiveWorker, ClientCommand, ClientRuntime, WorkspaceState,
 };
 use relaypod_core::{
-    AgentConfig, Channel, CreatedIdentity, Identity, IdentityKind, Message, UpdateChannelRequest,
-    UpdateIdentityRequest, DEFAULT_AGENT_CWD,
+    ActivityState, AgentConfig, Channel, CreatedIdentity, Identity, IdentityKind, Message,
+    UpdateChannelRequest, UpdateIdentityRequest, DEFAULT_AGENT_CWD,
 };
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
@@ -1296,6 +1296,12 @@ impl RelayPodApp {
                                                 format!("Working in #{channel}"),
                                                 None,
                                             ),
+                                            TargetPhase::Blocked { channel } => (
+                                                Color32::from_rgb(248, 113, 113),
+                                                true,
+                                                format!("Blocked in #{channel}"),
+                                                Some("Waiting for approval/input in Herdr".into()),
+                                            ),
                                             TargetPhase::Reconnecting => (
                                                 Color32::YELLOW,
                                                 false,
@@ -1865,14 +1871,14 @@ impl eframe::App for RelayPodApp {
                             ui.add_space(8.0);
                         }
 
-                        let thread_workers: Vec<String> = self
+                        let thread_workers: Vec<ActiveWorker> = self
                             .state
                             .workers_for_thread(&thread.parent.channel_id, &thread.parent.id)
                             .into_iter()
-                            .map(|w| w.handle.clone())
+                            .cloned()
                             .collect();
                         if !thread_workers.is_empty() {
-                            render_working_banner(ui, &thread_workers);
+                            render_activity_banners(ui, &thread_workers);
                             ui.add_space(6.0);
                         }
                     });
@@ -1951,11 +1957,11 @@ impl eframe::App for RelayPodApp {
                         .show(ui, |ui| {
                             ui.add_space(4.0);
                             for msg in msgs {
-                                let workers: Vec<String> = self
+                                let workers: Vec<ActiveWorker> = self
                                     .state
                                     .workers_for_thread(&msg.channel_id, &msg.id)
                                     .into_iter()
-                                    .map(|w| w.handle.clone())
+                                    .cloned()
                                     .collect();
                                 let thread_unread_ids: Vec<String> = self
                                     .state
@@ -2038,6 +2044,7 @@ fn watcher_pill_summary(snapshot: &watch::WatcherSnapshot) -> (String, Color32, 
     let total = snapshot.targets.len();
     let connected = snapshot.connected_count();
     let working = snapshot.working_count();
+    let blocked = snapshot.blocked_count();
     let errors = snapshot.error_count();
 
     if errors > 0 {
@@ -2045,6 +2052,12 @@ fn watcher_pill_summary(snapshot: &watch::WatcherSnapshot) -> (String, Color32, 
             format!("Watcher ({connected}/{total})"),
             Color32::LIGHT_RED,
             false,
+        )
+    } else if blocked > 0 {
+        (
+            format!("Watcher ({total} • blocked)"),
+            Color32::from_rgb(248, 113, 113),
+            true,
         )
     } else if working > 0 {
         (
@@ -2753,49 +2766,95 @@ fn draw_kind_badge(ui: &mut egui::Ui, kind: IdentityKind) {
     }
 }
 
-fn draw_working_dots(ui: &mut egui::Ui) {
+fn draw_activity_dots(ui: &mut egui::Ui, state: ActivityState) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 14.0), egui::Sense::hover());
-    let time = ui.ctx().input(|i| i.time) as f32;
     let base_y = rect.center().y + 1.0;
-    let accent = Color32::from_rgb(167, 139, 250);
 
-    for idx in 0..3 {
-        let phase = time * 5.0_f32 - (idx as f32) * 0.75_f32;
-        let bounce = phase.sin().max(0.0);
-        let x = rect.left() + 4.0 + (idx as f32) * 9.0;
-        let y = base_y - bounce * 4.0;
-        let alpha = (130.0 + bounce * 125.0) as u8;
-        let color = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha);
-        ui.painter().circle_filled(egui::pos2(x, y), 2.5, color);
+    match state {
+        ActivityState::Working => {
+            let time = ui.ctx().input(|i| i.time) as f32;
+            let accent = Color32::from_rgb(167, 139, 250);
+            for idx in 0..3 {
+                let phase = time * 5.0_f32 - (idx as f32) * 0.75_f32;
+                let bounce = phase.sin().max(0.0);
+                let x = rect.left() + 4.0 + (idx as f32) * 9.0;
+                let y = base_y - bounce * 4.0;
+                let alpha = (130.0 + bounce * 125.0) as u8;
+                let color =
+                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha);
+                ui.painter().circle_filled(egui::pos2(x, y), 2.5, color);
+            }
+            ui.ctx().request_repaint();
+        }
+        ActivityState::Blocked => {
+            let color = if ui.visuals().dark_mode {
+                Color32::from_rgb(248, 113, 113)
+            } else {
+                Color32::from_rgb(220, 38, 38)
+            };
+            for idx in 0..3 {
+                let x = rect.left() + 4.0 + (idx as f32) * 9.0;
+                ui.painter()
+                    .circle_filled(egui::pos2(x, base_y), 2.5, color);
+            }
+        }
     }
-    ui.ctx().request_repaint();
 }
 
-fn format_workers_label(handles: &[String]) -> String {
-    match handles {
-        [] => String::new(),
-        [one] => format!("@{one} is working..."),
-        [a, b] => format!("@{a} and @{b} are working..."),
-        many => format!("@{} and {} others are working...", many[0], many.len() - 1),
+fn format_workers_label(handles: &[String], state: ActivityState) -> String {
+    match state {
+        ActivityState::Working => match handles {
+            [] => String::new(),
+            [one] => format!("@{one} is working..."),
+            [a, b] => format!("@{a} and @{b} are working..."),
+            many => format!("@{} and {} others are working...", many[0], many.len() - 1),
+        },
+        ActivityState::Blocked => match handles {
+            [] => String::new(),
+            [one] => format!("@{one} is blocked — waiting for input"),
+            [a, b] => format!("@{a} and @{b} are blocked — waiting for input"),
+            many => format!(
+                "@{} and {} others are blocked — waiting for input",
+                many[0],
+                many.len() - 1
+            ),
+        },
     }
 }
 
-fn render_working_banner(ui: &mut egui::Ui, handles: &[String]) {
+fn render_activity_banner(ui: &mut egui::Ui, handles: &[String], state: ActivityState) {
     let dark = ui.visuals().dark_mode;
-    let fill = if dark {
-        Color32::from_rgb(42, 38, 56)
-    } else {
-        Color32::from_rgb(243, 238, 255)
-    };
-    let border = if dark {
-        Color32::from_rgb(92, 74, 140)
-    } else {
-        Color32::from_rgb(196, 181, 253)
-    };
-    let text_color = if dark {
-        Color32::from_rgb(216, 204, 255)
-    } else {
-        Color32::from_rgb(91, 33, 182)
+    let (fill, border, text_color) = match state {
+        ActivityState::Working => {
+            if dark {
+                (
+                    Color32::from_rgb(42, 38, 56),
+                    Color32::from_rgb(92, 74, 140),
+                    Color32::from_rgb(216, 204, 255),
+                )
+            } else {
+                (
+                    Color32::from_rgb(243, 238, 255),
+                    Color32::from_rgb(196, 181, 253),
+                    Color32::from_rgb(91, 33, 182),
+                )
+            }
+        }
+        ActivityState::Blocked => {
+            if dark {
+                (
+                    Color32::from_rgb(56, 30, 34),
+                    Color32::from_rgb(165, 56, 66),
+                    Color32::from_rgb(254, 202, 202),
+                )
+            } else {
+                (
+                    Color32::from_rgb(254, 242, 242),
+                    Color32::from_rgb(252, 165, 165),
+                    Color32::from_rgb(153, 27, 27),
+                )
+            }
+        }
     };
 
     egui::Frame::new()
@@ -2805,14 +2864,37 @@ fn render_working_banner(ui: &mut egui::Ui, handles: &[String]) {
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                draw_working_dots(ui);
+                draw_activity_dots(ui, state);
                 ui.label(
-                    egui::RichText::new(format_workers_label(handles))
+                    egui::RichText::new(format_workers_label(handles, state))
                         .size(12.0)
                         .color(text_color),
                 );
             });
         });
+}
+
+fn render_activity_banners(ui: &mut egui::Ui, workers: &[ActiveWorker]) {
+    let blocked: Vec<String> = workers
+        .iter()
+        .filter(|w| w.state == ActivityState::Blocked)
+        .map(|w| w.handle.clone())
+        .collect();
+    let working: Vec<String> = workers
+        .iter()
+        .filter(|w| w.state == ActivityState::Working)
+        .map(|w| w.handle.clone())
+        .collect();
+
+    if !blocked.is_empty() {
+        render_activity_banner(ui, &blocked, ActivityState::Blocked);
+    }
+    if !working.is_empty() {
+        if !blocked.is_empty() {
+            ui.add_space(4.0);
+        }
+        render_activity_banner(ui, &working, ActivityState::Working);
+    }
 }
 
 enum MessageCardAction {
@@ -2826,7 +2908,7 @@ fn render_message_card(
     ui: &mut egui::Ui,
     msg: &Message,
     can_delete: bool,
-    working_handles: &[String],
+    workers: &[ActiveWorker],
     unread_count: usize,
 ) -> MessageCardAction {
     let mut action = MessageCardAction::None;
@@ -2872,9 +2954,9 @@ fn render_message_card(
             } else {
                 markdown::render_markdown(ui, &msg.body);
             }
-            if !working_handles.is_empty() {
+            if !workers.is_empty() {
                 ui.add_space(6.0);
-                render_working_banner(ui, working_handles);
+                render_activity_banners(ui, workers);
             }
         });
 
@@ -3420,6 +3502,38 @@ mod tests {
         let (label, _, pulse) = watcher_pill_summary(&working);
         assert_eq!(label, "Watcher (2 • working)");
         assert!(pulse);
+
+        let blocked = watch::WatcherSnapshot {
+            running: true,
+            targets: vec![
+                mk_target(
+                    "claude",
+                    TargetPhase::Blocked {
+                        channel: "general".into(),
+                    },
+                ),
+                mk_target(
+                    "codex",
+                    TargetPhase::Working {
+                        channel: "general".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let (label, color, pulse) = watcher_pill_summary(&blocked);
+        assert_eq!(label, "Watcher (2 • blocked)");
+        assert_eq!(color, Color32::from_rgb(248, 113, 113));
+        assert!(pulse);
+
+        assert_eq!(
+            format_workers_label(&["codex".into()], ActivityState::Working),
+            "@codex is working..."
+        );
+        assert_eq!(
+            format_workers_label(&["codex".into()], ActivityState::Blocked),
+            "@codex is blocked — waiting for input"
+        );
     }
 
     #[test]
