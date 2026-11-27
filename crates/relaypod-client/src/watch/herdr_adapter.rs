@@ -136,9 +136,20 @@ async fn dispatch_herdr(ctx: &DispatchContext<'_>) -> Result<DispatchOutcome> {
     let prompt_resp =
         submit_herdr_prompt_with_retry(ctx.handle, &pane_id, &prompt, !is_resume).await?;
 
-    let mut settled_status = extract_agent_status(&prompt_resp)
-        .unwrap_or("unknown")
-        .to_string();
+    let mut settled_status = match extract_agent_status(&prompt_resp) {
+        Some(status) => status.to_string(),
+        None => {
+            warn!(
+                handle = %ctx.handle,
+                pane_id = %pane_id,
+                response = %prompt_resp,
+                "Could not extract agent_status from `herdr agent prompt` response; falling back to `herdr agent get`"
+            );
+            get_herdr_agent_status(&pane_id)
+                .await
+                .unwrap_or_else(|_| "unknown".to_string())
+        }
+    };
     info!(
         handle = %ctx.handle,
         thread_id = %ctx.thread_id,
@@ -536,13 +547,19 @@ async fn wait_for_herdr_unblock(pane_id: &str) -> Result<String> {
         "unknown",
     ])
     .await?;
-    Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
+    match extract_agent_status(&val) {
+        Some(status) => Ok(status.to_string()),
+        None => get_herdr_agent_status(pane_id).await,
+    }
 }
 
 /// Waits until a working Herdr pane settles into `idle`, `done`, or `blocked`.
 async fn wait_for_herdr_settle(pane_id: &str) -> Result<String> {
     let val = run_herdr_json(&["agent", "wait", pane_id]).await?;
-    Ok(extract_agent_status(&val).unwrap_or("unknown").to_string())
+    match extract_agent_status(&val) {
+        Some(status) => Ok(status.to_string()),
+        None => get_herdr_agent_status(pane_id).await,
+    }
 }
 
 async fn run_herdr_json(args: &[&str]) -> Result<Value> {
@@ -664,7 +681,12 @@ pub(crate) fn find_workspace_id(val: &Value, selector: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_agent_status(val: &Value) -> Option<&str> {
-    val.pointer("/result/agent/status")
+    val.pointer("/result/agent/agent_status")
+        .or_else(|| val.pointer("/result/event/data/agent_status"))
+        .or_else(|| val.pointer("/result/event/data/final_status"))
+        .or_else(|| val.pointer("/result/pane/agent_status"))
+        .or_else(|| val.pointer("/result/agent_status"))
+        .or_else(|| val.pointer("/result/agent/status"))
         .or_else(|| val.pointer("/result/status"))
         .or_else(|| val.pointer("/status"))
         .and_then(|v| v.as_str())
@@ -711,20 +733,46 @@ mod tests {
         assert_eq!(extract_pane_id(&tab_resp).as_deref(), Some("w1:p5"));
 
         let agent_resp = json!({
-            "ok": true,
+            "id": "cli:agent:wait",
             "result": {
-                "agent": { "name": "relaypod-codex-1234", "status": "idle" }
+                "type": "agent_info",
+                "agent": { "name": "relaypod-codex-1234", "agent_status": "idle" }
             }
         });
         assert_eq!(extract_agent_status(&agent_resp), Some("idle"));
 
         let prompt_resp = json!({
+            "id": "cli:agent:prompt",
+            "result": {
+                "type": "agent_prompted",
+                "agent": { "name": "relaypod-codex-1234", "agent_status": "blocked" }
+            }
+        });
+        assert_eq!(extract_agent_status(&prompt_resp), Some("blocked"));
+
+        let wait_event_resp = json!({
+            "id": "cli:agent:wait",
+            "result": {
+                "type": "wait_matched",
+                "event": {
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "type": "pane_agent_status_changed",
+                        "pane_id": "w4:p7",
+                        "agent_status": "working"
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_agent_status(&wait_event_resp), Some("working"));
+
+        let legacy_prompt_resp = json!({
             "ok": true,
             "result": {
                 "status": "blocked"
             }
         });
-        assert_eq!(extract_agent_status(&prompt_resp), Some("blocked"));
+        assert_eq!(extract_agent_status(&legacy_prompt_resp), Some("blocked"));
 
         let ws_list = json!({
             "id": "cli:workspace:list",
